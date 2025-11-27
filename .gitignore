@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist-info/
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Installer Output
+installer_output/
+
+# Logs
+logs/
+*.log
+
+# Database (if you want to exclude it - uncomment if needed)
+# *.db
+# vfx_launcher.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# Qt
+*.qmlc
+*.jsc
+
+# User settings (QSettings files)
+# Uncomment if you don't want to track user preferences
+# *.ini
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Build artifacts
+*.exe.manifest
+*.exe.config
+

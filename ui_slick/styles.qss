@@ -1,0 +1,31 @@
+/* Modern QSS stylesheet for Slick UI */
+QWidget#SlickMainWindow {
+    background: #181a1b;
+    color: #f0f0f0;
+    font-family: 'Inter', Arial, sans-serif;
+    font-size: 16px;
+}
+#Sidebar {
+    background: #23272e;
+    border-top-right-radius: 20px;
+    border-bottom-right-radius: 20px;
+    min-width: 180px;
+}
+QPushButton#SidebarBtnProjects, QPushButton#SidebarBtnUsers, QPushButton#SidebarBtnSettings, QPushButton#SidebarBtnLogs {
+    background: #2563eb;
+    color: #fff;
+    border-radius: 10px;
+    padding: 12px 0;
+    font-weight: 600;
+    margin-bottom: 6px;
+    transition: background 0.2s;
+}
+QPushButton#SidebarBtnProjects:hover, QPushButton#SidebarBtnUsers:hover, QPushButton#SidebarBtnSettings:hover, QPushButton#SidebarBtnLogs:hover {
+    background: #1d4ed8;
+}
+#ProjectBrowser, #UserManagement, #SettingsPanel, #LogPanel {
+    background: #23272e;
+    border-radius: 20px;
+    margin: 20px;
+    padding: 20px;
+}
