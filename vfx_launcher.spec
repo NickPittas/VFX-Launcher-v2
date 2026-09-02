@@ -18,6 +18,12 @@ a = Analysis(
         ('ui_slick/icons', 'ui_slick/icons'),
         # Include QSS stylesheet
         ('ui_slick/styles.qss', 'ui_slick'),
+        # Include subfolder structure preset for the New Project panel
+        ('ui_slick/Structure', 'ui_slick/Structure'),
+        # Manifest of Structure/ dirs (empty dirs are dropped from the bundle)
+        ('ui_slick/structure.txt', 'ui_slick'),
+        # Include app settings (launcher paths, scan config)
+        ('app_settings.ini', '.'),
     ],
     hiddenimports=[
         'PySide6.QtCore',

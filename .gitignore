@@ -69,3 +69,6 @@ htmlcov/
 *.exe.manifest
 *.exe.config
 
+# Pix Agent
+.pi/
+.pi-lens/

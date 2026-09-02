@@ -89,7 +89,7 @@ class FileHandler:
                 shot_name = os.path.basename(folder_path) if folder_path else ""
                 
                 # If no folder name found, try to extract from filename using common patterns
-                if not shot_name or shot_name.lower() in ['nk', 'aep', 'shots', 'assets']:
+                if not shot_name or shot_name.lower() in ['nk', 'aep', 'shots', 'assets', 'nuke', 'after effects']:
                     # Try to extract shot name from filename (before version number)
                     name_parts = filename.split('_v') if '_v' in filename else [filename]
                     base_name = name_parts[0]
@@ -122,6 +122,34 @@ class FileHandler:
                 shot_groups[shot_name].append(file)
         
         return shot_groups
+
+    @staticmethod
+    def group_by_timeline(files):
+        """
+        Group files into {timeline: {shot: [files]}}.
+        Levels are derived relative to the Projects/Nuke (or After Effects) anchor:
+        <anchor>/<timeline>/<shot>/.../file.nk — extra nesting (artist folders etc.)
+        below the shot is ignored. Files not at least two folders below the anchor
+        land in the '' timeline group using the shot-name fallback heuristics.
+        """
+        timeline_groups = {}
+        for f in files:
+            parts = [p for p in re.split(r'[\\/]', f.get('filepath', '')) if p]
+            anchor = next(
+                (i for i in range(len(parts) - 1, -1, -1)
+                 if parts[i].lower() in ('nuke', 'after effects', 'aftereffects')),
+                None
+            )
+            rel = parts[anchor + 1:-1] if anchor is not None else []
+            if len(rel) >= 2:
+                timeline, shot = rel[0], rel[1]
+            elif len(rel) == 1:
+                timeline, shot = '', rel[0]
+            else:
+                timeline = ''
+                shot = next(iter(FileHandler.group_by_shot([f])))  # filename heuristic
+            timeline_groups.setdefault(timeline, {}).setdefault(shot, []).append(f)
+        return timeline_groups
 
     @staticmethod
     def group_versioned_files(files):
@@ -170,3 +198,25 @@ class FileHandler:
         except Exception as e:
             logger.error(f"Error sorting files by version: {str(e)}")
             return files, [FileHandler.extract_version(f.get('filename', '')) for f in files]
+
+
+if __name__ == "__main__":
+    # Self-check: timeline grouping over Projects/Nuke/<timeline>/<shot>/file.nk
+    files = [
+        {'filename': 'shotA_comp_v01.nk', 'filepath': '/proj/Projects/Nuke/Timeline1/shotA/shotA_comp_v01.nk'},
+        {'filename': 'shotB_comp_v02.nk', 'filepath': '/proj/Projects/Nuke/Timeline1/shotB/shotB_comp_v02.nk'},
+        {'filename': 'shotC_comp_v01.nk', 'filepath': '/proj/Projects/Nuke/Timeline2/shotC/shotC_comp_v01.nk'},
+        {'filename': 'loose_comp_v01.nk', 'filepath': '/proj/Projects/Nuke/loose_comp_v01.nk'},
+        # Deep nesting: artist folder below the shot is ignored
+        {'filename': 'x_comp_v02.nk', 'filepath': '/proj/Projects/Nuke/080126_Edit_Novibet_pre 04_93sec/A_0004C017_260725_113917_a1DX4/Paul/x_comp_v02.nk'},
+        # Windows-style separators from the DB
+        {'filename': 'y_comp_v01.nk', 'filepath': 'H:\\Projects\\Nuke\\Timeline1\\shotA\\y_comp_v01.nk'},
+    ]
+    groups = FileHandler.group_by_timeline(files)
+    assert set(groups) == {'Timeline1', 'Timeline2', '080126_Edit_Novibet_pre 04_93sec', ''}, groups.keys()
+    assert set(groups['Timeline1']) == {'shotA', 'shotB'}
+    assert len(groups['Timeline1']['shotA']) == 2  # linux + windows path in same group
+    assert set(groups['Timeline2']) == {'shotC'}
+    assert set(groups['080126_Edit_Novibet_pre 04_93sec']) == {'A_0004C017_260725_113917_a1DX4'}
+    assert set(groups['']) == {'loose'}  # loose file: shot name from filename, no timeline
+    print("self-check OK")

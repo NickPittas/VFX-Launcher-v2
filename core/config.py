@@ -9,6 +9,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def resolve_app_settings_path():
+    """Path to app_settings.ini. Frozen builds (PyInstaller/AppImage) get a
+    writable per-user copy seeded from the bundled file; dev runs use the repo file."""
+    bundled = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'app_settings.ini'))
+    if not getattr(sys, 'frozen', False):
+        return bundled
+    user_copy = os.path.join(os.path.expanduser('~'), '.config', 'VFX_Launcher', 'app_settings.ini')
+    if not os.path.exists(user_copy):
+        os.makedirs(os.path.dirname(user_copy), exist_ok=True)
+        if os.path.exists(bundled):
+            import shutil
+            shutil.copy(bundled, user_copy)
+    return user_copy
+
 class ConfigManager:
     """Manages application configuration"""
     

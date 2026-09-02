@@ -7,6 +7,7 @@ from .sidebar import Sidebar
 from .project_browser import ProjectBrowser
 from .user_management import UserManagement
 from .settings_panel import SettingsPanel
+from .new_project_panel import NewProjectPanel
 from .log_panel import LogPanel
 import os
 import logging
@@ -71,6 +72,7 @@ class SlickMainWindow(QMainWindow):
         from .files_browser import FilesBrowser
         self.files_browser = FilesBrowser(self.db_manager, self.user_data, self)
         self.project_browser = ProjectBrowser(self.db_manager.db_path, self.user_data, self)
+        self.new_project_panel = NewProjectPanel(self)
         self.user_management = UserManagement(self.db_manager, self)
         self.settings_panel = SettingsPanel(self.db_manager, self.user_data, self)
         self.log_panel = LogPanel(self)
@@ -121,9 +123,10 @@ class SlickMainWindow(QMainWindow):
 
         # Add panels to stack in navigation order
         self.stack.addWidget(self.projects_panel)    # index 0
-        self.stack.addWidget(self.user_management)   # index 1
-        self.stack.addWidget(self.settings_panel)    # index 2
-        self.stack.addWidget(self.log_panel)         # index 3
+        self.stack.addWidget(self.new_project_panel) # index 1
+        self.stack.addWidget(self.user_management)   # index 2
+        self.stack.addWidget(self.settings_panel)    # index 3
+        self.stack.addWidget(self.log_panel)         # index 4
 
         # Connect project browser to files browser
         self.project_browser.file_selected.connect(self._on_project_file_selected)
@@ -284,6 +287,8 @@ class SlickMainWindow(QMainWindow):
         import subprocess
         import configparser
         import os
+        import sys
+        import shlex
         import logging
 
         logging.info(f"Launching file: {filepath}")
@@ -294,8 +299,9 @@ class SlickMainWindow(QMainWindow):
             file_extension = file_extension.lower()
 
             # Read application paths from app_settings.ini
+            from core.config import resolve_app_settings_path
             config = configparser.ConfigParser()
-            config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'app_settings.ini'))
+            config_path = resolve_app_settings_path()
             
             if not os.path.exists(config_path):
                 logging.warning(f"Settings file not found: {config_path}")
@@ -305,15 +311,26 @@ class SlickMainWindow(QMainWindow):
             
             # Launch based on file extension
             if file_extension in ('.nk', '.nknc'):
-                # Launch with Nuke
-                nuke_path = config.get("Paths", "nuke_path", fallback="")
-                
-                if not nuke_path:
-                    logging.warning("Nuke path not configured in settings")
-                    raise ValueError("Nuke path not configured in settings")
-                    
-                logging.info(f"Launching Nuke file with NukeX: {filepath}")
-                subprocess.Popen([nuke_path, '--nukex', filepath])
+                if sys.platform.startswith("linux"):
+                    # Full command line (terminal wrapper/env allowed), file path is appended
+                    nuke_cmd = config.get("Paths", "nuke_launch_cmd_linux", fallback="")
+
+                    if not nuke_cmd:
+                        logging.warning("Linux Nuke launch command not configured in settings")
+                        raise ValueError("Linux Nuke launch command not configured in settings")
+
+                    logging.info(f"Launching Nuke file on Linux: {filepath}")
+                    subprocess.Popen(shlex.split(nuke_cmd) + [filepath])
+                else:
+                    # Launch with Nuke
+                    nuke_path = config.get("Paths", "nuke_path", fallback="")
+
+                    if not nuke_path:
+                        logging.warning("Nuke path not configured in settings")
+                        raise ValueError("Nuke path not configured in settings")
+
+                    logging.info(f"Launching Nuke file with NukeX: {filepath}")
+                    subprocess.Popen([nuke_path, '--nukex', filepath])
                 
             elif file_extension in ('.aep', '.aet'):
                 # Launch with After Effects
@@ -329,7 +346,10 @@ class SlickMainWindow(QMainWindow):
             else:
                 # Use default application for other file types
                 logging.info(f"Launching file with default application: {filepath}")
-                os.startfile(filepath)
+                if hasattr(os, 'startfile'):
+                    os.startfile(filepath)
+                else:
+                    subprocess.Popen(['xdg-open', filepath])
                 
         except Exception as e:
             import traceback

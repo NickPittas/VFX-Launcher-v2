@@ -48,13 +48,16 @@ class FileTreeManager:
 
         return self.icon_cache[file_type]
     
-    def add_shot_item(self, shot_name):
+    def add_shot_item(self, shot_name, parent_item=None):
         """Add a shot/folder item to the tree with custom widget for text clarity"""
         # Create empty item first
         shot_item = QTreeWidgetItem()
         shot_item.setText(0, "")  # Explicitly empty text
         shot_item.setForeground(0, QBrush(QColor(0, 0, 0, 0)))  # Transparent text
-        self.tree_widget.addTopLevelItem(shot_item)
+        if parent_item is not None:
+            parent_item.addChild(shot_item)
+        else:
+            self.tree_widget.addTopLevelItem(shot_item)
         
         # Create custom widget for text display
         shot_widget = QWidget()
@@ -328,37 +331,36 @@ class FileTreeManager:
             # No need to apply additional styles - they're already set above
             
             if group_by_shot:
-                # Group files by shot/folder
-                shot_groups = FileHandler.group_by_shot(files)
-                
-                # Sort shot names alphabetically for consistent display
-                shot_names = sorted(shot_groups.keys())
-                
-                for shot_name in shot_names:
-                    shot_files = shot_groups[shot_name]
-                    
-                    # Add shot/folder item
-                    shot_item = self.add_shot_item(shot_name)
-                    
-                    if handle_versions:
-                        # Group files by base name
-                        versioned_groups = FileHandler.group_versioned_files(shot_files)
-                        
-                        # Sort base names alphabetically
-                        base_names = sorted(versioned_groups.keys())
-                        
-                        # Process each group of versions in sorted order
-                        for base_name in base_names:
-                            file_versions = versioned_groups[base_name]
-                            file_type = file_versions[0].get('filetype', '') if file_versions else ''
-                            self.handle_versioned_files(file_versions, shot_item, base_name, file_type)
-                    else:
-                        # Sort files by filename
-                        sorted_files = sorted(shot_files, key=lambda f: f.get('filename', ''))
-                        
-                        # Add files directly without version handling
-                        for file in sorted_files:
-                            self.add_single_file(file, shot_item)
+                # Group files by timeline, then shot (Projects/Nuke/<timeline>/<shot>/file)
+                timeline_groups = FileHandler.group_by_timeline(files)
+
+                for timeline_name in sorted(timeline_groups.keys()):
+                    # Empty timeline = not under a timeline folder; shots go top-level
+                    timeline_item = self.add_shot_item(timeline_name) if timeline_name else None
+
+                    for shot_name in sorted(timeline_groups[timeline_name].keys()):
+                        shot_files = timeline_groups[timeline_name][shot_name]
+                        shot_item = self.add_shot_item(shot_name, parent_item=timeline_item)
+
+                        if handle_versions:
+                            # Group files by base name
+                            versioned_groups = FileHandler.group_versioned_files(shot_files)
+
+                            # Sort base names alphabetically
+                            base_names = sorted(versioned_groups.keys())
+
+                            # Process each group of versions in sorted order
+                            for base_name in base_names:
+                                file_versions = versioned_groups[base_name]
+                                file_type = file_versions[0].get('filetype', '') if file_versions else ''
+                                self.handle_versioned_files(file_versions, shot_item, base_name, file_type)
+                        else:
+                            # Sort files by filename
+                            sorted_files = sorted(shot_files, key=lambda f: f.get('filename', ''))
+
+                            # Add files directly without version handling
+                            for file in sorted_files:
+                                self.add_single_file(file, shot_item)
             else:
                 # Sort files by filename
                 sorted_files = sorted(files, key=lambda f: f.get('filename', ''))

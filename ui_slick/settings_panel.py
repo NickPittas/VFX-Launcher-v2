@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 import configparser
 import os
+from core.config import resolve_app_settings_path
 
 class SettingsPanel(QWidget):
     """
@@ -18,7 +19,7 @@ class SettingsPanel(QWidget):
         self.setObjectName("SettingsPanel")
         self.db_path = db_path
         self.user_data = user_data
-        self.config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'app_settings.ini'))
+        self.config_path = resolve_app_settings_path()
         self.config = configparser.ConfigParser()
         self._setup_ui()
         self._load_settings()
@@ -55,6 +56,13 @@ class SettingsPanel(QWidget):
         ae_row.addWidget(self.ae_path_input)
         ae_row.addWidget(ae_browse_btn)
         form_apps.addRow("After Effects Path:", ae_row)
+
+        self.nuke_linux_cmd_input = QLineEdit()
+        self.nuke_linux_cmd_input.setPlaceholderText(
+            "ghostty -e env QT_QPA_PLATFORM=xcb LC_NUMERIC=C /opt/Nuke17.0v1/Nuke17.0 --nukex"
+        )
+        self.nuke_linux_cmd_input.setToolTip("Full Linux command line; the .nk file path is appended at the end.")
+        form_apps.addRow("Nuke Launch Cmd (Linux):", self.nuke_linux_cmd_input)
         apps_layout.addLayout(form_apps)
         apps_layout.addStretch(1)
 
@@ -122,6 +130,7 @@ class SettingsPanel(QWidget):
             # Paths
             self.nuke_path_input.setText(self.config.get("Paths", "nuke_path", fallback=""))
             self.ae_path_input.setText(self.config.get("Paths", "after_effects_path", fallback=""))
+            self.nuke_linux_cmd_input.setText(self.config.get("Paths", "nuke_launch_cmd_linux", fallback=""))
             # Projects
             self.project_dirs_input.setText(self.config.get("Projects", "project_directories", fallback=""))
             self.scan_interval_input.setText(self.config.get("Projects", "scan_interval_minutes", fallback=""))
@@ -175,6 +184,7 @@ class SettingsPanel(QWidget):
                 self.config.add_section("Logging")
             self.config.set("Paths", "nuke_path", nuke_path)
             self.config.set("Paths", "after_effects_path", ae_path)
+            self.config.set("Paths", "nuke_launch_cmd_linux", self.nuke_linux_cmd_input.text().strip())
             # Always save as comma-separated for compatibility
             self.config.set("Projects", "project_directories", ', '.join(proj_dirs))
             self.config.set("Projects", "scan_interval_minutes", self.scan_interval_input.text())

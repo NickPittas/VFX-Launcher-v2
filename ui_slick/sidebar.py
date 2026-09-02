@@ -57,9 +57,10 @@ class Sidebar(QWidget):
         self.buttons = []
         self.nav_items = [
             ("Projects", 0, "Browse and manage your VFX projects", "P"),
-            ("Users", 1, "Manage user accounts and permissions", "U"),
-            ("Settings", 2, "Configure application settings and paths", "S"),
-            ("Logs", 3, "View application logs and debug information", "L"),
+            ("New Project", 1, "Create a new project folder from preset", "N"),
+            ("Users", 2, "Manage user accounts and permissions", "U"),
+            ("Settings", 3, "Configure application settings and paths", "S"),
+            ("Logs", 4, "View application logs and debug information", "L"),
         ]
         for label, idx, tooltip, icon in self.nav_items:
             btn = QPushButton(label)
