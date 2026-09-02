@@ -777,6 +777,7 @@ class Scanner:
                         self.signals = ScannerSignals()
                         self.setAutoDelete(True)
                         self.completed = False
+                        self.error = None  # Set when the DB update fails (checked by the completion timer)
 
                     @Slot()
                     def run(self):
@@ -804,7 +805,8 @@ class Scanner:
                             import traceback
                             logger.error(f"[DbUpdateWorker] Traceback: {traceback.format_exc()}")
                             self.signals.error.emit(error_msg)
-                            self.completed = True  # Mark as completed even on error
+                            self.error = error_msg
+                            self.completed = True  # Stop polling; error already emitted via relay
                 
                 # Create and run database update worker
                 db_path = self.db_manager.db_path if self.db_manager else None
@@ -831,6 +833,11 @@ class Scanner:
                         logger.info(f"[Scanner] ========== DB WORKER COMPLETED (detected by timer) ==========")
                         self._stop_completion_timer()
 
+                        if db_worker.error:
+                            # DB update failed; the error already reached on_error
+                            # via the relay. Do not report success (100%/finished).
+                            logger.warning(f"[Scanner] DB update failed; skipping completion callbacks: {db_worker.error}")
+                            return
                         # Update progress to 100%
                         if on_progress:
                             logger.info(f"[Scanner] Calling on_progress with 100%")

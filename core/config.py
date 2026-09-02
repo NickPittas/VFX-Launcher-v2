@@ -87,6 +87,18 @@ class ConfigManager:
             db_path = os.path.join(os.path.dirname(os.path.abspath(self.config_file)), db_path)
         db_path = os.path.abspath(db_path)
 
+        # Legacy frozen builds kept the database at ~/VFX_Launcher (APPDATA on
+        # Windows). If the resolved path is new but the legacy database exists,
+        # keep using it so upgraded users don't appear to lose their data.
+        if not os.path.exists(db_path):
+            legacy_db = os.path.join(
+                os.environ.get('APPDATA', os.path.expanduser('~')),
+                'VFX_Launcher', 'vfx_launcher.db'
+            )
+            if os.path.exists(legacy_db):
+                logger.info(f"Using legacy database location: {legacy_db}")
+                return legacy_db
+
         # Ensure the directory exists
         db_dir = os.path.dirname(db_path)
         if not os.path.exists(db_dir):
