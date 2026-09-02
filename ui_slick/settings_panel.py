@@ -14,10 +14,11 @@ class SettingsPanel(QWidget):
     - Scalable controls
     - User preferences (placeholder logic)
     """
-    def __init__(self, db_path, user_data, parent=None):
+    def __init__(self, db_manager, user_data, parent=None):
         super().__init__(parent)
         self.setObjectName("SettingsPanel")
-        self.db_path = db_path
+        self.db_manager = db_manager
+        self.db_path = db_manager.db_path
         self.user_data = user_data
         self.config_path = resolve_app_settings_path()
         self.config = configparser.ConfigParser()

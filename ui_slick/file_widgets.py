@@ -68,7 +68,7 @@ class VersionedFileWidget:
         return combo
     
     @staticmethod
-    def create_file_widget(base_name, version_numbers, file_item, tree_widget, file_icon=None):
+    def create_file_widget(base_name, version_numbers, file_item, tree_widget, file_icon=None, on_version_change=None):
         """Create a widget for versioned file with name, dropdown and badge"""
         try:
             # Create custom widget for the file item
@@ -138,9 +138,9 @@ class VersionedFileWidget:
             
             file_layout.addWidget(combo)
             
-            # Connect version change event
+            # Connect version change event (single connection: badge update plus caller callback)
             combo.currentIndexChanged.connect(
-                VersionedFileWidget.make_on_version_change(version_badge, combo)
+                VersionedFileWidget.make_on_version_change(version_badge, combo, on_version_change)
             )
             
             # Add stretch at the end to push everything to the left
@@ -158,9 +158,11 @@ class VersionedFileWidget:
             return None
     
     @staticmethod
-    def make_on_version_change(badge, combo):
+    def make_on_version_change(badge, combo, extra_handler=None):
         """Create a callback function for version changes"""
         def on_version_change(idx):
             badge.setText(combo.currentText())
             badge.setToolTip(f"Current version: {combo.currentText()}")
+            if extra_handler is not None:
+                extra_handler(idx)
         return on_version_change

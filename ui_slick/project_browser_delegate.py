@@ -68,10 +68,14 @@ class FavoriteStarDelegate(QStyledItemDelegate):
         # Only handle mouse click
         if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
             project_id = index.data(Qt.UserRole + 2)
-            if self.favorites_manager.is_favorite(str(project_id)):
-                self.favorites_manager.remove_favorite(str(project_id))
+            if project_id is None:
+                logger.warning("Toggle favorite skipped: project id is None for clicked index")
+                return False
+            project_id = str(project_id)
+            if self.favorites_manager.is_favorite(project_id):
+                self.favorites_manager.remove_favorite(project_id)
             else:
-                self.favorites_manager.add_favorite(str(project_id))
+                self.favorites_manager.add_favorite(project_id)
             model.dataChanged.emit(index, index)
             return True
         return False

@@ -264,8 +264,6 @@ class FilesBrowser(QWidget):
                         self.db_manager.log_file_access(file_id, user_id)
                         logger.info(f"[FilesBrowser] Logged file access: file_id={file_id}, user_id={user_id}")
 
-                        # Refresh the file display to show updated access info
-                        self._refresh_current_files()
 
                 self._on_open_file(filepath)
         except Exception as e:
@@ -298,8 +296,6 @@ class FilesBrowser(QWidget):
                             self.db_manager.log_file_access(file_id, user_id)
                             logger.info(f"[FilesBrowser] Logged file access from context menu: file_id={file_id}, user_id={user_id}")
 
-                            # Refresh the file display to show updated access info
-                            self._refresh_current_files()
 
                 self._on_open_file(filepath)
 
@@ -332,7 +328,7 @@ class FilesBrowser(QWidget):
             ]
             
             # Display filtered files
-            self.display_filtered_files(filtered_files)
+            self._display_filtered_files(filtered_files)
         except Exception as e:
             logger.error(f"[FilesBrowser] Error filtering files: {str(e)}")
     
@@ -370,31 +366,6 @@ class FilesBrowser(QWidget):
         except Exception as e:
             logger.error(f"[FilesBrowser] Error setting current project: {str(e)}")
 
-    def _refresh_current_files(self):
-        """Reload files from database to refresh access info"""
-        try:
-            if self.db_manager and self.current_project_id:
-                logger.info(f"[FilesBrowser] Refreshing files for project_id: {self.current_project_id}")
-
-                # Reload files with updated access info
-                files = self.db_manager.get_files_with_access_info(self.current_project_id)
-
-                # Add base_name to files (same as main_window does)
-                for file in files:
-                    filename = file.get('filename', '')
-                    # Extract base name (without version)
-                    import re
-                    base_name = re.sub(r'_v\d{1,4}', '', filename)
-                    base_name = os.path.splitext(base_name)[0]
-                    file['base_name'] = base_name
-
-                # Display the refreshed files
-                self.display_files(files)
-                logger.info(f"[FilesBrowser] Files refreshed successfully")
-            else:
-                logger.warning(f"[FilesBrowser] Cannot refresh: db_manager={self.db_manager is not None}, project_id={self.current_project_id}")
-        except Exception as e:
-            logger.error(f"[FilesBrowser] Error refreshing files: {str(e)}")
 
     def _on_scan_button_clicked(self):
         """

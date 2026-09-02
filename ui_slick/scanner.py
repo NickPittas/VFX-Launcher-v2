@@ -14,9 +14,10 @@ This implementation strictly follows the project requirements.
 import os
 import time
 import logging
+import warnings
 import configparser
 from datetime import datetime
-from PySide6.QtCore import QObject, QRunnable, Signal, Slot, QThreadPool
+from PySide6.QtCore import QObject, QRunnable, Signal, Slot, QThreadPool, QTimer
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -32,6 +33,22 @@ class ScannerSignals(QObject):
     db_update_complete = Signal(str)  # project path when DB update is done
     error = Signal(str)  # error message
     scan_complete = Signal(str)  # project path
+
+class ScannerSignalRelay(QObject):
+    """
+    Relay that routes worker signals to the GUI thread.
+
+    Worker signals are connected to this relay's signals. The relay is a
+    QObject created on the GUI thread, so Qt delivers each hop as a queued
+    invocation: the relay re-emits on the GUI thread, and the plain Python
+    callbacks connected to it (which are not thread-safe) only ever run there.
+    """
+    progress = Signal(int, str, str)  # percent, message, eta
+    log = Signal(str)  # log message
+    file_found = Signal(dict)  # file info dictionary
+    folder_found = Signal(str)  # full path of matching target folder
+    error = Signal(str)  # error message
+    finished = Signal(list)  # list of files/folders found
 
 
 class FolderMatchWorker(QRunnable):
@@ -103,17 +120,17 @@ class FolderMatchWorker(QRunnable):
                     
                     process = subprocess.Popen(
                         cmd,
-                        stdout=subprocess.PIPE, 
-                        stderr=subprocess.PIPE, 
-                        text=True, 
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
                         shell=True
                     )
                 else:
                     # Unix/Linux/Mac: Use find to list directories only
                     process = subprocess.Popen(
-                        ["find", self.project_path, "-type", "d"], 
-                        stdout=subprocess.PIPE, 
-                        stderr=subprocess.PIPE, 
+                        ["find", self.project_path, "-type", "d"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
                         text=True
                     )
                 
@@ -150,10 +167,11 @@ class FolderMatchWorker(QRunnable):
                             last_update_time = current_time
                 
                 # Wait for process to complete and check for errors
+                # (stderr is merged into stdout above, so there is no separate
+                # pipe to drain - reading one while looping stdout would deadlock)
                 return_code = process.wait()
                 if return_code != 0:
-                    error = process.stderr.read()
-                    self.signals.log.emit(f"⚠ Directory scan process failed with code {return_code}: {error}")
+                    self.signals.log.emit(f"⚠ Directory scan process failed with code {return_code}")
 
                 elapsed = time.time() - start_time
                 self.signals.log.emit(f"✓ Directory scan complete, found {dir_count} directories in {elapsed:.1f}s")
@@ -468,24 +486,43 @@ class Scanner:
         self.folder_match_worker = None
         self.file_search_workers = []
         self._stop_requested = False
-        
+        # GUI-thread signal relay for the current scan (retained so worker
+        # signals stay routed through it)
+        self._signal_relay = None
+        # Completion polling timer for the database update worker (retained
+        # so it is never garbage-collected mid-scan)
+        self._completion_timer = None
+        # Folder-completion counter, mutated only on the GUI thread (via the
+        # signal relay), so no locking is needed
+        self.completed_folders = 0
+
         # Results storage
         self.matching_folders = []
         self.found_files = []
-        
+
+    def _ensure_signal_relay(self):
+        """Return the signal relay for the current scan, creating it if needed"""
+        if self._signal_relay is None:
+            self._signal_relay = ScannerSignalRelay()
+        return self._signal_relay
+
+    def _stop_completion_timer(self):
+        """Stop and drop the completion timer left over from a previous scan"""
+        if self._completion_timer is not None:
+            self._completion_timer.stop()
+            self._completion_timer = None
+
     def _load_target_folder_names(self):
         """Load target folder names from app_settings.ini"""
-        import os
-        import configparser
-        
+        from core.config import resolve_app_settings_path
+
         # Default target folder names
         target_folder_names = ['project', 'projects', 'Project', 'Projects']
-        
-        # Find the settings path
-        app_settings_path = os.path.join(os.path.dirname(__file__), '..', 'app_settings.ini')
-        config_settings_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'app_settings.ini')
-        settings_path = app_settings_path if os.path.exists(app_settings_path) else config_settings_path
-        
+
+        # Resolve the active settings path (dev repo file or writable per-user
+        # copy in frozen builds)
+        settings_path = resolve_app_settings_path()
+
         # Read from settings if available
         if os.path.exists(settings_path):
             try:
@@ -510,8 +547,9 @@ class Scanner:
                 logger.info(f"Created default settings at {settings_path}")
             except Exception as e:
                 logger.error(f"Error creating default settings: {e}")
-        
+
         return target_folder_names
+        
         
     def scan_project(self, project_path, on_progress=None, on_folder_found=None, 
                      on_file_found=None, on_log=None, on_finished=None, on_error=None):
@@ -528,25 +566,41 @@ class Scanner:
         self._stop_requested = False
         self.matching_folders = []
         self.found_files = []
-        
+        self._stop_completion_timer()
+
         # Load target folder names from settings
         target_folder_names = self._load_target_folder_names()
-        
+
         # Create folder match worker
         self.folder_match_worker = FolderMatchWorker(project_path, target_folder_names)
-        
-        # Connect signals
+
+        # Create the GUI-thread signal relay for this scan (retained on self,
+        # never a local). Every worker signal is routed through it, and the
+        # plain callbacks below are connected to the relay instead of to the
+        # worker signals, so Qt delivers them queued and they only run on the
+        # GUI thread.
+        relay = self._signal_relay = ScannerSignalRelay()
+
+        # Route every folder match worker signal through the relay
+        self.folder_match_worker.signals.progress.connect(relay.progress)
+        self.folder_match_worker.signals.log.connect(relay.log)
+        self.folder_match_worker.signals.folder_found.connect(relay.folder_found)
+        self.folder_match_worker.signals.error.connect(relay.error)
+        self.folder_match_worker.signals.finished.connect(relay.finished)
+
+        # Connect relay signals to the plain callbacks (GUI thread only)
         if on_progress:
-            self.folder_match_worker.signals.progress.connect(on_progress)
-        
+            relay.progress.connect(on_progress)
+
         if on_log:
-            self.folder_match_worker.signals.log.connect(on_log)
-        
+            relay.log.connect(on_log)
+
         if on_folder_found:
-            self.folder_match_worker.signals.folder_found.connect(on_folder_found)
-        
+            relay.folder_found.connect(on_folder_found)
+
         if on_error:
-            self.folder_match_worker.signals.error.connect(on_error)
+            relay.error.connect(on_error)
+
         
         # Connect folder match completion to start file search
         def on_folder_match_complete(matching_folders):
@@ -555,15 +609,19 @@ class Scanner:
                 on_log(f"Found {len(matching_folders)} matching folders: {matching_folders}")
                 
             # Save matching folders to database if db_manager available
-            if self.db_manager and hasattr(self.db_manager, 'update_project_folders'):
+            if self.db_manager:
                 try:
-                    project = self.db_manager.get_project_by_path(project_path)
+                    project = self.db_manager.get_project_by_path(self._canonical_path(project_path))
+                    if not project:
+                        # Single fallback with the raw spelling as given (legacy DB rows)
+                        project = self.db_manager.get_project_by_path(project_path)
                     if project:
                         self.db_manager.update_project_folders(project['id'], matching_folders)
                         if on_log:
                             on_log(f"Updated project folders in database for project ID {project['id']}")
                 except Exception as e:
                     logger.error(f"Error updating project folders in database: {str(e)}")
+
             
             # Start file search in each matching folder
             if matching_folders:
@@ -575,7 +633,7 @@ class Scanner:
                 if on_finished:
                     on_finished(project_path, [])
         
-        self.folder_match_worker.signals.finished.connect(on_folder_match_complete)
+        relay.finished.connect(on_folder_match_complete)
         
         # Start folder match worker
         self.thread_pool.start(self.folder_match_worker)
@@ -627,12 +685,57 @@ class Scanner:
         # Create and start a worker for each matching folder
         if on_log:
             on_log(f"Starting file search in {len(matching_folders)} folders")
-            
+
         # Get file extensions to scan for from settings or use defaults
         file_extensions = ['.nk', '.aep']
-        
+
+        # Get the GUI-thread signal relay for this scan (full scans created it
+        # in scan_project; quick scans create it here on the GUI thread) and
+        # rewire it for the file-search phase: disconnect the folder-match
+        # receivers so each callback fires exactly once per event.
+        relay = self._ensure_signal_relay()
+        with warnings.catch_warnings():
+            # PySide prints a RuntimeWarning when disconnecting a signal
+            # that has no receivers yet
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for relay_signal in (relay.progress, relay.log, relay.file_found,
+                                 relay.folder_found, relay.error, relay.finished):
+                try:
+                    relay_signal.disconnect()
+                except RuntimeError:
+                    pass  # Signal had no connections yet
+
+        total_folders = len(matching_folders)
+
+        # Single progress handler shared by all file search workers. It runs
+        # on the GUI thread via the relay, like every other callback below,
+        # so reading self.completed_folders there needs no lock.
+        if on_progress:
+            def overall_progress_handler(percent, msg, eta):
+                # Scale individual worker progress (0-100%) to overall progress (50-95%)
+                # Each folder gets an equal share of the 45% range
+                folder_share = 45 / total_folders
+                # Use current completed_folders count from scanner
+                base_progress = 50 + (self.completed_folders * folder_share)
+                current_folder_progress = (percent / 100) * folder_share
+                overall_progress = int(base_progress + current_folder_progress)
+                overall_progress = min(overall_progress, 95)  # Cap at 95%
+
+                # Show individual folder progress with ETA
+                current_index = min(self.completed_folders + 1, total_folders)
+                on_progress(overall_progress, f"Folder {current_index}/{total_folders}: {msg}", eta)
+            relay.progress.connect(overall_progress_handler)
+
+        relay.log.connect(on_log if on_log else lambda _: None)
+        relay.file_found.connect(on_file_found if on_file_found else lambda _: None)
+        relay.error.connect(on_error if on_error else lambda _: None)
+        # The completed_folders/remaining_folders counters mutated by this
+        # handler are only ever touched on the GUI thread because the relay
+        # re-emits there - no locking needed.
+        relay.finished.connect(on_file_search_complete)
+
         # Create and start workers for each folder
-        for folder_index, folder_path in enumerate(matching_folders, 1):
+        for folder_path in matching_folders:
             if self._stop_requested:
                 break
 
@@ -640,36 +743,23 @@ class Scanner:
             worker = FileSearchWorker(project_path, folder_path, file_extensions)
             self.file_search_workers.append(worker)
 
-            # Connect signals - use default parameter to capture folder_index properly
-            def make_progress_handler(idx, total, scanner_ref):
-                def handler(percent, msg, eta):
-                    if on_progress:
-                        # Scale individual worker progress (0-100%) to overall progress (50-95%)
-                        # Each folder gets an equal share of the 45% range
-                        folder_share = 45 / total
-                        # Use current completed_folders count from scanner
-                        base_progress = 50 + (scanner_ref.completed_folders * folder_share)
-                        current_folder_progress = (percent / 100) * folder_share
-                        overall_progress = int(base_progress + current_folder_progress)
-                        overall_progress = min(overall_progress, 95)  # Cap at 95%
-
-                        # Show individual folder progress with ETA
-                        on_progress(overall_progress, f"Folder {idx}/{total}: {msg}", eta)
-                return handler
-
-            worker.signals.progress.connect(make_progress_handler(folder_index, len(matching_folders), self))
-            worker.signals.log.connect(on_log if on_log else lambda _: None)
-            worker.signals.file_found.connect(on_file_found if on_file_found else lambda _: None)
-            worker.signals.error.connect(on_error if on_error else lambda _: None)
-            worker.signals.finished.connect(on_file_search_complete)
+            # Route every worker signal through the GUI-thread relay
+            worker.signals.progress.connect(relay.progress)
+            worker.signals.log.connect(relay.log)
+            worker.signals.file_found.connect(relay.file_found)
+            worker.signals.error.connect(relay.error)
+            worker.signals.finished.connect(relay.finished)
 
             # Start worker
             self.thread_pool.start(worker)
 
             if on_log:
                 on_log(f"Started file search in: {folder_path}")
+
         
-        # Function to handle completion of all file searches
+        # Function to handle completion of all file searches. Reached only via
+        # on_file_search_complete, which the relay runs on the GUI thread, so
+        # everything below (including the completion timer) executes there.
         def on_all_file_searches_complete():
             # Update database if db_manager available
             if self.db_manager:
@@ -720,27 +810,26 @@ class Scanner:
                 db_path = self.db_manager.db_path if self.db_manager else None
                 db_worker = DbUpdateWorker(self, project_path, self.found_files, db_path)
 
-                # Connect signals
-                if on_log:
-                    db_worker.signals.log.connect(on_log)
-
-                if on_error:
-                    db_worker.signals.error.connect(on_error)
+                # Connect signals through the GUI-thread relay
+                db_worker.signals.log.connect(relay.log)
+                db_worker.signals.error.connect(relay.error)
 
                 # Start database update worker
                 logger.info(f"[Scanner] Starting database update worker in thread pool")
                 self.thread_pool.start(db_worker)
                 logger.info(f"[Scanner] Database update worker started")
 
-                # Use a timer to poll for completion
-                from PySide6.QtCore import QTimer
-                completion_timer = QTimer()
-                completion_timer.setInterval(100)  # Check every 100ms
+                # Use a timer to poll for completion. The timer is retained on
+                # self (never a bare local) so it is not garbage-collected
+                # mid-scan and can be stopped when the next scan starts.
+                self._stop_completion_timer()
+                self._completion_timer = QTimer()
+                self._completion_timer.setInterval(100)  # Check every 100ms
 
                 def check_completion():
                     if db_worker.completed:
                         logger.info(f"[Scanner] ========== DB WORKER COMPLETED (detected by timer) ==========")
-                        completion_timer.stop()
+                        self._stop_completion_timer()
 
                         # Update progress to 100%
                         if on_progress:
@@ -754,8 +843,8 @@ class Scanner:
 
                         logger.info(f"[Scanner] Completion handling finished")
 
-                completion_timer.timeout.connect(check_completion)
-                completion_timer.start()
+                self._completion_timer.timeout.connect(check_completion)
+                self._completion_timer.start()
                 logger.info(f"[Scanner] Completion timer started, polling every 100ms")
             else:
                 # No DB manager, just signal completion
@@ -804,6 +893,12 @@ class Scanner:
         
         self._stop_requested = False
         self.found_files = []
+        self._stop_completion_timer()
+
+        # Fresh GUI-thread signal relay for this scan (quick scans wire it up
+        # in _start_file_search, which runs on the GUI thread)
+        self._signal_relay = ScannerSignalRelay()
+
         
         # Get the target folder names from settings
         target_folder_names = self._load_target_folder_names()
@@ -821,14 +916,22 @@ class Scanner:
                     
                 with self.db_manager.get_connection() as conn:
                     cursor = conn.cursor()
-                    # First try exact path match
-                    cursor.execute("SELECT id FROM projects WHERE path = ?", (project_path,))
+                    # Primary lookup uses the canonical form (how new project
+                    # rows are stored); single fallback keeps the raw spelling
+                    # as given for legacy database rows
+                    cursor.execute("SELECT id FROM projects WHERE path = ?", (self._canonical_path(project_path),))
                     result = cursor.fetchone()
-                    
+                    if not result:
+                        cursor.execute("SELECT id FROM projects WHERE path = ?", (project_path,))
+                        result = cursor.fetchone()
+
                     # If not found and this is a Projects subfolder, try the parent path
                     if not result and project_path != parent_project_path:
-                        cursor.execute("SELECT id FROM projects WHERE path = ?", (parent_project_path,))
+                        cursor.execute("SELECT id FROM projects WHERE path = ?", (self._canonical_path(parent_project_path),))
                         result = cursor.fetchone()
+                        if not result:
+                            cursor.execute("SELECT id FROM projects WHERE path = ?", (parent_project_path,))
+                            result = cursor.fetchone()
                         if result and on_log:
                             on_log(f"Found project using parent path: {parent_project_path}")
                 
@@ -843,10 +946,12 @@ class Scanner:
                         if on_log:
                             on_log(f"Project not found with normalized path, trying parent relationship check")
                             
+                        canonical_scan_path = self._canonical_path(project_path)
+                        canonical_scan_parent = self._canonical_path(parent_project_path)
                         for proj in all_projects:
                             # Check if our path starts with the project path (is a subfolder)
-                            normalized_proj_path = self._normalize_path(proj['path'])
-                            if project_path.startswith(normalized_proj_path + '/') or parent_project_path.startswith(normalized_proj_path + '/'):
+                            normalized_proj_path = self._canonical_path(proj['path'])
+                            if canonical_scan_path.startswith(normalized_proj_path + os.sep) or canonical_scan_parent.startswith(normalized_proj_path + os.sep):
                                 project_id = proj['id']
                                 if on_log:
                                     on_log(f"Found parent project in database with ID: {project_id} (path: {proj['path']})")
@@ -865,8 +970,33 @@ class Scanner:
             # Don't treat this as an error, just continue with fallback approach
             # if on_error:
             #    on_error("Database manager not available for quick scan")
-            # Try to get folders from database if we have both a database manager and a project ID
+        # Preferred folder source: the folders column persisted by the last
+        # full scan (newline-joined paths)
         if self.db_manager and 'project_id' in locals() and project_id:
+            try:
+                rows = self.db_manager._execute_query(
+                    "SELECT folders FROM projects WHERE id = ?",
+                    (project_id,)
+                )
+                stored_folders = []
+                if rows and rows[0]['folders']:
+                    stored_folders = [
+                        folder for folder in rows[0]['folders'].split('\n')
+                        if folder and os.path.isdir(folder)
+                    ]
+
+                if stored_folders:
+                    matching_folders = stored_folders
+                    if on_log:
+                        on_log(f"Using {len(stored_folders)} stored folders from last full scan for project ID {project_id}")
+                elif on_log:
+                    on_log(f"No stored folders for project ID {project_id}, falling back to file paths")
+            except Exception as e:
+                if on_log:
+                    on_log(f"Error reading stored folders for project ID {project_id}: {str(e)}")
+
+        # Fallback: derive folders from the file paths already in the database
+        if self.db_manager and 'project_id' in locals() and project_id and not matching_folders:
             try:
                 if on_log:
                     on_log(f"Querying database for existing folders for project ID {project_id}")
@@ -1004,6 +1134,15 @@ class Scanner:
             path = path[:-1]
             
         return path
+
+    def _canonical_path(self, path):
+        """
+        Canonical path form used for database lookups and new project rows:
+        absolute, normalized, and case-folded per platform.
+        """
+        if not path:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
         
     def _update_database(self, project_path, files, thread_db=None):
         """
@@ -1030,33 +1169,22 @@ class Scanner:
         project_path = self._normalize_path(project_path)
         parent_project_path = self._normalize_path(parent_project_path)
         
-        # Try multiple path variations to find the project
-        project = None
-        
-        # Try with parent path first
-        project = db_manager.get_project_by_path(parent_project_path)
-        
-        # If not found, try with original path
+        # Canonical form for the primary database lookup and for new rows
+        canonical_parent_path = self._canonical_path(parent_project_path)
+
+        # Primary lookup with the canonical form; single fallback with the
+        # raw parent spelling as given (legacy database rows). No
+        # backslash-swap or trailing-slash variants.
+        project = db_manager.get_project_by_path(canonical_parent_path)
         if not project:
-            project = db_manager.get_project_by_path(project_path)
-            
-        # If still not found, try variations
-        if not project:
-            # Try with Windows backslashes
-            windows_path = parent_project_path.replace('/', '\\')
-            project = db_manager.get_project_by_path(windows_path)
-            
-            if not project and not parent_project_path.endswith('/'):
-                # Try with trailing slash
-                with_slash = parent_project_path + '/'
-                project = db_manager.get_project_by_path(with_slash)
-        
-        # If project still not found, create it
+            project = db_manager.get_project_by_path(parent_project_path)
+
+        # If project still not found, create it with the canonical path
         project_name = os.path.basename(parent_project_path)
         if not project:
             try:
-                project_id = db_manager.create_project(project_name, parent_project_path)
-                logger.info(f"Created new project in database: {project_name} ({parent_project_path})")
+                project_id = db_manager.create_project(project_name, canonical_parent_path)
+                logger.info(f"Created new project in database: {project_name} ({canonical_parent_path})")
                 project = {'id': project_id}
             except Exception as e:
                 logger.error(f"Error creating project {project_name}: {str(e)}")
@@ -1137,21 +1265,31 @@ class Scanner:
         
         # Handle deleted files - remove files that exist in DB but weren't found on disk
         deleted_files = []
-        for db_filepath, db_file in existing_paths.items():
-            if db_filepath not in current_filepaths:
-                try:
-                    # Check if file exists on disk as a final verification
-                    if not os.path.exists(db_filepath):
-                        # File is in DB but not on disk, delete it
-                        db_manager._execute_query(
-                            "DELETE FROM project_files WHERE id = ?", 
-                            (db_file.get('id'),)
-                        )
-                        deleted_files.append(db_filepath)
-                        logger.info(f"Removed file from DB (no longer exists): {db_filepath}")
-                except Exception as e:
-                    logger.error(f"Error removing deleted file {db_filepath}: {str(e)}")
-        
+        if self._stop_requested or not os.path.exists(original_project_path):
+            # Skip the sweep entirely when the scan was cancelled or the
+            # project path is unavailable (e.g. an unmounted network share):
+            # in both cases the files were simply not seen, and sweeping
+            # would mass-delete rows for files that still exist.
+            logger.warning(
+                f"Skipping deleted-file sweep for {original_project_path} "
+                f"(stop_requested={self._stop_requested}, "
+                f"path_exists={os.path.exists(original_project_path)})"
+            )
+        else:
+            for db_filepath, db_file in existing_paths.items():
+                if db_filepath not in current_filepaths:
+                    try:
+                        # Check if file exists on disk as a final verification
+                        if not os.path.exists(db_filepath):
+                            # File is in DB but not on disk, delete it
+                            db_manager._execute_query(
+                                "DELETE FROM project_files WHERE id = ?",
+                                (db_file.get('id'),)
+                            )
+                            deleted_files.append(db_filepath)
+                            logger.info(f"Removed file from DB (no longer exists): {db_filepath}")
+                    except Exception as e:
+                        logger.error(f"Error removing deleted file {db_filepath}: {str(e)}")
         # Log results
         logger.info(f"Database update complete: {len(new_files)} new, {len(updated_files)} updated, {len(deleted_files)} deleted")
     

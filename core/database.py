@@ -2,8 +2,9 @@
 Database Management Module
 
 Purpose:
-    Handles SQLite database initialization, connection pooling, and schema management.
-    Provides reusable CRUD functions for all database operations.
+    Handles SQLite database initialization, thread-safe connection management,
+    and schema management. Provides reusable CRUD functions for all database
+    operations.
 
 Requirements:
     - Automatically create the database and tables if not present
@@ -14,36 +15,35 @@ Requirements:
 import os
 import sqlite3
 import logging
+import threading
+import weakref
 from contextlib import contextmanager
 import time
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
+
+def _close_connections(thread_connections):
+    """
+    Close every per-thread connection tracked in thread_connections.
+
+    Registered as a weakref finalizer so connections are closed when the
+    owning DatabaseManager is garbage-collected. Connections are created
+    with check_same_thread=False, so this may run on any thread. Individual
+    failures are logged and swallowed so one bad connection does not
+    prevent the rest from being closed.
+    """
+    for thread_id, connection in list(thread_connections.items()):
+        try:
+            connection.close()
+        except Exception as e:
+            logger.warning(f"Failed to close connection for thread {thread_id}: {e}")
+
 class DatabaseManager:
     """
-    Handles all database operations including initialization, connection pooling,
-    and provides methods for CRUD operations.
-    """
-
-    def get_all_logs(self):
-        """
-        Get all logs from the logs table.
-        Returns:
-            list: List of log dictionaries with keys: level, timestamp, message
-        """
-        try:
-            result = self._execute_query(
-                "SELECT level, timestamp, message FROM logs ORDER BY timestamp DESC"
-            )
-            return [dict(row) for row in result]
-        except Exception as e:
-            logger.error(f"Error fetching logs: {str(e)}")
-            return []
-
-    """
-    Handles all database operations including initialization, connection pooling,
-    and provides methods for CRUD operations.
+    Handles all database operations including initialization, thread-safe
+    connection management, and provides methods for CRUD operations.
     """
     
     def __init__(self, db_path):
@@ -54,11 +54,15 @@ class DatabaseManager:
             db_path (str): Path to the SQLite database file
         """
         self.db_path = db_path
-        self.connection_pool = []
-        self.max_pool_size = 5
-        
-        # Track which thread owns each connection
+
+        # Track which thread owns each connection (per-thread connection cache)
         self._thread_connections = {}
+
+        # Close all per-thread connections when this manager is collected.
+        # Connections use check_same_thread=False so any thread may close them.
+        self._finalizer = weakref.finalize(
+            self, _close_connections, self._thread_connections
+        )
         
         # Ensure database directory exists
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -142,6 +146,17 @@ class DatabaseManager:
                 )
             """)
 
+            # Create user_activity_log table to record user actions
+            self._execute_query("""
+                CREATE TABLE IF NOT EXISTS user_activity_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    action_type TEXT,
+                    description TEXT,
+                    timestamp TEXT DEFAULT (datetime('now','localtime'))
+                )
+            """)
+
             # Check if default admin user exists, create if not
             self._execute_query("""
                 INSERT OR IGNORE INTO users (username, is_admin)
@@ -173,46 +188,34 @@ class DatabaseManager:
     @contextmanager
     def get_connection(self):
         """
-        Get a database connection from the pool or create a new one.
-        
-        Returns:
+        Get the database connection for the current thread.
+
+        Connections are cached per thread and reused for the lifetime of
+        this manager. Each connection is created with check_same_thread=False
+        so the weakref finalizer may close it from any thread.
+
+        Yields:
             sqlite3.Connection: SQLite connection object
         """
-        # Check for a thread-specific connection first
-        import threading
         thread_id = threading.get_ident()
-        
-        # Try to get a connection from the thread-specific pool
+
         if thread_id in self._thread_connections:
             connection = self._thread_connections[thread_id]
-        # Try to get a connection from the pool
-        elif self.connection_pool:
-            connection = self.connection_pool.pop()
-            # Store this connection as the thread's connection
-            self._thread_connections[thread_id] = connection
         else:
-            # Create a new connection if pool is empty
-            connection = sqlite3.connect(self.db_path)
+            # Create a new connection for this thread
+            connection = sqlite3.connect(self.db_path, check_same_thread=False)
             # Enable foreign key support
             connection.execute("PRAGMA foreign_keys = ON")
             # Ensure rows are dict-like for all queries
             connection.row_factory = sqlite3.Row
             # Store this connection as the thread's connection
             self._thread_connections[thread_id] = connection
-        
+
         try:
             yield connection
         except Exception as e:
             logger.error(f"Database connection error: {str(e)}")
             raise
-        finally:
-            # SQLite connections do not have a 'closed' attribute.
-            # Assume the connection is valid unless an exception is raised.
-            try:
-                # Don't return thread-specific connections to the pool
-                pass
-            except Exception as pool_exc:
-                logger.warning(f"Failed to manage connection: {pool_exc}")
     
     def _execute_query(self, query, params=None):
         """
@@ -278,6 +281,30 @@ class DatabaseManager:
                 logger.error(f"Params list length: {len(params_list)}")
                 raise
     
+    def _execute_transaction(self, operations):
+        """
+        Execute multiple statements as a single atomic transaction on one connection.
+
+        Args:
+            operations (list[tuple[str, tuple]]): (query, params) pairs executed in order
+
+        Raises:
+            sqlite3.Error: On failure, after rolling back all changes
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                for query, params in operations:
+                    cursor.execute(query, params)
+                conn.commit()
+            except sqlite3.Error as e:
+                conn.rollback()
+                logger.error(f"Transaction execution error: {str(e)}")
+                for query, params in operations:
+                    logger.error(f"Transaction statement: {query}")
+                raise
+
     # User CRUD operations
     def create_user(self, username, is_admin=0):
         """
@@ -492,45 +519,64 @@ class DatabaseManager:
             logger.warning(f"Cannot update project - path '{path}' already exists")
             return False
     
-    def delete_project(self, project_id):
+    def update_project_folders(self, project_id, folders):
         """
-        Delete a project and its associated files.
-        
+        Store the list of folders scanned for a project.
+
+        Adds the folders column to the projects table if it does not exist
+        yet, then stores the folder paths newline-separated.
+
         Args:
             project_id (int): Project ID
-            
+            folders (list[str]): Folder paths associated with the project
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                try:
+                    conn.execute("ALTER TABLE projects ADD COLUMN folders TEXT")
+                    conn.commit()
+                except sqlite3.OperationalError as e:
+                    # Column was already added on a previous call
+                    if "duplicate column" not in str(e).lower():
+                        raise
+            self._execute_query(
+                "UPDATE projects SET folders = ? WHERE id = ?",
+                ("\n".join(folders), project_id)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update folders for project_id={project_id}: {e}")
+            return False
+
+    def delete_project(self, project_id):
+        """
+        Delete a project and all associated records in a single transaction.
+
+        file_access_log references project_files without an ON DELETE
+        cascade, so access-log rows must be removed before project_files.
+
+        Args:
+            project_id (int): Project ID
+
         Returns:
             bool: True if deletion successful
         """
         try:
-            logger.info(f"[DB] Deleting project_files for project_id={project_id}")
-            self._execute_query(
-                "DELETE FROM project_files WHERE project_id = ?",
-                (project_id,)
-            )
-            logger.info(f"[DB] Deleted project_files for project_id={project_id}")
-            
-            logger.info(f"[DB] Deleting recent_projects for project_id={project_id}")
-            self._execute_query(
-                "DELETE FROM recent_projects WHERE project_id = ?",
-                (project_id,)
-            )
-            logger.info(f"[DB] Deleted recent_projects for project_id={project_id}")
-            
-            logger.info(f"[DB] Deleting favorite_projects for project_id={project_id}")
-            self._execute_query(
-                "DELETE FROM favorite_projects WHERE project_id = ?",
-                (project_id,)
-            )
-            logger.info(f"[DB] Deleted favorite_projects for project_id={project_id}")
-            
-            logger.info(f"[DB] Deleting project for id={project_id}")
-            self._execute_query(
-                "DELETE FROM projects WHERE id = ?",
-                (project_id,)
-            )
-            logger.info(f"[DB] Deleted project for id={project_id}")
-            
+            logger.info(f"[DB] Deleting project_id={project_id}")
+            self._execute_transaction([
+                (
+                    "DELETE FROM file_access_log WHERE file_id IN "
+                    "(SELECT id FROM project_files WHERE project_id = ?)",
+                    (project_id,)
+                ),
+                ("DELETE FROM project_files WHERE project_id = ?", (project_id,)),
+                ("DELETE FROM recent_projects WHERE project_id = ?", (project_id,)),
+                ("DELETE FROM favorite_projects WHERE project_id = ?", (project_id,)),
+                ("DELETE FROM projects WHERE id = ?", (project_id,)),
+            ])
             logger.info(f"[DB] Successfully deleted project_id={project_id}")
             return True
         except Exception as e:
@@ -619,13 +665,29 @@ class DatabaseManager:
         Returns:
             list: List of file dictionaries
         """
+        escaped_base = (
+            filename_base
+            .replace("/", "//")
+            .replace("%", "/%")
+            .replace("_", "/_")
+        )
         result = self._execute_query(
             """
-            SELECT * FROM project_files 
-            WHERE project_id = ? AND filename LIKE ?
+            SELECT * FROM project_files
+            WHERE project_id = ?
+              AND (
+                  filename LIKE ? ESCAPE '/'
+                  OR filename = ?
+                  OR filename = ?
+              )
             ORDER BY version DESC
             """,
-            (project_id, f"{filename_base}%")
+            (
+                project_id,
+                f"{escaped_base}/_v%",
+                f"{filename_base}.nk",
+                f"{filename_base}.aep",
+            )
         )
         return [dict(row) for row in result]
     

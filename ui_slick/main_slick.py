@@ -48,7 +48,7 @@ import os
 # Ensure parent directory is on sys.path for package imports
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QDockWidget
+from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QDockWidget, QMessageBox
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 # Import our SlickMainWindow class from the main_window module
@@ -71,6 +71,12 @@ def main():
 
     logger.info(f"Using database path: {db_path}")
     logger.info(f"Using config path: {config_path}")
+
+    # Warn before DatabaseManager silently creates a new empty database
+    if not os.path.exists(db_path):
+        QMessageBox.warning(None, 'Database Not Found',
+                            f'Database not found at:\n{db_path}\n\n'
+                            f'A new empty database will be created there.')
 
     # Create database manager
     db_manager = DatabaseManager(db_path)

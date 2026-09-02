@@ -67,7 +67,8 @@ class FileTreeManager:
         
         # Add folder icon
         icon_label = QLabel()
-        icon_label.setPixmap(QIcon("icons/folder_icon.png").pixmap(16, 16))
+        folder_icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", "folder_icon.png")
+        icon_label.setPixmap(QIcon(folder_icon_path).pixmap(16, 16))
         layout.addWidget(icon_label)
         
         # Add shot name with spacing for clarity
@@ -189,13 +190,13 @@ class FileTreeManager:
                         version = version_numbers[idx]
                         file_paths_by_version[version] = file.get('filepath', '')
                 
-                # Create widget with version dropdown
                 file_widget = VersionedFileWidget.create_file_widget(
                     base_name,
                     version_numbers,
                     file_item,
                     self.tree_widget,
-                    file_icon  # Pass the file icon
+                    file_icon,  # Pass the file icon
+                    on_version_change  # Unique path/access-info logic; badge handled in file_widgets
                 )
                 
                 # Find the combo box in the widget
@@ -239,44 +240,38 @@ class FileTreeManager:
 
                     file_item.setText(2, opened_by if opened_by else "-")
 
-                # Custom version change handler
-                if combo and version_badge:
-                    def on_version_change(idx):
-                        if idx >= 0 and idx < len(version_numbers):
-                            selected_version = version_numbers[idx]
-                            selected_path = file_paths_by_version.get(selected_version, '')
-                            selected_file = versions_sorted[idx] if idx < len(versions_sorted) else None
+                # Custom version change handler (connected once inside create_file_widget)
+                def on_version_change(idx):
+                    if idx >= 0 and idx < len(version_numbers):
+                        selected_version = version_numbers[idx]
+                        selected_path = file_paths_by_version.get(selected_version, '')
+                        selected_file = versions_sorted[idx] if idx < len(versions_sorted) else None
 
-                            # Update the badge and filepath
-                            version_badge.setText(selected_version)
-                            version_badge.setToolTip(f"Current version: {selected_version}")
-                            file_item.setData(0, 256, selected_path)  # Update path for launching
+                        # Update filepath for launching
+                        file_item.setData(0, 256, selected_path)
 
-                            # Update access info for selected version
-                            if selected_file:
-                                file_id = selected_file.get('id', None)
-                                file_item.setData(0, 257, file_id)  # Update file ID
+                        # Update access info for selected version
+                        if selected_file:
+                            file_id = selected_file.get('id', None)
+                            file_item.setData(0, 257, file_id)  # Update file ID
 
-                                last_opened = selected_file.get('last_opened', '')
-                                opened_by = selected_file.get('opened_by', '')
+                            last_opened = selected_file.get('last_opened', '')
+                            opened_by = selected_file.get('opened_by', '')
 
-                                if last_opened:
-                                    from datetime import datetime
-                                    try:
-                                        dt = datetime.fromisoformat(last_opened.replace('Z', '+00:00'))
-                                        formatted_time = dt.strftime('%Y-%m-%d %H:%M')
-                                    except:
-                                        formatted_time = last_opened
-                                    file_item.setText(1, formatted_time)
-                                else:
-                                    file_item.setText(1, "Never")
+                            if last_opened:
+                                from datetime import datetime
+                                try:
+                                    dt = datetime.fromisoformat(last_opened.replace('Z', '+00:00'))
+                                    formatted_time = dt.strftime('%Y-%m-%d %H:%M')
+                                except:
+                                    formatted_time = last_opened
+                                file_item.setText(1, formatted_time)
+                            else:
+                                file_item.setText(1, "Never")
 
-                                file_item.setText(2, opened_by if opened_by else "-")
+                            file_item.setText(2, opened_by if opened_by else "-")
 
-                            logger.debug(f"Updated file path to {selected_path} for version {selected_version}")
-
-                    # Connect the handler
-                    combo.currentIndexChanged.connect(on_version_change)
+                        logger.debug(f"Updated file path to {selected_path} for version {selected_version}")
             else:
                 # Single version - just add as a regular file
                 single_file = file_versions[0] if file_versions else None

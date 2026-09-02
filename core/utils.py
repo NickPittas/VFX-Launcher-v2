@@ -23,44 +23,6 @@ logger = logging.getLogger(__name__)
 VERSION_REGEX = re.compile(r'_v(\d+)', re.IGNORECASE)
 
 
-def setup_logger(log_file, log_level=logging.INFO):
-    """
-    Configure the application logger.
-    
-    Args:
-        log_file (str): Path to log file
-        log_level (int): Logging level
-    """
-    # Create directory for log file if it doesn't exist
-    log_dir = os.path.dirname(os.path.abspath(log_file))
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Configure root logger
-    logger = logging.getLogger()
-    logger.setLevel(log_level)
-    
-    # Remove existing handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-    
-    # Create file handler
-    file_handler = logging.FileHandler(log_file)
-    file_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
-    
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    console_formatter = logging.Formatter(
-        '%(levelname)s: %(message)s'
-    )
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
-    
-    logger.info("Logger initialized")
-
 
 def extract_version(filename):
     """
@@ -118,23 +80,28 @@ def format_timestamp(timestamp):
 def get_latest_version_file(files):
     """
     Get the file with the latest version from a list of files.
-    
+
     Args:
         files (list): List of file dictionaries with 'version' key
-        
+
     Returns:
         dict: File with the latest version, or None if list is empty
     """
     if not files:
         return None
-    
-    # Sort files by version (as integer)
+
+    # Sort by version (as integer), then last-modified time, then filename
+    # so results are deterministic when versions tie
     sorted_files = sorted(
         files,
-        key=lambda x: int(x['version']) if x['version'].isdigit() else 0,
+        key=lambda x: (
+            int(x['version']) if x['version'].isdigit() else 0,
+            x.get('last_modified') or 0,
+            x.get('filename', ''),
+        ),
         reverse=True
     )
-    
+
     return sorted_files[0]
 
 

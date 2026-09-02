@@ -1,5 +1,8 @@
 import os
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class FavoritesManager:
     """
@@ -27,8 +30,8 @@ class FavoritesManager:
         try:
             with open(self.fav_path, 'w', encoding='utf-8') as f:
                 json.dump(list(self.favorites), f, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to save favorites to {self.fav_path}: {e}")
 
     def is_favorite(self, project_id_or_path):
         return project_id_or_path in self.favorites

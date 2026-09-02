@@ -1,6 +1,6 @@
 """
 Configuration Manager for VFX Launcher
-Handles reading configuration from config.ini file
+Handles reading configuration from app_settings.ini file
 """
 import os
 import sys
@@ -30,38 +30,28 @@ class ConfigManager:
     def __init__(self, config_file=None):
         """
         Initialize configuration manager
-        
+
         Args:
-            config_file: Path to config.ini file. If None, searches in standard locations.
+            config_file: Path to app_settings.ini file. If None, the active
+                app_settings.ini is resolved automatically (see resolve_app_settings_path).
         """
         self.config = configparser.ConfigParser()
         self.config_file = config_file or self._find_config_file()
-        
+
         if self.config_file and os.path.exists(self.config_file):
             logger.info(f"Loading configuration from: {self.config_file}")
-            self.config.read(self.config_file)
+            try:
+                self.config.read(self.config_file)
+            except configparser.Error as e:
+                logger.warning(f"Error reading config file {self.config_file}: {e}. Using defaults.")
+            self._set_defaults()
         else:
             logger.warning(f"Config file not found: {self.config_file}. Using defaults.")
             self._set_defaults()
     
     def _find_config_file(self):
-        """Find config.ini in standard locations"""
-        # Check in application directory (for installed version)
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        app_config = os.path.join(app_dir, '..', 'config.ini')
-        if os.path.exists(app_config):
-            return app_config
-        
-        # Check in executable directory (for PyInstaller)
-        if getattr(sys, 'frozen', False):
-            exe_dir = os.path.dirname(sys.executable)
-            exe_config = os.path.join(exe_dir, 'config.ini')
-            if os.path.exists(exe_config):
-                return exe_config
-        
-        # Check in development directory
-        dev_config = os.path.join(app_dir, '..', 'config.ini')
-        return dev_config
+        """Resolve the active app_settings.ini location"""
+        return resolve_app_settings_path()
     
     def _set_defaults(self):
         """Set default configuration values"""
@@ -75,8 +65,8 @@ class ConfigManager:
             'VFX_Launcher'
         )
         
-        if not self.config.has_option('Database', 'Path'):
-            self.config.set('Database', 'Path', 
+        if not self.config.has_option('Database', 'db_path'):
+            self.config.set('Database', 'db_path',
                           os.path.join(default_data_dir, 'vfx_launcher.db'))
         
         # Paths defaults
@@ -88,15 +78,21 @@ class ConfigManager:
     
     def get_database_path(self):
         """Get the database file path"""
-        db_path = self.config.get('Database', 'Path', 
+        db_path = self.config.get('Database', 'db_path',
                                   fallback=os.path.join(os.path.dirname(__file__), '..', 'vfx_launcher.db'))
-        
+
+        # Resolve relative paths against the config file's directory so the
+        # database stays beside the per-user config in frozen builds
+        if not os.path.isabs(db_path):
+            db_path = os.path.join(os.path.dirname(os.path.abspath(self.config_file)), db_path)
+        db_path = os.path.abspath(db_path)
+
         # Ensure the directory exists
         db_dir = os.path.dirname(db_path)
         if not os.path.exists(db_dir):
             logger.info(f"Creating database directory: {db_dir}")
             os.makedirs(db_dir, exist_ok=True)
-        
+
         return db_path
     
     def get_data_dir(self):
@@ -126,6 +122,7 @@ class ConfigManager:
     def save(self):
         """Save configuration to file"""
         if self.config_file:
+            os.makedirs(os.path.dirname(os.path.abspath(self.config_file)), exist_ok=True)
             with open(self.config_file, 'w') as f:
                 self.config.write(f)
             logger.info(f"Configuration saved to: {self.config_file}")

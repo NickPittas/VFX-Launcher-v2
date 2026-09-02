@@ -1,13 +1,21 @@
 import sqlite3
 import os
 
+try:
+    from core.config import ConfigManager
+    DB_PATH = ConfigManager().get_database_path()
+except Exception:
+    # Fallback: database in the repo root next to this script
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vfx_launcher.db')
+
 def main():
-    db_path = 'vfx_launcher.db'
+    db_path = DB_PATH
     if not os.path.exists(db_path):
         print(f"Database file not found: {db_path}")
         return
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
+    print(f"Database: {db_path}")
     print("project_id | filename | filepath | version | filetype")
     print("-" * 80)
     try:

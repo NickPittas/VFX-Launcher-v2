@@ -1,11 +1,12 @@
 # Modern User Management Panel for Slick UI
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableView, QHeaderView, QAbstractItemView,
-    QStyledItemDelegate, QComboBox, QProgressBar
+    QStyledItemDelegate, QComboBox, QProgressBar, QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QMessageBox
 )
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QModelIndex, Signal, QThreadPool
+from PySide6.QtCore import Qt, QSortFilterProxyModel, QModelIndex, Signal, QThreadPool, QRunnable
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont
-from .async_workers import WorkerSignals, QRunnable
+from core.database import DatabaseManager
+from .async_workers import WorkerSignals
 
 class UserLoadWorker(QRunnable):
     """
@@ -35,6 +36,80 @@ class UserLoadWorker(QRunnable):
             import traceback
             self.signals.error.emit((type(e), e, traceback.format_exc()))
 
+class NewUserDialog(QDialog):
+    """Minimal dialog to create a new user."""
+
+    def __init__(self, db_path, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.setWindowTitle("Add User")
+        self.setMinimumWidth(320)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Username")
+        form.addRow("Username:", self.username_input)
+        self.is_admin_check = QCheckBox("Administrator")
+        form.addRow("", self.is_admin_check)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        username = self.username_input.text().strip()
+        if not username:
+            QMessageBox.warning(self, "Invalid Input", "Username cannot be empty.")
+            return
+        db = DatabaseManager(self.db_path)
+        if db.get_user_by_username(username):
+            QMessageBox.warning(self, "Duplicate User", f"User '{username}' already exists.")
+            return
+        db.create_user(username, 1 if self.is_admin_check.isChecked() else 0)
+        self.accept()
+
+
+class EditUserDialog(QDialog):
+    """Minimal dialog to edit an existing user."""
+
+    def __init__(self, db_path, user, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.user = user
+        self.setWindowTitle("Edit User")
+        self.setMinimumWidth(320)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.username_input = QLineEdit(user.get("username", ""))
+        form.addRow("Username:", self.username_input)
+        self.is_admin_check = QCheckBox("Administrator")
+        self.is_admin_check.setChecked(bool(user.get("is_admin", 0)))
+        form.addRow("", self.is_admin_check)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        username = self.username_input.text().strip()
+        if not username:
+            QMessageBox.warning(self, "Invalid Input", "Username cannot be empty.")
+            return
+        db = DatabaseManager(self.db_path)
+        existing = db.get_user_by_username(username)
+        if existing and existing.get("id") != self.user.get("id"):
+            QMessageBox.warning(self, "Duplicate User", f"User '{username}' already exists.")
+            return
+        db.update_user(self.user["id"], username=username,
+                       is_admin=1 if self.is_admin_check.isChecked() else 0)
+        self.accept()
+
 class UserManagement(QWidget):
     """
     Modern User Management panel for Slick UI.
@@ -45,10 +120,11 @@ class UserManagement(QWidget):
     """
     user_updated = Signal(dict)  # Emits updated user info
 
-    def __init__(self, db_path, parent=None):
+    def __init__(self, db_manager, parent=None):
         super().__init__(parent)
         self.setObjectName("UserManagement")
-        self.db_path = db_path
+        self.db_manager = db_manager
+        self.db_path = db_manager.db_path
         self._setup_ui()
         self.threadpool = QThreadPool.globalInstance()
         self._load_users_async()
@@ -108,7 +184,7 @@ class UserManagement(QWidget):
     def _load_users_async(self):
         self.loading_bar.setVisible(True)
         self.status_label.setText("Loading users...")
-        worker = UserLoadWorker(self.db_path)
+        worker = UserLoadWorker(self.db_manager)
         worker.signals.finished.connect(self._on_users_loaded)
         worker.signals.error.connect(self._on_users_load_error)
         self.threadpool.start(worker)
@@ -142,10 +218,7 @@ class UserManagement(QWidget):
         self.status_label.setText(f"Filter: '{text}'")
 
     def _on_add_user(self):
-        from ui.user_management import NewUserDialog  # Classic dialog logic
-        from core.database import DatabaseManager
-        db = DatabaseManager(self.db_path)
-        dialog = NewUserDialog(db, self)
+        dialog = NewUserDialog(self.db_path, self)
         if dialog.exec():
             self._load_users_async()
 
@@ -164,8 +237,6 @@ class UserManagement(QWidget):
             self._on_delete_user(index)
 
     def _on_edit_user(self, index):
-        from ui.user_management import EditUserDialog
-        from core.database import DatabaseManager
         db = DatabaseManager(self.db_path)
         # Map proxy index to source
         proxy_row = index.row()
@@ -173,7 +244,7 @@ class UserManagement(QWidget):
         username = self.model.item(source_row, 1).text()
         user = db.get_user_by_username(username)
         if user:
-            dialog = EditUserDialog(db, user, self)
+            dialog = EditUserDialog(self.db_path, user, self)
             if dialog.exec():
                 self._load_users_async()
 
@@ -204,7 +275,7 @@ class UserManagement(QWidget):
                     # Optionally: log the action using classic logic
                     try:
                         from core.user_actions import UserActionLogger
-                        action_logger = UserActionLogger()
+                        action_logger = UserActionLogger(self.db_manager)
                         current_username = getattr(self, 'current_user', {}).get('username', None)
                         action_logger.log_user_remove(current_username or "", user['username'])
                     except Exception:

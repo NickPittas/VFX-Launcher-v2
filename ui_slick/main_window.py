@@ -71,7 +71,7 @@ class SlickMainWindow(QMainWindow):
         self.stack = QStackedWidget()
         from .files_browser import FilesBrowser
         self.files_browser = FilesBrowser(self.db_manager, self.user_data, self)
-        self.project_browser = ProjectBrowser(self.db_manager.db_path, self.user_data, self)
+        self.project_browser = ProjectBrowser(self.db_manager, self.user_data, self)
         self.new_project_panel = NewProjectPanel(self)
         self.user_management = UserManagement(self.db_manager, self)
         self.settings_panel = SettingsPanel(self.db_manager, self.user_data, self)
@@ -175,7 +175,7 @@ class SlickMainWindow(QMainWindow):
         self.current_project_path = project_path  # Explicitly store at class level
         
         # Use project ID if available, else resolve from path
-        db = self.db_manager if hasattr(self, 'db_manager') else DatabaseManager(self.config_path)
+        db = self.db_manager
         project = db.get_project_by_path(project_path)
         
         if project:
@@ -227,25 +227,15 @@ class SlickMainWindow(QMainWindow):
         import logging
         
         try:
-            # Normalize project path for consistent lookup
-            normalized_path = os.path.abspath(project_path)
+            # Canonical lookup first; single fallback to the raw spelling for legacy DB rows
+            canonical_path = os.path.normcase(os.path.normpath(os.path.abspath(project_path)))
             logging.info(f"[MainWindow] Scan finished for project path: {project_path}")
-            logging.info(f"[MainWindow] Using normalized path for DB lookup: {normalized_path}")
-            
-            # Find project in DB with multiple fallbacks
-            project = self.db_manager.get_project_by_path(normalized_path)
-            
-            # If not found with normalized path, try with original path
+            logging.info(f"[MainWindow] Using canonical path for DB lookup: {canonical_path}")
+
+            project = self.db_manager.get_project_by_path(canonical_path)
             if not project:
-                logging.info(f"[MainWindow] Project not found with normalized path, trying original: {project_path}")
+                logging.info(f"[MainWindow] Project not found with canonical path, trying raw: {project_path}")
                 project = self.db_manager.get_project_by_path(project_path)
-            
-            # If still not found, try with Windows-style backslashes
-            if not project:
-                windows_path = normalized_path.replace('/', '\\')
-                logging.info(f"[MainWindow] Project not found, trying Windows path: {windows_path}")
-                project = self.db_manager.get_project_by_path(windows_path)
-            
             # If project found in DB, load its files
             if project:
                 logging.info(f"[MainWindow] Found project in DB: {project['name']} (ID: {project['id']})")
@@ -269,7 +259,7 @@ class SlickMainWindow(QMainWindow):
             else:
                 # Log available project paths for diagnosis
                 all_projects = self.db_manager._execute_query("SELECT id, name, path FROM projects")
-                logging.error(f"[MainWindow] Project not found in DB for path {normalized_path}. Available: {[p['path'] for p in all_projects]}")
+                logging.error(f"[MainWindow] Project not found in DB for path {canonical_path}. Available: {[p['path'] for p in all_projects]}")
                 
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(self, "Project Not Found", 

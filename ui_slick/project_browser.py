@@ -10,8 +10,44 @@ from .async_workers import ProjectLoadWorker
 from .version_delegate import VersionDelegate
 from .favorites_manager import FavoritesManager
 from .project_browser_delegate import FavoriteStarDelegate
+from .file_context_menu import open_in_file_manager
 import logging
 logger = logging.getLogger(__name__)
+
+class IdFilterProxyModel(QSortFilterProxyModel):
+    """
+    Proxy filter for the Favorites/Recents trees: accepts a row when the project ID
+    stored at Qt.UserRole + 2 on column 0 is in the allowed set AND the project name
+    (column 1, DisplayRole) contains the name filter (case-insensitive).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._allowed_ids = set()
+        self._name_filter = ""
+
+    def set_allowed_ids(self, ids):
+        self._allowed_ids = set(ids)
+        self.endFilterChange()  # re-run filterAcceptsRow (invalidateFilter is deprecated in Qt 6.10+)
+
+    def set_name_filter(self, text):
+        self._name_filter = (text or "").lower()
+        self.endFilterChange()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        id_data = model.index(source_row, 0, source_parent).data(Qt.UserRole + 2)
+        try:
+            project_id = int(id_data)
+        except (TypeError, ValueError):
+            return False
+        if project_id not in self._allowed_ids:
+            return False
+        if self._name_filter:
+            name = model.index(source_row, 1, source_parent).data()
+            if not name or self._name_filter not in str(name).lower():
+                return False
+        return True
 
 class ProjectBrowser(QWidget):
     """
@@ -25,10 +61,11 @@ class ProjectBrowser(QWidget):
     file_selected = Signal(list, list)  # Emits (nuke_files, aep_files) when a project is selected
     scan_finished = Signal(str)  # Emits project_path after scan completes
 
-    def __init__(self, db_path, user_data=None, parent=None):
+    def __init__(self, db_manager, user_data=None, parent=None):
         super().__init__(parent)
         self.setObjectName("ProjectBrowser")
-        self.db_path = db_path
+        self.db_manager = db_manager
+        self.db_path = db_manager.db_path
         self.user_data = user_data or {"username": "default", "id": 1}
         self.favorites_manager = FavoritesManager(self.user_data["username"])
         self.show_favorites_only = False
@@ -60,10 +97,13 @@ class ProjectBrowser(QWidget):
         logger.info("[DIAG] Refresh button clicked. Reloading project list from database.")
         self._load_projects_async()
 
-    def _on_remove_project(self, index=None):
+    def _on_remove_project(self, tree=None):
         from PySide6.QtWidgets import QMessageBox
         from core.database import DatabaseManager
-        selection = self.tree.selectionModel().selectedRows()
+        # clicked() passes a checked bool; only accept an actual tree view
+        if not isinstance(tree, QTreeView):
+            tree = self.tree
+        selection = tree.selectionModel().selectedRows()
         if not selection:
             QMessageBox.warning(self, "Remove Project", "No project selected.")
             return
@@ -74,7 +114,7 @@ class ProjectBrowser(QWidget):
         failed = []
         for ix in selection:
             # Get project ID directly from model, using the same column as get_all_projects()
-            row = self.proxy_model.mapToSource(ix).row()
+            row = self._map_to_source(ix).row()
             project_id_item = self.model.item(row, 0)
             try:
                 project_id = int(project_id_item.text())
@@ -100,7 +140,7 @@ class ProjectBrowser(QWidget):
         from PySide6.QtWidgets import QMessageBox
         if not indexes:
             return
-        names = [self.model.item(self.proxy_model.mapToSource(ix).row(), 1).text() for ix in indexes]
+        names = [self.model.item(self._map_to_source(ix).row(), 1).text() for ix in indexes]
         if len(names) == 1:
             msg = f"Are you sure you want to archive project '{names[0]}'?"
         else:
@@ -118,9 +158,9 @@ class ProjectBrowser(QWidget):
             logger.info(f"[DIAG] Version changed for '{project_name}': {new_version}")
             # TODO: Save version change to database if needed
 
-    def _show_context_menu(self, pos):
+    def _show_context_menu(self, tree, pos):
         from PySide6.QtWidgets import QMenu
-        selected_indexes = self.tree.selectionModel().selectedRows()
+        selected_indexes = tree.selectionModel().selectedRows()
         if not selected_indexes:
             return
         menu = QMenu(self)
@@ -130,7 +170,7 @@ class ProjectBrowser(QWidget):
         # Remove and Archive work for multi-select
         menu.addAction(
             "Remove" if len(selected_indexes) == 1 else f"Remove {len(selected_indexes)} Projects",
-            lambda: self._on_remove_project())
+        lambda: self._on_remove_project(tree))
         menu.addAction(
             "Archive" if len(selected_indexes) == 1 else f"Archive {len(selected_indexes)} Projects",
             lambda: self._on_archive_projects(selected_indexes))
@@ -139,7 +179,7 @@ class ProjectBrowser(QWidget):
         # Open Containing Folder only works for single selection
         if len(selected_indexes) == 1:
             menu.addAction("Open Containing Folder", lambda: self._on_open_containing_folder(selected_indexes[0]))
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        menu.exec(tree.viewport().mapToGlobal(pos))
 
 # NOTE: If you see 'Unknown property transition' warnings in the terminal, your QSS stylesheet is using the CSS 'transition' property, which is not supported by Qt. Remove 'transition' lines from your QSS to silence these warnings.
 
@@ -178,15 +218,21 @@ class ProjectBrowser(QWidget):
         # Tab widget for All/Favorites/Recents
         self.tab_widget = QTabWidget()
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
-        # Create model and proxy for filtering
+        # Create model and per-tree proxies for filtering
         self.model = QStandardItemModel()
         self.model.setHorizontalHeaderLabels(["★", "Name", "Type", "Last Modified", "Path"])
         self.proxy_model = QSortFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.model)
         self.proxy_model.setFilterKeyColumn(1)  # Filter by project name (now column 1)
 
+        # Favorites/Recents tabs: each tree filters by an allowed project-ID set plus name text
+        self.favorites_proxy = IdFilterProxyModel(self)
+        self.favorites_proxy.setSourceModel(self.model)
+        self.recents_proxy = IdFilterProxyModel(self)
+        self.recents_proxy.setSourceModel(self.model)
+
         # Create tree view for "All Projects" tab
-        self.tree = self._create_tree_view()
+        self.tree = self._create_tree_view(self.proxy_model)
         all_projects_widget = QWidget()
         all_layout = QVBoxLayout(all_projects_widget)
         all_layout.setContentsMargins(0, 0, 0, 0)
@@ -194,7 +240,7 @@ class ProjectBrowser(QWidget):
         self.tab_widget.addTab(all_projects_widget, "All Projects")
 
         # Create tree view for "Favorites" tab (will share same model but filtered)
-        self.favorites_tree = self._create_tree_view()
+        self.favorites_tree = self._create_tree_view(self.favorites_proxy)
         favorites_widget = QWidget()
         fav_layout = QVBoxLayout(favorites_widget)
         fav_layout.setContentsMargins(0, 0, 0, 0)
@@ -202,7 +248,7 @@ class ProjectBrowser(QWidget):
         self.tab_widget.addTab(favorites_widget, "Favorites")
 
         # Create tree view for "Recents" tab
-        self.recents_tree = self._create_tree_view()
+        self.recents_tree = self._create_tree_view(self.recents_proxy)
         recents_widget = QWidget()
         recents_layout = QVBoxLayout(recents_widget)
         recents_layout.setContentsMargins(0, 0, 0, 0)
@@ -239,10 +285,10 @@ class ProjectBrowser(QWidget):
         self.status_label = QLabel("")
         layout.addWidget(self.status_label)
 
-    def _create_tree_view(self):
-        """Create a configured tree view for projects"""
+    def _create_tree_view(self, proxy):
+        """Create a configured tree view backed by the given proxy model"""
         tree = QTreeView(self)
-        tree.setModel(self.proxy_model)
+        tree.setModel(proxy)
         tree.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
         tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -266,11 +312,15 @@ class ProjectBrowser(QWidget):
         # Allow last visible column to stretch
         tree.header().setStretchLastSection(True)
 
-        # Connect signals
-        tree.doubleClicked.connect(self._on_project_activated)
+        # Connect signals with closures binding this tree and its proxy,
+        # so every handler acts on the tree the signal originated from
+        tree.doubleClicked.connect(
+            lambda index, t=tree: self._on_project_activated(index))
         tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        tree.customContextMenuRequested.connect(self._show_context_menu)
-        tree.selectionModel().selectionChanged.connect(self._on_tree_selection_changed)
+        tree.customContextMenuRequested.connect(
+            lambda pos, t=tree: self._show_context_menu(t, pos))
+        tree.selectionModel().selectionChanged.connect(
+            lambda selected, deselected, t=tree: self._on_tree_selection_changed(t, selected, deselected))
 
         # Attach FavoriteStarDelegate to star column
         star_delegate = FavoriteStarDelegate(self.favorites_manager, tree)
@@ -298,13 +348,13 @@ class ProjectBrowser(QWidget):
 
     def _on_rescan_files_clicked(self):
         """Perform a full scan of the currently selected project for files"""
-        selection = self.tree.selectionModel().selectedRows()
+        tree = self._active_tree()
+        selection = tree.selectionModel().selectedRows()
         if not selection:
             self.status_label.setText("No project selected to scan.")
             return
             
-        proxy_index = selection[0]
-        src_index = self.proxy_model.mapToSource(proxy_index)
+        src_index = self._map_to_source(selection[0])
         # Always use the last column for path
         project_path = self.model.item(src_index.row(), self.model.columnCount() - 1).text()
         
@@ -389,112 +439,120 @@ class ProjectBrowser(QWidget):
         # Reset horizontal scroll to left
         self.tree.horizontalScrollBar().setValue(0)
 
+    def _normalize_project_ids(self, values):
+        """
+        Normalize project IDs to a set of ints.
+
+        Favorites/recents persist IDs as JSON strings and may contain legacy
+        non-numeric entries (e.g. 'None'); invalid values are skipped.
+        """
+        ids = set()
+        for value in values:
+            try:
+                ids.add(int(value))
+            except (TypeError, ValueError):
+                logger.warning(f"[ProjectBrowser] Skipping invalid project ID: {value!r}")
+        return ids
+
     def _filter_projects(self):
+        """
+        Update each tree's own proxy. Changing tabs or typing in the search
+        box never alters another tree's filtering semantics:
+        - All Projects: search regex on the name column (DisplayRole)
+        - Favorites/Recents: allowed project-ID set + name filter
+        """
         text = self.search_input.text()
 
-        # If 'Show Recents Only' is checked, filter by recent projects
+        # All Projects tab: regex text search on project name
+        self.proxy_model.setFilterRole(Qt.DisplayRole)
+        self.proxy_model.setFilterKeyColumn(1)  # Name column
+        self.proxy_model.setFilterRegularExpression(text)
+
+        # Favorites tab: allowed ID set (+ name filter)
+        fav_ids = self._normalize_project_ids(self.favorites_manager.get_favorites())
+        logger.debug(f"[ProjectBrowser] Filtering favorites to IDs: {fav_ids}")
+        self.favorites_proxy.set_allowed_ids(fav_ids)
+        self.favorites_proxy.set_name_filter(text)
+
+        # Recents tab: refresh the recent ID set from the DB while the tab is active
+        recent_count = 0
         if self.show_recents_only:
-            from core.database import DatabaseManager
-            db = DatabaseManager(self.db_path)
-            recent_projects = db.get_recent_projects(self.user_data.get("id", 1), limit=20)
-            recent_ids = [str(p["id"]) for p in recent_projects]
-            logger.debug(f"[ProjectBrowser] Filtering to show only recents: {recent_ids}")
+            try:
+                from core.database import DatabaseManager
+                db = DatabaseManager(self.db_path)
+                recent_projects = db.get_recent_projects(self.user_data.get("id", 1), limit=20)
+                recent_ids = self._normalize_project_ids(p["id"] for p in recent_projects)
+            except Exception as e:
+                logger.error(f"[ProjectBrowser] Failed to load recent projects: {e}")
+                recent_ids = set()
+            recent_count = len(recent_ids)
+            logger.debug(f"[ProjectBrowser] Filtering recents to IDs: {recent_ids}")
+            self.recents_proxy.set_allowed_ids(recent_ids)
+            self.recents_proxy.set_name_filter(text)
 
-            # We need to hide rows where the project ID is not in recents
-            self.proxy_model.setFilterRole(Qt.UserRole + 2)  # Use the role where we store project ID
-            self.proxy_model.setFilterKeyColumn(0)  # Star column
-
-            if recent_ids:
-                # Create a regex pattern that matches any of the recent IDs
-                pattern = '|'.join([f'^{id}$' for id in recent_ids])
-                self.proxy_model.setFilterRegularExpression(pattern)
-            else:
-                # If no recents, match nothing
-                self.proxy_model.setFilterRegularExpression('a^')  # Will match nothing
-
-            if hasattr(self, 'status_label'):
-                self.status_label.setText(f"Showing {len(recent_ids)} recent projects")
-
-        # If 'Show Favorites Only' is checked, filter by favorites
-        elif self.show_favorites_only:
-            # Get the list of favorite project IDs
-            fav_ids = self.favorites_manager.get_favorites()
-            logger.debug(f"[ProjectBrowser] Filtering to show only favorites: {fav_ids}")
-
-            # We need to hide rows where the project ID is not in favorites
-            self.proxy_model.setFilterRole(Qt.UserRole + 2)  # Use the role where we store project ID
-            self.proxy_model.setFilterKeyColumn(0)  # Star column
-
-            if fav_ids:
-                # Create a regex pattern that matches any of the favorite IDs
-                pattern = '|'.join([f'^{id}$' for id in fav_ids])
-                self.proxy_model.setFilterRegularExpression(pattern)
-            else:
-                # If no favorites, match nothing
-                self.proxy_model.setFilterRegularExpression('a^')  # Will match nothing
-
-            if hasattr(self, 'status_label'):
+        if hasattr(self, 'status_label'):
+            if self.show_recents_only:
+                self.status_label.setText(f"Showing {recent_count} recent projects")
+            elif self.show_favorites_only:
                 self.status_label.setText("Showing favorites only")
-        else:
-            # Normal text filtering on project name
-            self.proxy_model.setFilterRole(Qt.DisplayRole)
-            self.proxy_model.setFilterRegularExpression(text)
-            self.proxy_model.setFilterKeyColumn(1)  # Name column
-
-            if hasattr(self, 'status_label'):
-                if text:
-                    self.status_label.setText(f"Filter: '{text}'")
-                else:
-                    self.status_label.setText("Showing all projects")
+            elif text:
+                self.status_label.setText(f"Filter: '{text}'")
+            else:
+                self.status_label.setText("Showing all projects")
 
     # Removed _on_scan_files_clicked as it's redundant with _on_rescan_files_clicked
 
-    def _on_tree_selection_changed(self, selected, deselected):
-        # Emit project_selected for the first selected row (if any)
-        if selected.indexes():
-            row = selected.indexes()[0].row()
-            src_index = self.proxy_model.mapToSource(self.proxy_model.index(row, 1))
+    @staticmethod
+    def _map_to_source(index):
+        """Map a view index from any of the per-tree proxies to the source model (identity if already a source index)."""
+        model = index.model()
+        if isinstance(model, QSortFilterProxyModel):
+            return model.mapToSource(index)
+        return index
 
-            # Get data from the correct columns
-            # Column 0: Star (contains ID as text)
-            # Column 1: Name
-            # Column 2: Type
-            # Column 3: Last Modified
-            # Column 4: Path
-            proj = {
-                "id": int(self.model.item(src_index.row(), 0).text()),  # Star column has ID
-                "name": self.model.item(src_index.row(), 1).text(),
-                "type": self.model.item(src_index.row(), 2).text(),
-                "last_modified": self.model.item(src_index.row(), 3).text(),
-                "path": self.model.item(src_index.row(), 4).text(),
-            }
-            logger.debug(f"[DIAG] Emitting project_selected: {proj}")
-            self.project_selected.emit(proj)
-            if hasattr(self, 'status_label'):
-                self.status_label.setText(f"Selected: {proj['name']}")
-
-            # Track this as a recent project
-            self._track_recent_project(proj["id"])
-
-    def _on_project_activated(self, index: QModelIndex):
-        """
-        Handle double-click or activation of a project row.
-        """
-        src_index = self.proxy_model.mapToSource(index)
-
-        # Get data from the correct columns
+    def _project_from_view_index(self, index):
+        """Build the project dict for the source row behind a proxy index from any tree."""
+        src_index = self._map_to_source(index)
         # Column 0: Star (contains ID as text)
         # Column 1: Name
         # Column 2: Type
         # Column 3: Last Modified
         # Column 4: Path
-        proj = {
-            "id": int(self.model.item(src_index.row(), 0).text()),  # Star column has ID
+        return {
+            "id": int(self.model.item(src_index.row(), 0).text()),
             "name": self.model.item(src_index.row(), 1).text(),
             "type": self.model.item(src_index.row(), 2).text(),
             "last_modified": self.model.item(src_index.row(), 3).text(),
             "path": self.model.item(src_index.row(), 4).text(),
         }
+
+    def _active_tree(self):
+        """Return the tree view of the currently active tab."""
+        trees = (self.tree, self.favorites_tree, self.recents_tree)
+        index = self.tab_widget.currentIndex()
+        if 0 <= index < len(trees):
+            return trees[index]
+        return self.tree
+
+    def _on_tree_selection_changed(self, tree, selected, deselected):
+        # Emit project_selected for the first selected row (if any)
+        indexes = tree.selectionModel().selectedRows()
+        if not indexes:
+            return
+        proj = self._project_from_view_index(indexes[0])
+        logger.debug(f"[DIAG] Emitting project_selected: {proj}")
+        self.project_selected.emit(proj)
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(f"Selected: {proj['name']}")
+
+        # Track this as a recent project
+        self._track_recent_project(proj["id"])
+
+    def _on_project_activated(self, index: QModelIndex):
+        """
+        Handle double-click or activation of a project row.
+        """
+        proj = self._project_from_view_index(index)
         logger.debug(f"[DIAG] Emitting project_selected: {proj}")
         self.project_selected.emit(proj)
         if hasattr(self, 'status_label'):
@@ -560,8 +618,8 @@ class ProjectBrowser(QWidget):
         Open the folder containing the selected project in the system file explorer.
         """
         from PySide6.QtWidgets import QMessageBox
-        # Map proxy index to source index
-        src_index = self.proxy_model.mapToSource(index)
+        # Map the index (from whichever tree/proxy it came) to the source model
+        src_index = self._map_to_source(index)
         # Get the path column (always last column)
         path_item = self.model.item(src_index.row(), self.model.columnCount() - 1)
 
@@ -573,7 +631,7 @@ class ProjectBrowser(QWidget):
             QMessageBox.warning(self, "Open Folder", f"Project folder does not exist:\n{folder_path}")
             return
         try:
-            os.startfile(folder_path)
+            open_in_file_manager(folder_path)
         except Exception as e:
             QMessageBox.critical(self, "Open Folder", f"Failed to open folder:\n{e}")
 
@@ -596,10 +654,10 @@ class ProjectBrowser(QWidget):
     def get_selected_project_id(self):
         """Get the currently selected project ID"""
         try:
-            selection = self.tree.selectionModel().selectedRows()
+            selection = self._active_tree().selectionModel().selectedRows()
             if selection:
                 index = selection[0]
-                src_index = self.proxy_model.mapToSource(index)
+                src_index = self._map_to_source(index)
                 project_id = int(self.model.item(src_index.row(), 0).text())
                 return project_id
         except Exception as e:

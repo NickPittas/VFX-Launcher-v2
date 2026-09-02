@@ -2,11 +2,20 @@
 File Context Menu Module - Manages context menu operations for file browser items
 """
 import os
+import sys
+import subprocess
 import logging
 from PySide6.QtWidgets import QMenu, QMessageBox, QApplication
 from PySide6.QtCore import Qt, Signal
 
 logger = logging.getLogger(__name__)
+
+def open_in_file_manager(path):
+    """Open a file or folder in the system file manager (Windows, macOS, Linux)."""
+    if hasattr(os, 'startfile'):
+        os.startfile(path)
+    else:
+        subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', path])
 
 class FileContextMenuManager:
     """Manages context menu operations for file items"""
@@ -96,9 +105,8 @@ class FileContextMenuManager:
                 QMessageBox.warning(self.parent, "Folder Not Found", f"The folder does not exist:\n{folder_path}")
                 return False
                 
-            # Open the folder in file explorer
-            # For Windows, use os.startfile
-            os.startfile(folder_path)
+            # Open the folder in the system file manager
+            open_in_file_manager(folder_path)
             logger.info(f"[FileContextMenu] Opened containing folder: {folder_path}")
             return True
             

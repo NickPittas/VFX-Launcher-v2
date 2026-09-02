@@ -1,31 +1,9 @@
 from PySide6.QtCore import QRunnable, Slot, Signal, QObject
-import traceback
 from core.database import DatabaseManager
 
 class WorkerSignals(QObject):
     finished = Signal(object)
     error = Signal(tuple)
-
-class LogLoadWorker(QRunnable):
-    """
-    QRunnable to load logs from the database asynchronously.
-    Emits finished(result) or error((exctype, value, traceback)).
-    Accepts db_path (str), not a DatabaseManager instance.
-    """
-    def __init__(self, db_path):
-        super().__init__()
-        self.db_path = db_path
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            db_manager = DatabaseManager(self.db_path)
-            logs = db_manager.get_all_logs()
-            self.signals.finished.emit(logs)
-        except Exception as e:
-            import traceback
-            self.signals.error.emit((type(e), e, traceback.format_exc()))
 
 class ProjectLoadWorker(QRunnable):
     """
@@ -52,34 +30,6 @@ class ProjectLoadWorker(QRunnable):
                 merged["version"] = p.get("version", "N/A")
                 merged["last_modified"] = p.get("last_modified", p.get("created_at", ""))
                 result.append(merged)
-            self.signals.finished.emit(result)
-        except Exception as e:
-            import traceback
-            self.signals.error.emit((type(e), e, traceback.format_exc()))
-
-class UserLoadWorker(QRunnable):
-    """
-    QRunnable to load users from the database asynchronously.
-    Emits finished(result) or error((exctype, value, traceback)).
-    Accepts db_path (str), not a DatabaseManager instance.
-    """
-    def __init__(self, db_path):
-        super().__init__()
-        self.db_path = db_path
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            db_manager = DatabaseManager(self.db_path)
-            users = db_manager.get_all_users()
-            result = []
-            for u in users:
-                role = "Admin" if u.get("is_admin", 0) else "Artist"
-                result.append({
-                    "username": u.get("username"),
-                    "role": role,
-                    "id": u.get("id")
-                })
             self.signals.finished.emit(result)
         except Exception as e:
             import traceback

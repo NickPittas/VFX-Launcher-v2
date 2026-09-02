@@ -208,8 +208,8 @@ class UserActionLogger:
     
     def _log_action(self, username, action_type, description):
         """
-        Log an action to the application log.
-        
+        Log an action to the application log and the user activity table.
+
         Args:
             username (str): Username
             action_type (str): Type of action
@@ -217,8 +217,16 @@ class UserActionLogger:
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_message = f"[{timestamp}] USER: {username} | ACTION: {action_type} | {description}"
-        
+
         # Log to application log
         logger.info(log_message)
-        
-        # Future enhancement: persist to database if db_manager is provided
+
+        # Best-effort persistence to the database when a db_manager is available
+        if self.db_manager is not None:
+            try:
+                self.db_manager._execute_query(
+                    "INSERT INTO user_activity_log (username, action_type, description) VALUES (?, ?, ?)",
+                    (username, action_type, description)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log user action to database: {e}")

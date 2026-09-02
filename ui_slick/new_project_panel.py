@@ -176,9 +176,13 @@ class NewProjectPanel(QWidget):
         return str(best + 1).zfill(5)
 
     def _refresh_code(self):
-        # Code is always derived from /mnt/Projects, not the chosen root
-        if os.path.isdir(DEFAULT_ROOT):
-            self.code_input.setText(self._next_code(DEFAULT_ROOT))
+        # Code derives from the currently chosen root; fall back to the
+        # default root only when no valid root folder is chosen.
+        root = self.root_input.text().strip()
+        if not root or not os.path.isdir(root):
+            root = DEFAULT_ROOT
+        if os.path.isdir(root):
+            self.code_input.setText(self._next_code(root))
         self._update_preview()
 
     def _project_name(self):
