@@ -89,7 +89,7 @@ class FileHandler:
                 shot_name = os.path.basename(folder_path) if folder_path else ""
                 
                 # If no folder name found, try to extract from filename using common patterns
-                if not shot_name or shot_name.lower() in ['nk', 'aep', 'shots', 'assets', 'nuke', 'after effects']:
+                if not shot_name or shot_name.lower() in ['nk', 'aep', 'shots', 'assets', 'nuke', 'after effects', 'script', 'scripts']:
                     # Try to extract shot name from filename (before version number)
                     name_parts = filename.split('_v') if '_v' in filename else [filename]
                     base_name = name_parts[0]
@@ -128,24 +128,31 @@ class FileHandler:
         """
         Group files into {timeline: {shot: [files]}}.
         Levels are derived relative to the Projects/Nuke (or After Effects) anchor:
-        <anchor>/<timeline>/<shot>/.../file.nk — extra nesting (artist folders etc.)
-        below the shot is ignored. Files not at least two folders below the anchor
-        land in the '' timeline group using the shot-name fallback heuristics.
+        <anchor>/<timeline>/<shot>/.../file.nk — extra nesting (artist folders such
+        as <shot>/nuke/script) below the shot is ignored. The TOPMOST anchor that
+        still yields a timeline+shot pair wins, so a per-shot 'nuke' subfolder can
+        never be mistaken for the project-level Nuke root. Files not at least two
+        folders below any anchor land in the '' timeline group using the
+        shot-name fallback heuristics.
         """
         timeline_groups = {}
         for f in files:
             parts = [p for p in re.split(r'[\\/]', f.get('filepath', '')) if p]
-            anchor = next(
-                (i for i in range(len(parts) - 1, -1, -1)
-                 if parts[i].lower() in ('nuke', 'after effects', 'aftereffects')),
-                None
-            )
-            rel = parts[anchor + 1:-1] if anchor is not None else []
-            if len(rel) >= 2:
-                timeline, shot = rel[0], rel[1]
-            elif len(rel) == 1:
-                timeline, shot = '', rel[0]
-            else:
+            anchors = [i for i, p in enumerate(parts[:-1])
+                       if p.lower() in ('nuke', 'after effects', 'aftereffects')]
+            timeline = shot = None
+            # Prefer the topmost anchor with a full timeline+shot pair; fall back
+            # to the topmost anchor with at least a shot segment.
+            for needed in (2, 1):
+                for anchor in anchors:
+                    rel = parts[anchor + 1:-1]
+                    if len(rel) >= needed:
+                        timeline = rel[0] if len(rel) >= 2 else ''
+                        shot = rel[1] if len(rel) >= 2 else rel[0]
+                        break
+                if shot is not None:
+                    break
+            if shot is None:
                 timeline = ''
                 shot = next(iter(FileHandler.group_by_shot([f])))  # filename heuristic
             timeline_groups.setdefault(timeline, {}).setdefault(shot, []).append(f)
