@@ -198,7 +198,8 @@ class NewProjectPanel(QWidget):
         self.preview_label.setText(f"→ {self._project_name()}")
 
     def _on_browse_root(self):
-        dir_path = QFileDialog.getExistingDirectory(
+        from .file_dialogs import pick_directory
+        dir_path = pick_directory(
             self, "Select Root Folder", self.root_input.text() or DEFAULT_ROOT
         )
         if dir_path:

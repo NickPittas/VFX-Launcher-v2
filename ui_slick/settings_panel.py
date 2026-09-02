@@ -200,20 +200,20 @@ class SettingsPanel(QWidget):
             QMessageBox.critical(self, "Settings Error", f"Error saving settings: {e}")
 
     def _on_browse_nuke(self):
-        from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getOpenFileName(self, "Select Nuke Executable", "", "Executables (*.exe);;All Files (*)")
+        from .file_dialogs import pick_open_file
+        path = pick_open_file(self, "Select Nuke Executable", "", "Executables (*.exe);;All Files (*)")
         if path:
             self.nuke_path_input.setText(path)
 
     def _on_browse_ae(self):
-        from PySide6.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getOpenFileName(self, "Select After Effects Executable", "", "Executables (*.exe);;All Files (*)")
+        from .file_dialogs import pick_open_file
+        path = pick_open_file(self, "Select After Effects Executable", "", "Executables (*.exe);;All Files (*)")
         if path:
             self.ae_path_input.setText(path)
 
     def _on_browse_project_dirs(self):
-        from PySide6.QtWidgets import QFileDialog
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Project Directory", "")
+        from .file_dialogs import pick_directory
+        dir_path = pick_directory(self, "Select Project Directory")
         if dir_path:
             # Append or set, comma-separated
             text = self.project_dirs_input.text()

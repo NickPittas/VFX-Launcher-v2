@@ -75,10 +75,11 @@ class ProjectBrowser(QWidget):
         self._load_projects_async()
 
     def _on_add_project(self):
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from PySide6.QtWidgets import QMessageBox
         import os
         from core.database import DatabaseManager
-        folder = QFileDialog.getExistingDirectory(self, "Select Project Folder")
+        from .file_dialogs import pick_directory
+        folder = pick_directory(self, "Select Project Folder")
         if not folder:
             return
         name = os.path.basename(folder)
