@@ -25,12 +25,12 @@ installer_output/
 
 # Logs
 logs/
-*.log
+# Database — live local data, not source
+vfx_launcher.db
 
-# Database (if you want to exclude it - uncomment if needed)
-# *.db
-# vfx_launcher.db
-
+# Loose source images at repo root (referenced icons live in ui_slick/icons/)
+freepik__*.jpeg
+freepik__*.png
 # IDE
 .vscode/
 .idea/
