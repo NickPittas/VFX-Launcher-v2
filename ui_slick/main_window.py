@@ -9,6 +9,7 @@ from .user_management import UserManagement
 from .settings_panel import SettingsPanel
 from .new_project_panel import NewProjectPanel
 from .log_panel import LogPanel
+from core.utils import get_external_process_env
 import os
 import logging
 
@@ -236,26 +237,32 @@ class SlickMainWindow(QMainWindow):
             if not project:
                 logging.info(f"[MainWindow] Project not found with canonical path, trying raw: {project_path}")
                 project = self.db_manager.get_project_by_path(project_path)
+            # Bulk scans must not switch the current selection or its file list.
+            selected_id = getattr(self, "current_project_id", None)
+            selected_path = getattr(self, "current_project_path", None)
+            if not project or (selected_id is None and not selected_path) or (
+                (selected_id is not None and project['id'] != selected_id)
+                or (selected_path and canonical_path != os.path.normcase(os.path.normpath(os.path.abspath(selected_path))))
+            ):
+                logging.info(
+                    f"[MainWindow] Ignoring scan result for non-selected project: "
+                    f"{project['path'] if project else project_path}"
+                )
+                return
+
             # If project found in DB, load its files
             if project:
                 logging.info(f"[MainWindow] Found project in DB: {project['name']} (ID: {project['id']})")
                 files = self.db_manager.get_files_with_access_info(project['id'])
                 
-                if files:
-                    logging.info(f"[MainWindow] Loaded {len(files)} files from DB for project {project['name']}")
-                    
-                    # Make sure all files have a project_path
-                    for file in files:
-                        if 'project_path' not in file:
-                            file['project_path'] = project['path']
-                    
-                    # Add base_name to all files for versioning
-                    files_with_base_names = self._add_base_name(files)
-                    
-                    # Update file browser display
-                    self.files_browser.display_files(files_with_base_names)
-                else:
-                    logging.warning(f"[MainWindow] No files found in DB for project {project['name']} (ID: {project['id']})")
+                logging.info(f"Loaded {len(files)} files from DB for project {project['name']}")
+                # Make sure all files have a project_path
+                for file in files:
+                    if 'project_path' not in file:
+                        file['project_path'] = project['path']
+                # Add base_name to all files for versioning and clear stale rows on zero files.
+                files_with_base_names = self._add_base_name(files)
+                self.files_browser.display_files(files_with_base_names)
             else:
                 # Log available project paths for diagnosis
                 all_projects = self.db_manager._execute_query("SELECT id, name, path FROM projects")
@@ -310,7 +317,10 @@ class SlickMainWindow(QMainWindow):
                         raise ValueError("Linux Nuke launch command not configured in settings")
 
                     logging.info(f"Launching Nuke file on Linux: {filepath}")
-                    subprocess.Popen(shlex.split(nuke_cmd) + [filepath])
+                    subprocess.Popen(
+                        shlex.split(nuke_cmd) + [filepath],
+                        env=get_external_process_env(),
+                    )
                 else:
                     # Launch with Nuke
                     nuke_path = config.get("Paths", "nuke_path", fallback="")
@@ -320,7 +330,10 @@ class SlickMainWindow(QMainWindow):
                         raise ValueError("Nuke path not configured in settings")
 
                     logging.info(f"Launching Nuke file with NukeX: {filepath}")
-                    subprocess.Popen([nuke_path, '--nukex', filepath])
+                    subprocess.Popen(
+                        [nuke_path, '--nukex', filepath],
+                        env=get_external_process_env(),
+                    )
                 
             elif file_extension in ('.aep', '.aet'):
                 # Launch with After Effects
@@ -331,7 +344,10 @@ class SlickMainWindow(QMainWindow):
                     raise ValueError("After Effects path not configured in settings")
                     
                 logging.info(f"Launching After Effects file: {filepath}")
-                subprocess.Popen([ae_path, filepath])
+                subprocess.Popen(
+                    [ae_path, filepath],
+                    env=get_external_process_env(),
+                )
                 
             else:
                 # Use default application for other file types
@@ -339,7 +355,10 @@ class SlickMainWindow(QMainWindow):
                 if hasattr(os, 'startfile'):
                     os.startfile(filepath)
                 else:
-                    subprocess.Popen(['xdg-open', filepath])
+                    subprocess.Popen(
+                        ['xdg-open', filepath],
+                        env=get_external_process_env(),
+                    )
                 
         except Exception as e:
             import traceback

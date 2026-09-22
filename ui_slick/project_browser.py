@@ -1,18 +1,209 @@
 # Modern Project Browser for Slick UI
 import os
+import threading
+import weakref
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QTreeView, QHeaderView, QAbstractItemView,
-    QStyledItemDelegate, QFrame, QMenu, QProgressBar, QCheckBox, QTabWidget
+    QStyledItemDelegate, QFrame, QMenu, QProgressBar, QCheckBox, QTabWidget, QDialog, QListWidget,
+    QListWidgetItem
 )
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QModelIndex, Signal, QThreadPool, QItemSelectionModel
+from PySide6.QtCore import (
+    Qt, QSortFilterProxyModel, QModelIndex, Signal, QThreadPool, QItemSelectionModel, QObject, Slot, QTimer
+)
 from PySide6.QtGui import QStandardItemModel, QStandardItem
-from .async_workers import ProjectLoadWorker
+from .async_workers import (
+    DirectoryDiscoveryWorker, ProjectLoadWorker, ProjectRegistrationWorker,
+    canonical_project_path, register_project_folders,
+)
 from .version_delegate import VersionDelegate
 from .favorites_manager import FavoritesManager
 from .project_browser_delegate import FavoriteStarDelegate
 from .file_context_menu import open_in_file_manager
 import logging
 logger = logging.getLogger(__name__)
+
+
+class _FolderSelectionDialog(QDialog):
+    """Small checkable list used after a root folder has been discovered."""
+
+    def __init__(self, root, parent=None):
+        super().__init__(parent)
+        self.root = root
+        self.selected_paths = []
+        self.setWindowTitle("Add Multiple Projects")
+        self.resize(520, 420)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"Select immediate child folders in:\n{root}"))
+        self.status_label = QLabel("Discovering folders…")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.list_widget = QListWidget()
+        self.list_widget.itemChanged.connect(self._update_add_button)
+        layout.addWidget(self.list_widget, 1)
+
+        controls = QHBoxLayout()
+        self.select_all_button = QPushButton("Select All")
+        self.select_none_button = QPushButton("Select None")
+        self.select_all_button.clicked.connect(self._select_all)
+        self.select_none_button.clicked.connect(self._select_none)
+        controls.addWidget(self.select_all_button)
+        controls.addWidget(self.select_none_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.cancel_button = QPushButton("Cancel")
+        self.add_button = QPushButton("Add Selected")
+        self.cancel_button.clicked.connect(self.reject)
+        self.add_button.clicked.connect(self._accept_selected)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.add_button)
+        layout.addLayout(buttons)
+        self._set_discovery_controls(False)
+
+    def _set_discovery_controls(self, enabled):
+        self.list_widget.setEnabled(enabled)
+        self.select_all_button.setEnabled(enabled)
+        self.select_none_button.setEnabled(enabled)
+        self._update_add_button()
+
+    def set_folders(self, folders):
+        self.list_widget.clear()
+        for folder in folders:
+            item = QListWidgetItem(os.path.basename(folder))
+            item.setToolTip(folder)
+            item.setData(Qt.UserRole, folder)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.list_widget.addItem(item)
+        self.status_label.setText(
+            f"Found {len(folders)} immediate child folder(s). Select folders to register. "
+            "Registration cannot be cancelled; selected folders will be scanned next."
+            if folders else "No immediate child directories found."
+        )
+        self._set_discovery_controls(True)
+
+    def show_error(self, exc_info):
+        self._set_discovery_controls(False)
+        self.status_label.setText(f"Could not read this folder: {exc_info[1]}")
+
+    def show_cancelled(self):
+        self.status_label.setText("Folder discovery cancelled.")
+        self._set_discovery_controls(False)
+
+    def _select_all(self):
+        for row in range(self.list_widget.count()):
+            self.list_widget.item(row).setCheckState(Qt.Checked)
+
+    def _select_none(self):
+        for row in range(self.list_widget.count()):
+            self.list_widget.item(row).setCheckState(Qt.Unchecked)
+
+    def _update_add_button(self):
+        self.add_button.setEnabled(any(
+            self.list_widget.item(row).checkState() == Qt.Checked
+            for row in range(self.list_widget.count())
+        ))
+
+    def _accept_selected(self):
+        self.selected_paths = [
+            self.list_widget.item(row).data(Qt.UserRole)
+            for row in range(self.list_widget.count())
+            if self.list_widget.item(row).checkState() == Qt.Checked
+        ]
+        if self.selected_paths:
+            self.accept()
+
+
+class _DiscoveryJob(QObject):
+    """Own discovery state independently of the browser/dialog QObject tree."""
+
+    def __init__(self, browser, worker, dialog, cancel_event):
+        super().__init__()
+        self._browser_ref = weakref.ref(browser)
+        self.worker = worker
+        self.dialog = dialog
+        self.dialog_alive = True
+        self.receiver = None
+        self.cancel_event = cancel_event
+        self.dismissed = False
+        self.terminal = False
+
+    def set_receiver(self, receiver):
+        self.receiver = receiver
+
+    @Slot()
+    def browser_destroyed(self):
+        self.dismissed = True
+        self.cancel_event.set()
+        self.dialog = None
+        self.receiver = None
+        self._clear_browser_job()
+        self._release_if_ready()
+
+    @Slot()
+    def dialog_destroyed(self):
+        self.dismissed = True
+        self.cancel_event.set()
+        self.dialog_alive = False
+        self.dialog = None
+        self.receiver = None
+        self._release_if_ready()
+
+    @Slot()
+    def terminal_result(self):
+        self.terminal = True
+        self._release_if_ready()
+
+    def finish_dialog(self, accepted):
+        self.dismissed = True
+        if not accepted:
+            self.cancel_event.set()
+        self._clear_browser_job()
+        self._release_if_ready()
+
+    def _clear_browser_job(self):
+        browser = self._browser_ref()
+        if browser is not None and browser.__dict__.get("_multi_import_job") is self:
+            browser.__dict__["_multi_import_job"] = None
+
+    def _release_if_ready(self):
+        if self.dismissed and self.terminal:
+            if self.dialog_alive and self.dialog is not None:
+                self.dialog.deleteLater()
+            self.worker = None
+            self.dialog = None
+            self.receiver = None
+            self.deleteLater()
+
+
+class _DiscoveryReceiver(QObject):
+    """GUI-thread relay that drops results after the dialog/job is dismissed."""
+
+    def __init__(self, browser, job, parent):
+        super().__init__(parent)
+        self.browser = browser
+        self.job = job
+
+    @Slot(object)
+    def finished(self, folders):
+        self.browser._on_multi_discovery_finished(self.job, folders)
+
+    @Slot(tuple)
+    def error(self, exc_info):
+        self.browser._on_multi_discovery_error(self.job, exc_info)
+
+    @Slot()
+    def cancelled(self):
+        self.browser._on_multi_discovery_cancelled(self.job)
+
+    @Slot(int)
+    def dialog_finished(self, result):
+        self.browser._on_multi_dialog_finished(self.job, result)
+
 
 class IdFilterProxyModel(QSortFilterProxyModel):
     """
@@ -70,6 +261,10 @@ class ProjectBrowser(QWidget):
         self.favorites_manager = FavoritesManager(self.user_data["username"])
         self.show_favorites_only = False
         self.show_recents_only = False
+        self._multi_import_job = None
+        self._multi_registration_job = None
+        self._scan_queue = None
+        self._scan_all_load_worker = None
         self._setup_ui()
         self.threadpool = QThreadPool.globalInstance()
         self._load_projects_async()
@@ -93,6 +288,278 @@ class ProjectBrowser(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add project: {e}")
             self.status_label.setText(f"Error adding project: {e}")
+
+    def _on_add_multiple_projects(self):
+        from .file_dialogs import pick_directory
+
+        if self._multi_import_job or self._multi_registration_job:
+            return
+        root = pick_directory(self, "Select Project Root")
+        if not root:
+            return
+
+        dialog = _FolderSelectionDialog(root, self)
+        cancel_event = threading.Event()
+        worker = DirectoryDiscoveryWorker(root, cancel_event)
+        job = _DiscoveryJob(self, worker, dialog, cancel_event)
+        receiver = _DiscoveryReceiver(self, job, dialog)
+        job.set_receiver(receiver)
+        self._multi_import_job = job
+        self.destroyed.connect(job.browser_destroyed)
+        dialog.destroyed.connect(job.dialog_destroyed)
+        # The guard is connected first so terminal state is set before any GUI relay runs.
+        worker.signals.finished.connect(job.terminal_result)
+        worker.signals.error.connect(job.terminal_result)
+        worker.signals.cancelled.connect(job.terminal_result)
+        worker.signals.finished.connect(receiver.finished)
+        worker.signals.error.connect(receiver.error)
+        worker.signals.cancelled.connect(receiver.cancelled)
+        dialog.finished.connect(receiver.dialog_finished)
+        self.threadpool.start(worker)
+
+        result = dialog.exec()
+        if job.dismissed or job.dialog is None:
+            job.finish_dialog(False)
+            return
+        selected = dialog.selected_paths if result == QDialog.Accepted else []
+        job.finish_dialog(result == QDialog.Accepted)
+        if selected:
+            self._start_project_registration(selected)
+
+    def _on_multi_discovery_finished(self, job, folders):
+        if self._multi_import_job is not job or job.dismissed or job.dialog is None:
+            return
+        job.dialog.set_folders(folders)
+
+    def _on_multi_discovery_error(self, job, exc_info):
+        if self._multi_import_job is not job or job.dismissed or job.dialog is None:
+            return
+        job.dialog.show_error(exc_info)
+
+    def _on_multi_discovery_cancelled(self, job):
+        if self._multi_import_job is not job or job.dismissed or job.dialog is None:
+            return
+        job.dialog.show_cancelled()
+
+    def _on_multi_dialog_finished(self, job, result):
+        if self._multi_import_job is not job:
+            return
+        if result != QDialog.Accepted:
+            job.dismissed = True
+            job.cancel_event.set()
+
+    def _set_scan_controls_busy(self, busy):
+        enabled = not busy
+        for button in (
+            self.add_project_btn, self.add_multiple_project_btn,
+            self.remove_project_btn, self.refresh_project_btn,
+            self.rescan_files_btn, self.scan_all_files_btn,
+        ):
+            button.setEnabled(enabled)
+
+    def _start_project_registration(self, folders):
+        worker = ProjectRegistrationWorker(self.db_path, folders)
+        self._multi_registration_job = {"worker": worker}
+        self._set_scan_controls_busy(True)
+        self.loading_bar.setVisible(True)
+        self.status_label.setText(
+            f"Registering {len(folders)} project(s)… Registration cannot be cancelled; "
+            "the scan queue starts next."
+        )
+        worker.signals.finished.connect(self._on_multi_registration_finished)
+        worker.signals.error.connect(self._on_multi_registration_error)
+        self.threadpool.start(worker)
+
+    def _on_multi_registration_finished(self, summary):
+        if not self._multi_registration_job:
+            return
+        self._multi_registration_job = None
+        if summary["added"]:
+            self._load_projects_async()
+            self._start_scan_queue(summary["added"], "bulk", summary)
+        else:
+            self.loading_bar.setVisible(False)
+            self._set_scan_controls_busy(False)
+            self._show_multi_registration_summary(summary)
+
+    def _on_multi_registration_error(self, exc_info):
+        from PySide6.QtWidgets import QMessageBox
+
+        if not self._multi_registration_job:
+            return
+        self._multi_registration_job = None
+        self.loading_bar.setVisible(False)
+        self._set_scan_controls_busy(False)
+        QMessageBox.critical(
+            self,
+            "Add Multiple Projects",
+            f"No projects were added.\nDatabase setup failed: {exc_info[1]}",
+        )
+
+    def _show_multi_registration_summary(self, summary):
+        from PySide6.QtWidgets import QMessageBox
+
+        lines = [
+            f"Added: {len(summary['added'])}",
+            f"Skipped existing: {len(summary['skipped'])}",
+            f"Failed: {len(summary['failed'])}",
+        ]
+        if summary["failed"]:
+            lines.append("\nFailures:")
+            lines.extend(f"{path}: {reason}" for path, reason in summary["failed"])
+        box = QMessageBox(self)
+        box.setWindowTitle("Add Multiple Projects")
+        box.setIcon(QMessageBox.Warning if summary["failed"] else QMessageBox.Information)
+        box.setText("\n".join(lines))
+        box.exec()
+
+    def _on_scan_all_projects_clicked(self):
+        if self._scan_queue or self._multi_registration_job or self._scan_all_load_worker:
+            return
+        self._set_scan_controls_busy(True)
+        self.loading_bar.setVisible(True)
+        self.status_label.setText("Loading all registered projects for scanning…")
+        worker = ProjectLoadWorker(self.db_path)
+        self._scan_all_load_worker = worker
+        worker.signals.finished.connect(self._on_scan_all_projects_loaded)
+        worker.signals.error.connect(self._on_scan_all_projects_load_error)
+        self.threadpool.start(worker)
+
+    def _on_scan_all_projects_loaded(self, projects):
+        self._scan_all_load_worker = None
+        self._start_scan_queue([project["path"] for project in projects], "all")
+
+    def _on_scan_all_projects_load_error(self, exc_info):
+        from PySide6.QtWidgets import QMessageBox
+
+        self._scan_all_load_worker = None
+        self.loading_bar.setVisible(False)
+        self._set_scan_controls_busy(False)
+        QMessageBox.critical(self, "Scan All Project Files", f"Could not load projects: {exc_info[1]}")
+
+    def _start_scan_queue(self, project_paths, source, registration_summary=None):
+        from core.database import DatabaseManager
+        from ui_slick.scan_progress_dialog import ScanManager
+
+        if self._scan_queue or self._multi_registration_job:
+            return
+        paths = list(dict.fromkeys(path for path in project_paths if path))
+        queue = {
+            "paths": paths,
+            "index": 0,
+            "source": source,
+            "registration": registration_summary,
+            "results": [],
+            "cancelled": False,
+            "destroyed": False,
+        }
+        self._scan_queue = queue
+        browser_ref = weakref.ref(self)
+        self.destroyed.connect(lambda: queue.__setitem__("destroyed", True))
+
+        def finished(path, files):
+            browser = browser_ref()
+            if browser is not None and not queue["destroyed"]:
+                browser._on_scan_queue_finished(queue, path, files)
+
+        def failed(path, message):
+            def deliver():
+                browser = browser_ref()
+                if browser is not None and not queue["destroyed"]:
+                    browser._on_scan_queue_error(queue, path, message)
+            QTimer.singleShot(0, deliver)
+
+        def cancelled(path):
+            browser = browser_ref()
+            if browser is not None and not queue["destroyed"]:
+                browser._on_scan_queue_cancelled(queue, path)
+
+        queue["finished"] = finished
+        queue["failed"] = failed
+        queue["cancelled_callback"] = cancelled
+        self._set_scan_controls_busy(True)
+        self.loading_bar.setVisible(True)
+        self._scan_manager = ScanManager(DatabaseManager(self.db_path), self)
+        self._scan_queue_next(queue)
+
+    def _scan_queue_next(self, queue):
+        if self._scan_queue is not queue or queue["destroyed"]:
+            return
+        if queue["cancelled"] or queue["index"] >= len(queue["paths"]):
+            self._finish_scan_queue(queue)
+            return
+        path = queue["paths"][queue["index"]]
+        queue["index"] += 1
+        self.status_label.setText(
+            f"Scanning project {queue['index']}/{len(queue['paths'])}: {path}"
+        )
+        self._scan_manager.scan_project(
+            path,
+            on_finished=queue["finished"],
+            on_error=queue["failed"],
+            on_cancelled=queue["cancelled_callback"],
+        )
+
+    def _on_scan_queue_finished(self, queue, path, files):
+        if self._scan_queue is not queue:
+            return
+        self.scan_finished.emit(path)
+        queue["results"].append({"path": path, "status": "success", "files": len(files)})
+        self._scan_queue_next(queue)
+
+    def _on_scan_queue_error(self, queue, path, message):
+        if self._scan_queue is not queue:
+            return
+        queue["results"].append({"path": path, "status": "error", "message": message})
+        self._scan_queue_next(queue)
+
+    def _on_scan_queue_cancelled(self, queue, path):
+        if self._scan_queue is not queue:
+            return
+        queue["results"].append({"path": path, "status": "cancelled"})
+        queue["cancelled"] = True
+        self._scan_queue_next(queue)
+
+    def _finish_scan_queue(self, queue):
+        if self._scan_queue is not queue:
+            return
+        self._scan_queue = None
+        self.loading_bar.setVisible(False)
+        if queue["cancelled"]:
+            queue["results"].extend(
+                {"path": path, "status": "cancelled"}
+                for path in queue["paths"][queue["index"]:]
+            )
+        self._set_scan_controls_busy(False)
+        self._show_scan_queue_summary(queue)
+
+    def _show_scan_queue_summary(self, queue):
+        from PySide6.QtWidgets import QMessageBox
+
+        results = queue["results"]
+        lines = []
+        registration = queue["registration"]
+        if registration:
+            lines.extend([
+                f"Registered: {len(registration['added'])}",
+                f"Registration skipped: {len(registration['skipped'])}",
+                f"Registration failed: {len(registration['failed'])}",
+            ])
+            lines.extend(f"Registration failure: {path}: {reason}" for path, reason in registration["failed"])
+        lines.extend([
+            f"Scanned successfully: {sum(result['status'] == 'success' for result in results)}",
+            f"Scan failures: {sum(result['status'] == 'error' for result in results)}",
+            f"Cancelled: {sum(result['status'] == 'cancelled' for result in results)}",
+        ])
+        lines.extend(
+            f"Scan failure: {result['path']}: {result['message']}"
+            for result in results if result["status"] == "error"
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Project File Scan Summary")
+        box.setIcon(QMessageBox.Warning if any("failure" in line.lower() for line in lines) else QMessageBox.Information)
+        box.setText("\n".join(lines) if lines else "No projects were available to scan.")
+        box.exec()
 
     def _on_refresh_projects(self):
         logger.info("[DIAG] Refresh button clicked. Reloading project list from database.")
@@ -197,6 +664,12 @@ class ProjectBrowser(QWidget):
         self.add_project_btn.clicked.connect(self._on_add_project)
         add_bar.addWidget(self.add_project_btn)
 
+        self.add_multiple_project_btn = QPushButton("Add Multiple…")
+        self.add_multiple_project_btn.setStyleSheet("QPushButton { background-color: #2563eb; color: white; padding: 8px 16px; font-weight: bold; }")
+        self.add_multiple_project_btn.setToolTip("Register immediate child folders from a selected root")
+        self.add_multiple_project_btn.clicked.connect(self._on_add_multiple_projects)
+        add_bar.addWidget(self.add_multiple_project_btn)
+
         self.remove_project_btn = QPushButton("Remove Project")
         self.remove_project_btn.setStyleSheet("QPushButton { background-color: #2563eb; color: white; padding: 8px 16px; font-weight: bold; }")
         self.remove_project_btn.setToolTip("Remove the selected project from the database")
@@ -272,6 +745,12 @@ class ProjectBrowser(QWidget):
         self.rescan_files_btn.setToolTip("Scan the selected project for .nk and .aep files")
         self.rescan_files_btn.clicked.connect(self._on_rescan_files_clicked)
         bottom_bar.addWidget(self.rescan_files_btn)
+
+        self.scan_all_files_btn = QPushButton("Scan All Project Files")
+        self.scan_all_files_btn.setStyleSheet("QPushButton { background-color: #2563eb; color: white; padding: 8px 16px; font-weight: bold; }")
+        self.scan_all_files_btn.setToolTip("Scan every registered project")
+        self.scan_all_files_btn.clicked.connect(self._on_scan_all_projects_clicked)
+        bottom_bar.addWidget(self.scan_all_files_btn)
 
         bottom_bar.addStretch(1)
         layout.addLayout(bottom_bar)
@@ -561,58 +1040,11 @@ class ProjectBrowser(QWidget):
         # Start async scan for files in the selected project
 
     def _scan_project_files_async(self, project_path):
-        """
-        Asynchronously scan the project folder for .nk and .aep files and emit file_selected.
-        Uses the new Scanner module for robust scanning with proper path normalization and DB integration.
-        Shows a ScanProgressDialog with progress, ETA, and logs.
-        """
-        import os
-        import logging
-        from ui_slick.scan_progress_dialog import ScanManager
-        from core.database import DatabaseManager
-        
-        # Validate project path
+        """Queue one full project scan through the shared scan entry point."""
         if not project_path or not os.path.isdir(project_path):
             self.status_label.setText(f"Invalid project path: {project_path}")
             return
-            
-        logging.info(f"[ProjectBrowser] Starting scan for project path: {project_path}")
-        
-        # Create database manager for the scan
-        db_manager = DatabaseManager(self.db_path)
-        
-        # Create scan manager and prepare for scan
-        self._scan_manager = ScanManager(db_manager, self)
-        self._scan_incremental_files = []
-        
-        # Define scan completion callback
-        def on_scan_finished(scanned_project_path, found_files):
-            logging.info(f"[ProjectBrowser] Scan complete for {scanned_project_path}. Found {len(found_files)} files")
-            
-            # Log a breakdown of files by type for diagnostics
-            nuke_files = [f for f in found_files if f.get('filepath', '').lower().endswith('.nk')]
-            aep_files = [f for f in found_files if f.get('filepath', '').lower().endswith('.aep')]
-            logging.info(f"[ProjectBrowser] File breakdown: {len(nuke_files)} Nuke files, {len(aep_files)} AEP files")
-            
-            # Log some sample paths to help diagnose scanning issues
-            if found_files:
-                logging.info(f"[ProjectBrowser] Sample files found:\n" + 
-                            '\n'.join([f['filepath'] for f in found_files[:5]]) + 
-                            (f"\n...and {len(found_files)-5} more" if len(found_files) > 5 else ""))
-            
-            # Update UI
-            self.status_label.setText(f"Found {len(found_files)} files.")
-            
-            # Emit scan_finished to update file browser from DB
-            self.scan_finished.emit(scanned_project_path)
-            
-            # Also send incremental file update signals
-            nuke_files_incr = [f for f in found_files if f.get('filepath', '').lower().endswith('.nk')]
-            aep_files_incr = [f for f in found_files if f.get('filepath', '').lower().endswith('.aep')]
-            self.file_selected.emit(nuke_files_incr, aep_files_incr)
-        
-        # Start the scan
-        self._scan_manager.scan_project(project_path, on_scan_finished)
+        self._start_scan_queue([project_path], "single")
 
     def _on_open_containing_folder(self, index):
         """

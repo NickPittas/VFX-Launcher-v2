@@ -13,11 +13,33 @@ Requirements:
 import os
 import re
 import logging
+import sys
 from datetime import datetime
 import time
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+
+def get_external_process_env():
+    """Return a safe copy of the environment for processes launched outside the app.
+
+    PyInstaller's bundled library path must not leak into external Linux
+    applications.  Keep the parent environment untouched and preserve every
+    other variable exactly as inherited.
+    """
+    env = os.environ.copy()
+
+    if sys.platform.startswith("linux") and (
+        getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS")
+    ):
+        if "LD_LIBRARY_PATH_ORIG" in env:
+            env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+
+    return env
+
 
 # Regular expression for extracting version numbers (_v###)
 VERSION_REGEX = re.compile(r'_v(\d+)', re.IGNORECASE)

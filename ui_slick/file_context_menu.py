@@ -7,6 +7,7 @@ import subprocess
 import logging
 from PySide6.QtWidgets import QMenu, QMessageBox, QApplication
 from PySide6.QtCore import Qt, Signal
+from core.utils import get_external_process_env
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,10 @@ def open_in_file_manager(path):
     if hasattr(os, 'startfile'):
         os.startfile(path)
     else:
-        subprocess.Popen(['open' if sys.platform == 'darwin' else 'xdg-open', path])
+        subprocess.Popen(
+            ['open' if sys.platform == 'darwin' else 'xdg-open', path],
+            env=get_external_process_env(),
+        )
 
 class FileContextMenuManager:
     """Manages context menu operations for file items"""

@@ -130,9 +130,38 @@ class ScanProgressDialog(QDialog):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setToolTip("Cancel the current scan operation")
         self.cancel_button.clicked.connect(self._on_cancel)
+        self._cancel_emitted = False
         button_layout.addWidget(self.cancel_button)
 
         layout.addLayout(button_layout)
+
+    def prepare_for_scan(self, title):
+        """Reset this dialog for the next queued scan without creating another dialog."""
+        self.setWindowTitle(title)
+        self.title_label.setText(title)
+        self.current_dir_label.setText("Initializing...")
+        self.progress_label.setText("Initializing scan...")
+        self.eta_label.setText("ETA: --:--")
+        self.progress_bar.setValue(0)
+        self.log_text.clear()
+        self.folders_tree.clear()
+        self.files_tree.clear()
+        self.tab_widget.setTabText(1, "Matching Folders (0)")
+        self.tab_widget.setTabText(2, "Found Files (0)")
+        self.folder_count = 0
+        self.file_count = 0
+        self.matching_folders = []
+        self.found_files = []
+        self._cancel_emitted = False
+        try:
+            self.cancel_button.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self.cancel_button.setText("Cancel")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setToolTip("Cancel the current scan operation")
+        self.cancel_button.setStyleSheet("")
+        self.cancel_button.clicked.connect(self._on_cancel)
 
     def update_progress(self, percent, message, eta):
         """Update progress bar and labels"""
@@ -202,42 +231,6 @@ class ScanProgressDialog(QDialog):
         # Show a summary in the title
         self.title_label.setText(f"Scan Complete: {self.folder_count} folders, {self.file_count} files")
         
-    def _convert_to_close_button(self):
-        """Convert the Cancel button to a Close button"""
-        # Disconnect all existing signals
-        try:
-            self.cancel_button.clicked.disconnect()
-        except (RuntimeError, TypeError):
-            # No connections to disconnect
-            pass
-
-        # Change text, tooltip, and connect to accept (close dialog)
-        self.cancel_button.setText("Close")
-        self.cancel_button.setToolTip("Close this dialog")
-        self.cancel_button.setEnabled(True)  # Re-enable in case it was disabled
-        self.cancel_button.clicked.connect(self.accept)
-        
-    def _on_cancel(self):
-        """Handle cancel button click"""
-        # Confirm cancellation
-        from PySide6.QtWidgets import QMessageBox
-        confirm = QMessageBox.question(
-            self, 
-            "Cancel Scan", 
-            "Are you sure you want to cancel the current scan?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if confirm == QMessageBox.Yes:
-            # Emit signal to cancel the scan
-            self.append_log("Cancelling scan...")
-            self.cancel_requested.emit()
-            
-            # Change button to indicate cancellation in progress
-            self.cancel_button.setText("Cancelling...")
-            self.cancel_button.setEnabled(False)
-        
     def _get_timestamp(self):
         """Get current timestamp for log entries"""
         from datetime import datetime
@@ -273,22 +266,23 @@ class ScanProgressDialog(QDialog):
         self.tab_widget.setTabText(2, f"Found Files ({self.file_count})")
         
     def _on_cancel(self):
-        """Handle cancel button click"""
-        # If text is "Close", just accept the dialog
+        """Handle cancel button click exactly once."""
         if self.cancel_button.text() == "Close":
             self.accept()
             return
-        
-        # Otherwise, emit the cancel signal
+        if self._cancel_emitted:
+            return
+        self._cancel_emitted = True
         self.cancel_requested.emit()
         self.cancel_button.setEnabled(False)
         self.progress_label.setText("Cancelling scan...")
         self.append_log("Cancelling scan...")
         
     def _convert_to_close_button(self):
-        """Convert cancel button to close button"""
+        """Convert cancel button to close button."""
         self.cancel_button.setText("Close")
         self.cancel_button.setEnabled(True)
+        self.cancel_button.setToolTip("Close this dialog")
         self.cancel_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
 
 
@@ -306,8 +300,22 @@ class ScanManager:
         self.parent = parent
         self.db_manager = db_manager
         self.dialog = None
+        self.on_finished_callback = None
+        self.on_error_callback = None
+        self.on_cancelled_callback = None
+        self.current_project_path = ""
+        if parent is not None:
+            parent.destroyed.connect(self._on_parent_destroyed)
+
+    def _on_parent_destroyed(self):
+        self.scanner.stop()
+        self.dialog = None
+        self.on_finished_callback = None
+        self.on_error_callback = None
+        self.on_cancelled_callback = None
         
-    def scan_project(self, project_path, on_finished=None, quick_scan=False):
+    def scan_project(self, project_path, on_finished=None, quick_scan=False,
+                     on_error=None, on_cancelled=None):
         """
         Start scanning a project with UI feedback
         
@@ -315,21 +323,30 @@ class ScanManager:
             project_path: Path to project root
             on_finished: Callback when scan is complete (project_path, found_files)
             quick_scan: If True, perform a quick scan of existing folders only
+            on_error: Terminal error callback (project_path, message)
+            on_cancelled: Terminal cancellation callback (project_path)
         """
-        from ui_slick.scanner import Scanner
-        
-        # Create progress dialog with appropriate title
         scan_type = "Quick Scan" if quick_scan else "Full Scan"
-        self.dialog = ScanProgressDialog(self.parent)
-        self.dialog.setWindowTitle(f"{scan_type}: {os.path.basename(project_path)}")
-        self.dialog.title_label.setText(f"{scan_type}: {os.path.basename(project_path)}")
+        self.current_project_path = project_path
+        title = f"{scan_type}: {os.path.basename(project_path)}"
+        if self.dialog is None:
+            self.dialog = ScanProgressDialog(self.parent)
+        else:
+            self.dialog.prepare_for_scan(title)
+        self.dialog.setWindowTitle(title)
+        self.dialog.title_label.setText(title)
         self.dialog.show()
         
-        # Connect cancel button
+        try:
+            self.dialog.cancel_requested.disconnect(self.scanner.stop)
+        except (RuntimeError, TypeError):
+            pass
         self.dialog.cancel_requested.connect(self.scanner.stop)
         
-        # Store callback
+        # Store callbacks
         self.on_finished_callback = on_finished
+        self.on_error_callback = on_error
+        self.on_cancelled_callback = on_cancelled
         
         # Prepare scan arguments
         scan_args = {
@@ -339,7 +356,8 @@ class ScanManager:
             'on_file_found': self.dialog.show_file_found,
             'on_log': self.dialog.append_log,
             'on_finished': self._on_scan_finished,
-            'on_error': self._on_scan_error
+            'on_error': self._on_scan_error,
+            'on_cancelled': self._on_scan_cancelled,
         }
         
         # Start the appropriate scan type
@@ -379,7 +397,19 @@ class ScanManager:
         logger.info(f"[ScanManager] _on_scan_finished completed")
             
     def _on_scan_error(self, message):
-        """Handle scan error"""
+        """Handle one terminal scan error."""
         if self.dialog:
             self.dialog.append_log(f"ERROR: {message}")
             self.dialog.update_progress(100, "Scan failed", "00:00")
+            self.dialog._convert_to_close_button()
+        if self.on_error_callback:
+            self.on_error_callback(self.current_project_path, message)
+
+    def _on_scan_cancelled(self, project_path):
+        """Handle one terminal scan cancellation."""
+        if self.dialog:
+            self.dialog.append_log("Scan cancelled.")
+            self.dialog.update_progress(100, "Scan cancelled", "00:00")
+            self.dialog._convert_to_close_button()
+        if self.on_cancelled_callback:
+            self.on_cancelled_callback(project_path)

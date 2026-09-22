@@ -32,6 +32,7 @@ class ScannerSignals(QObject):
     finished = Signal(list)  # list of all files/folders found
     db_update_complete = Signal(str)  # project path when DB update is done
     error = Signal(str)  # error message
+    cancelled = Signal(str)  # project or folder path
     scan_complete = Signal(str)  # project path
 
 class ScannerSignalRelay(QObject):
@@ -47,7 +48,11 @@ class ScannerSignalRelay(QObject):
     log = Signal(str)  # log message
     file_found = Signal(dict)  # file info dictionary
     folder_found = Signal(str)  # full path of matching target folder
-    error = Signal(str)  # error message
+    error = Signal(str)  # terminal error message
+    file_error = Signal(object, str, str)  # worker token, folder path, error
+    file_cancelled = Signal(object, str)  # worker token, folder path
+    file_finished = Signal(object, str, list)  # worker token, folder path, files
+    cancelled = Signal(str)  # terminal cancellation with project/folder path
     finished = Signal(list)  # list of files/folders found
 
 
@@ -201,6 +206,10 @@ class FolderMatchWorker(QRunnable):
                         full_path = os.path.join(root, d)
                         directories_found.add(full_path)
             
+            if self._stop_requested:
+                self.signals.cancelled.emit(self.project_path)
+                return
+
             # Now check which directories match our target names
             self.signals.log.emit(f"🔍 Processing {len(directories_found)} directories for target matches...")
             self.signals.progress.emit(50, f"Matching directories to targets...", "--:--")
@@ -233,6 +242,10 @@ class FolderMatchWorker(QRunnable):
                     self.signals.folder_found.emit(directory)
                     self.signals.log.emit(f"✓ Found target folder: {directory}")
             
+            if self._stop_requested:
+                self.signals.cancelled.emit(self.project_path)
+                return
+
             # Report completion of folder matching phase (50% of total scan)
             elapsed = time.time() - start_time
             self.signals.log.emit(f"✓ Folder match scan complete. Found {len(matching_folders)} matching folders in {elapsed:.1f} seconds")
@@ -240,8 +253,11 @@ class FolderMatchWorker(QRunnable):
             self.signals.finished.emit(matching_folders)
 
         except Exception as e:
-            self.signals.log.emit(f"❌ Error in folder match scan: {str(e)}")
-            self.signals.error.emit(f"Error in folder match scan: {str(e)}")
+            if self._stop_requested:
+                self.signals.cancelled.emit(self.project_path)
+            else:
+                self.signals.log.emit(f"❌ Error in folder match scan: {str(e)}")
+                self.signals.error.emit(f"Error in folder match scan: {str(e)}")
 
 
 class FileSearchWorker(QRunnable):
@@ -346,6 +362,10 @@ class FileSearchWorker(QRunnable):
 
             analysis_time = time.time() - analysis_start
             self.signals.log.emit(f"✓ Analysis complete: {total_files_estimate} files in {folders_found} folders ({analysis_time:.1f}s)")
+
+            if self._stop_requested:
+                self.signals.cancelled.emit(self.folder_path)
+                return
             
             if total_files_estimate == 0:
                 self.signals.log.emit(f"⚠ No matching files found in {folder_name}")
@@ -450,8 +470,12 @@ class FileSearchWorker(QRunnable):
                         self.signals.file_found.emit(file_info)
                     except Exception as e:
                         error_msg = f"❌ Error processing {filename}: {str(e)}"
+                        # A single unreadable file is recoverable; keep scanning.
                         self.signals.log.emit(error_msg)
-                        self.signals.error.emit(error_msg)
+
+            if self._stop_requested:
+                self.signals.cancelled.emit(self.folder_path)
+                return
 
             # Report completion
             elapsed = time.time() - start_time
@@ -461,9 +485,12 @@ class FileSearchWorker(QRunnable):
             self.signals.finished.emit(found_files)
 
         except Exception as e:
-            error_msg = f"❌ Error in file scan: {str(e)}"
-            self.signals.log.emit(error_msg)
-            self.signals.error.emit(error_msg)
+            if self._stop_requested:
+                self.signals.cancelled.emit(self.folder_path)
+            else:
+                error_msg = f"❌ Error in file scan: {str(e)}"
+                self.signals.log.emit(error_msg)
+                self.signals.error.emit(error_msg)
 
 
 class Scanner:
@@ -499,6 +526,37 @@ class Scanner:
         # Results storage
         self.matching_folders = []
         self.found_files = []
+        self._terminal_sent = False
+        self._active_on_finished = None
+        self._active_on_error = None
+        self._active_on_cancelled = None
+
+    def _begin_scan(self, on_finished, on_error, on_cancelled):
+        self._terminal_sent = False
+        self._active_on_finished = on_finished
+        self._active_on_error = on_error
+        self._active_on_cancelled = on_cancelled
+
+    def _finish_success(self, project_path, found_files):
+        if self._terminal_sent:
+            return
+        self._terminal_sent = True
+        if self._active_on_finished:
+            self._active_on_finished(project_path, found_files)
+
+    def _finish_error(self, message):
+        if self._terminal_sent:
+            return
+        self._terminal_sent = True
+        if self._active_on_error:
+            self._active_on_error(message)
+
+    def _finish_cancelled(self, project_path):
+        if self._terminal_sent:
+            return
+        self._terminal_sent = True
+        if self._active_on_cancelled:
+            self._active_on_cancelled(project_path)
 
     def _ensure_signal_relay(self):
         """Return the signal relay for the current scan, creating it if needed"""
@@ -552,11 +610,12 @@ class Scanner:
         
         
     def scan_project(self, project_path, on_progress=None, on_folder_found=None, 
-                     on_file_found=None, on_log=None, on_finished=None, on_error=None):
-        """Start a full scan of a project (folder matching + file scanning)"""
+                     on_file_found=None, on_log=None, on_finished=None, on_error=None,
+                     on_cancelled=None):
+        """Start a full scan of a project (folder matching + file scanning)."""
+        self._begin_scan(on_finished, on_error, on_cancelled)
         if not project_path or not os.path.isdir(project_path):
-            if on_error:
-                on_error(f"Invalid project path: {project_path}")
+            self._finish_error(f"Invalid project path: {project_path}")
             return False
             
         # Normalize the project path for consistent handling
@@ -586,6 +645,7 @@ class Scanner:
         self.folder_match_worker.signals.log.connect(relay.log)
         self.folder_match_worker.signals.folder_found.connect(relay.folder_found)
         self.folder_match_worker.signals.error.connect(relay.error)
+        self.folder_match_worker.signals.cancelled.connect(relay.cancelled)
         self.folder_match_worker.signals.finished.connect(relay.finished)
 
         # Connect relay signals to the plain callbacks (GUI thread only)
@@ -599,11 +659,15 @@ class Scanner:
             relay.folder_found.connect(on_folder_found)
 
         if on_error:
-            relay.error.connect(on_error)
+            relay.error.connect(self._finish_error)
+        relay.cancelled.connect(self._finish_cancelled)
 
         
         # Connect folder match completion to start file search
         def on_folder_match_complete(matching_folders):
+            if self._stop_requested:
+                self._finish_cancelled(project_path)
+                return
             self.matching_folders = matching_folders
             if on_log:
                 on_log(f"Found {len(matching_folders)} matching folders: {matching_folders}")
@@ -630,8 +694,7 @@ class Scanner:
             else:
                 if on_log:
                     on_log(f"No matching folders found in project: {project_path}")
-                if on_finished:
-                    on_finished(project_path, [])
+                self._finish_success(project_path, [])
         
         relay.finished.connect(on_folder_match_complete)
         
@@ -644,21 +707,27 @@ class Scanner:
         """Start file search in each matching folder"""
         self.file_search_workers = []
         self.found_files = []
-        remaining_folders = len(matching_folders)
-        
+        remaining_folders = 0
+        cancelled_folders = 0
+        started_folders = 0
+        terminal_workers = set()
+        fatal_error = None
+
         # If no folders to scan, we're done
-        if remaining_folders == 0:
-            if on_finished:
-                on_finished(project_path, [])
+        if not matching_folders:
+            self._finish_success(project_path, [])
             return
-            
-        # Track completion to know when all workers are done
+
+        # Track completion to know when all started workers are done
         self.completed_folders = 0
         
         # Function to handle file search worker completion
-        def on_file_search_complete(files_found):
+        def on_file_search_complete(worker_token, folder_path, files_found):
             nonlocal remaining_folders
-            
+            if worker_token in terminal_workers:
+                return
+            terminal_workers.add(worker_token)
+
             # Update completion counter
             self.completed_folders += 1
             remaining_folders -= 1
@@ -677,10 +746,36 @@ class Scanner:
                 
             # Check if all searches are complete
             if remaining_folders == 0:
+                on_all_file_searches_terminal()
+
+        def on_file_search_cancelled(worker_token, folder_path):
+            nonlocal remaining_folders, cancelled_folders
+            if worker_token in terminal_workers:
+                return
+            terminal_workers.add(worker_token)
+            cancelled_folders += 1
+            remaining_folders -= 1
+            if on_log:
+                on_log(f"Cancelled folder scan {cancelled_folders}")
+            if remaining_folders == 0:
+                on_all_file_searches_terminal()
+
+        def on_file_search_error(worker_token, folder_path, message):
+            nonlocal remaining_folders, cancelled_folders, fatal_error
+            if worker_token in terminal_workers:
+                return
+            terminal_workers.add(worker_token)
+            remaining_folders -= 1
+            if self._stop_requested:
+                cancelled_folders += 1
+            else:
+                fatal_error = fatal_error or message
+                for worker in self.file_search_workers:
+                    worker.stop()
                 if on_log:
-                    on_log(f"All folder scans complete. Found {len(self.found_files)} total files")
-                # All searches are complete, update database
-                on_all_file_searches_complete()
+                    on_log(f"Fatal file scan error in {folder_path}; stopping sibling scans")
+            if remaining_folders == 0:
+                on_all_file_searches_terminal()
                 
         # Create and start a worker for each matching folder
         if on_log:
@@ -699,7 +794,9 @@ class Scanner:
             # that has no receivers yet
             warnings.simplefilter("ignore", RuntimeWarning)
             for relay_signal in (relay.progress, relay.log, relay.file_found,
-                                 relay.folder_found, relay.error, relay.finished):
+                                 relay.folder_found, relay.error, relay.file_error,
+                                 relay.file_cancelled, relay.file_finished,
+                                 relay.cancelled, relay.finished):
                 try:
                     relay_signal.disconnect()
                 except RuntimeError:
@@ -728,11 +825,13 @@ class Scanner:
 
         relay.log.connect(on_log if on_log else lambda _: None)
         relay.file_found.connect(on_file_found if on_file_found else lambda _: None)
-        relay.error.connect(on_error if on_error else lambda _: None)
-        # The completed_folders/remaining_folders counters mutated by this
-        # handler are only ever touched on the GUI thread because the relay
+        relay.error.connect(lambda message: self._finish_error(message))
+        relay.file_error.connect(on_file_search_error)
+        relay.file_cancelled.connect(on_file_search_cancelled)
+        relay.file_finished.connect(on_file_search_complete)
+        # The completed_folders/remaining_folders counters mutated by these
+        # handlers are only ever touched on the GUI thread because the relay
         # re-emits there - no locking needed.
-        relay.finished.connect(on_file_search_complete)
 
         # Create and start workers for each folder
         for folder_path in matching_folders:
@@ -741,25 +840,50 @@ class Scanner:
 
             # Create worker
             worker = FileSearchWorker(project_path, folder_path, file_extensions)
+            worker_token = object()
             self.file_search_workers.append(worker)
 
             # Route every worker signal through the GUI-thread relay
             worker.signals.progress.connect(relay.progress)
             worker.signals.log.connect(relay.log)
             worker.signals.file_found.connect(relay.file_found)
-            worker.signals.error.connect(relay.error)
-            worker.signals.finished.connect(relay.finished)
+            worker.signals.error.connect(
+                lambda message, token=worker_token, folder=folder_path:
+                    relay.file_error.emit(token, folder, message)
+            )
+            worker.signals.cancelled.connect(
+                lambda _path, token=worker_token, folder=folder_path:
+                    relay.file_cancelled.emit(token, folder)
+            )
+            worker.signals.finished.connect(
+                lambda files, token=worker_token, folder=folder_path:
+                    relay.file_finished.emit(token, folder, files)
+            )
 
             # Start worker
             self.thread_pool.start(worker)
+            started_folders += 1
 
             if on_log:
                 on_log(f"Started file search in: {folder_path}")
 
+        remaining_folders = started_folders
+
         
-        # Function to handle completion of all file searches. Reached only via
-        # on_file_search_complete, which the relay runs on the GUI thread, so
-        # everything below (including the completion timer) executes there.
+        # Terminal file-worker outcomes are serialized through the relay. A fatal
+        # worker error is held until every started sibling has reported once.
+        def on_all_file_searches_terminal():
+            if fatal_error:
+                self._stop_completion_timer()
+                self._finish_error(fatal_error)
+            elif self._stop_requested or cancelled_folders:
+                self._stop_completion_timer()
+                self._finish_cancelled(project_path)
+            else:
+                if on_log:
+                    on_log(f"All folder scans complete. Found {len(self.found_files)} total files")
+                on_all_file_searches_complete()
+
         def on_all_file_searches_complete():
             # Update database if db_manager available
             if self.db_manager:
@@ -838,15 +962,16 @@ class Scanner:
                             # via the relay. Do not report success (100%/finished).
                             logger.warning(f"[Scanner] DB update failed; skipping completion callbacks: {db_worker.error}")
                             return
+                        if self._stop_requested:
+                            self._finish_cancelled(project_path)
+                            return
                         # Update progress to 100%
                         if on_progress:
                             logger.info(f"[Scanner] Calling on_progress with 100%")
                             on_progress(100, f"Scan complete: {len(self.found_files)} files found", "00:00")
 
-                        # Call finished callback
-                        if on_finished:
-                            logger.info(f"[Scanner] Calling on_finished callback")
-                            on_finished(project_path, self.found_files)
+                        logger.info(f"[Scanner] Calling finished callback")
+                        self._finish_success(project_path, self.found_files)
 
                         logger.info(f"[Scanner] Completion handling finished")
 
@@ -855,10 +980,15 @@ class Scanner:
                 logger.info(f"[Scanner] Completion timer started, polling every 100ms")
             else:
                 # No DB manager, just signal completion
-                if on_progress:
-                    on_progress(100, f"Scan complete: {len(self.found_files)} files found", "00:00")
-                if on_finished:
-                    on_finished(project_path, self.found_files)
+                if self._stop_requested:
+                    self._finish_cancelled(project_path)
+                else:
+                    if on_progress:
+                        on_progress(100, f"Scan complete: {len(self.found_files)} files found", "00:00")
+                    self._finish_success(project_path, self.found_files)
+
+        if remaining_folders == 0:
+            on_all_file_searches_terminal()
                     
     def stop(self):
         """Stop all scanning operations"""
@@ -876,14 +1006,15 @@ class Scanner:
         logger.info("Scanner stopping all operations")
                 
     def quick_scan_project(self, project_path, on_progress=None, on_folder_found=None, 
-                      on_file_found=None, on_log=None, on_finished=None, on_error=None):
+                      on_file_found=None, on_log=None, on_finished=None, on_error=None,
+                      on_cancelled=None):
         """
         Perform a quick scan of a project, only scanning files in already-known folders.
         This is optimized for finding new versions without redoing the folder matching phase.
         """
+        self._begin_scan(on_finished, on_error, on_cancelled)
         if not project_path or not os.path.isdir(project_path):
-            if on_error:
-                on_error(f"Invalid project path: {project_path}")
+            self._finish_error(f"Invalid project path: {project_path}")
             return False
         
         # Normalize the project path for consistent handling
@@ -969,8 +1100,8 @@ class Scanner:
             except Exception as e:
                 if on_log:
                     on_log(f"Error accessing database: {str(e)}")
-                if on_error:
-                    on_error(f"Database error: {str(e)}")
+                self._finish_error(f"Database error: {str(e)}")
+                return False
         else:
             if on_log:
                 on_log("Database manager not available, will scan without database information")
@@ -1055,8 +1186,8 @@ class Scanner:
             except Exception as e:
                 if on_log:
                     on_log(f"Error getting folders from database: {str(e)}")
-                if on_error:
-                    on_error(f"Database error: {str(e)}")
+                self._finish_error(f"Database error: {str(e)}")
+                return False
     
         # If no folders found in database, try direct match using target folder names
         if not matching_folders:
@@ -1087,8 +1218,8 @@ class Scanner:
             except Exception as e:
                 if on_log:
                     on_log(f"Error listing project directory: {str(e)}")
-                if on_error:
-                    on_error(f"File system error: {str(e)}")
+                self._finish_error(f"File system error: {str(e)}")
+                return False
     
         # If still no matching folders, check if the user REALLY wants to continue
         if not matching_folders:
@@ -1097,10 +1228,9 @@ class Scanner:
                 on_log(error_msg)
                 on_log("Scan would need to use the entire project root as fallback, which may be very slow")
                 
-            if on_error:
-                # Signal an error instead of proceeding with a slow scan
-                on_error(error_msg + ". Please check project structure and settings.")
-                return False
+            # Signal an error instead of proceeding with a slow scan
+            self._finish_error(error_msg + ". Please check project structure and settings.")
+            return False
                 
             # Only as absolute last resort, use project root
             if on_log:

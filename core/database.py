@@ -411,7 +411,7 @@ class DatabaseManager:
         return True
     
     # Project CRUD operations
-    def create_project(self, name, path, added_by=None):
+    def create_project(self, name, path, added_by=None, existing_ok=True):
         """
         Create a new project.
         
@@ -419,7 +419,9 @@ class DatabaseManager:
             name (str): Project name
             path (str): Project path
             added_by (str, optional): Username who added the project
-            
+            existing_ok (bool, optional): Return an existing ID on a path conflict;
+                when false, re-raise the uniqueness error for the caller to classify.
+
         Returns:
             int: ID of the created project
         """
@@ -435,6 +437,8 @@ class DatabaseManager:
             return result[0]['id'] if result else None
         except sqlite3.IntegrityError:
             logger.warning(f"Project with path '{path}' already exists")
+            if not existing_ok:
+                raise
             result = self._execute_query(
                 "SELECT id FROM projects WHERE path = ?",
                 (path,)
