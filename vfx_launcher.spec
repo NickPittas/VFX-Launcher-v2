@@ -18,8 +18,10 @@ a = Analysis(
         ('ui_slick/icons', 'ui_slick/icons'),
         # Include QSS stylesheet
         ('ui_slick/styles.qss', 'ui_slick'),
-        # Include subfolder structure preset for the New Project panel
-        ('ui_slick/Structure', 'ui_slick/Structure'),
+# Include subfolder structure preset for the New Project panel
+        # (only exists on dev machines — empty dirs aren't tracked by git)
+        *([( 'ui_slick/Structure', 'ui_slick/Structure')]
+          if os.path.isdir(os.path.join(project_root, 'ui_slick', 'Structure')) else []),
         # Manifest of Structure/ dirs (empty dirs are dropped from the bundle)
         ('ui_slick/structure.txt', 'ui_slick'),
         # Include app settings (launcher paths, scan config)

@@ -39,10 +39,15 @@ A Python-based Windows application that helps VFX artists manage and quickly lau
 ## 🚀 Installation
 
 ### Option 1: Use Pre-built Executable (Recommended)
-1. Download `VFX_Launcher.exe` from releases
-2. Run the executable
-3. Configure database location on first run
-4. Set paths to Nuke and After Effects in Settings
+
+**Windows:** Download `VFX_Launcher.exe` from the
+[latest release](https://github.com/NickPittas/VFX-Launcher-v2/releases) and run it.
+Configure the database location on first run, then set paths to Nuke and
+After Effects in Settings.
+
+**Linux:** Download `VFX_Launcher-x86_64.AppImage` from the
+[latest release](https://github.com/NickPittas/VFX-Launcher-v2/releases),
+make it executable (`chmod +x`), and run it.
 
 ### Option 2: Use Installer
 1. Download `VFX_Launcher_Setup.exe` from releases
@@ -82,6 +87,19 @@ The executable will be created at `dist/VFX_Launcher.exe` (~47 MB single file).
 2. Open `installer.iss` in Inno Setup Compiler
 3. Click "Compile" to create the installer
 4. Installer will be created in `installer_output/VFX_Launcher_Setup.exe`
+
+### Build Linux AppImage
+```bash
+./build_appimage.sh
+```
+The AppImage will be created at `dist/VFX_Launcher-x86_64.AppImage`. Requires
+Python 3 with `pyinstaller` and `requirements.txt` installed; `appimagetool`
+is downloaded automatically if missing.
+
+> Note: the `ui_slick/Structure/` preset directory contains only empty folders
+> and is not tracked by git. Builds without it use the committed
+> `ui_slick/structure.txt` manifest instead (the app recreates the folders from
+> it at runtime), so the AppImage is fully functional either way.
 
 ## ⚙️ Configuration
 

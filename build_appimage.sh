@@ -14,7 +14,9 @@ fi
 
 # Regenerate the Structure/ dir manifest (PyInstaller drops empty dirs, so the
 # panel needs this list to recreate the preset in frozen builds)
-(cd ui_slick/Structure && find . -type d -printf '%P\n' | sed '/^$/d' | sort) > ui_slick/structure.txt
+if [ -d ui_slick/Structure ]; then
+    (cd ui_slick/Structure && find . -type d -printf '%P\n' | sed '/^$/d' | sort) > ui_slick/structure.txt
+fi
 
 python -m PyInstaller --noconfirm --clean vfx_launcher.spec
 APPDIR=dist/VFX_Launcher.AppDir
