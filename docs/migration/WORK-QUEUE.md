@@ -3,7 +3,7 @@
 2026-11-06. This file records current state; IMPLEMENTATION-STATUS.md retains
 historical packet reports and their superseding corrections.
 
-1. **Re-review Copy workspace corrections.** Scanning, selection, validation,
+1. **Copy workspace: remaining localized verification.** Scanning, selection, validation,
    execution, progress and results are wired. A disposable native Skip workflow
    copied two nested files, skipped one existing file, preserved all sources and
    excluded an unmatched extension. See NATIVE-COPY-EVIDENCE.md. Other policies,
@@ -12,7 +12,9 @@ historical packet reports and their superseding corrections.
    reporting/state/control findings are corrected. A second disposable native
    copy and destination edit confirmed expanded reports, cleared stale table
    states and a retained labeled previous report. Error/interruption and picker
-   close branches remain compile-verified only.
+   close branches remain compile-verified only. Follow-up source review confirmed
+   the original fixes; its three smaller findings (failed-start prior report,
+   interrupted aggregate counts and fallback warnings) are corrected and compile.
 2. **Implement Incoming routing and UI.** Exact frame grouping and file analysis
    are integrated and source-reviewed. The unsupported-name reporting finding
    is corrected; no sequence correctness blocker was found. Mapping/editing and

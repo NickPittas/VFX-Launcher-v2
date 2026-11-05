@@ -434,13 +434,13 @@ impl CopyByFileTypeState {
                 })
             }
         };
+        let warnings = self
+            .review
+            .as_ref()
+            .map(|review| review.warnings.clone())
+            .unwrap_or_default();
         match result {
             Ok(report) => {
-                let warnings = self
-                    .review
-                    .as_ref()
-                    .map(|review| review.warnings.clone())
-                    .unwrap_or_default();
                 self.report = Some(RunDone {
                     draft: run.draft,
                     run_id: Some(report.run_id),
@@ -455,7 +455,7 @@ impl CopyByFileTypeState {
             }
             Err(failure) => {
                 self.message = Some(failure.message.clone());
-                self.report = Some(failed_run(failure, &run.labels, run.draft));
+                self.report = Some(failed_run(failure, &run.labels, run.draft, warnings));
             }
         }
         // A run changes the destination, so the reviewed plan can never be
@@ -1025,6 +1025,7 @@ impl CopyByFileTypeState {
             }
             Err(error) => {
                 self.review = None;
+                self.report = None;
                 self.rebuild_row_states();
                 self.message = Some(format!(
                     "The copy could not be started: {error}. Validate the selection again before retrying."
@@ -1705,8 +1706,12 @@ fn report_progress(report: &RunReport) -> JobProgress {
     }
 }
 
-fn failed_run(failure: CopyFailure, labels: &[ItemLabel], draft: Draft) -> RunDone {
-    let mut warnings = Vec::new();
+fn failed_run(
+    failure: CopyFailure,
+    labels: &[ItemLabel],
+    draft: Draft,
+    mut warnings: Vec<String>,
+) -> RunDone {
     let mut counts = RunCounts {
         total: labels.len(),
         ..RunCounts::default()
@@ -1715,14 +1720,18 @@ fn failed_run(failure: CopyFailure, labels: &[ItemLabel], draft: Draft) -> RunDo
     let mut inspected = HashMap::new();
     let mut trustworthy = false;
     if let Some(inspection) = &failure.inspection {
-        warnings.extend(inspection.warnings.clone());
+        for warning in &inspection.warnings {
+            if !warnings.contains(warning) {
+                warnings.push(warning.clone());
+            }
+        }
         if let Some(error) = &inspection.detail_error {
             warnings.push(format!("Journal inspection: {error}"));
         } else {
             trustworthy = true;
             state = inspection.state;
-            if let Some(result) = &inspection.result {
-                counts = result.counts;
+            if let Some(confirmed) = inspection.confirmed_counts() {
+                counts = confirmed;
             }
         }
         inspected.extend(inspection.items.iter().map(|item| (item.ordinal, item)));

@@ -1,5 +1,16 @@
 # Implementation status
 
+## Copy follow-up review corrections
+
+The fresh review confirmed the original four corrections and found three smaller
+reporting gaps. Coordinator now clears an earlier report when a new worker cannot
+start, preventing that prior attempt's rows from reappearing. Consistent journal
+inspection derives item counts without requiring a finalized run result, reusing
+the journal's counting rules; missing terminal byte evidence remains unknown.
+Review warnings are retained and merged with available inspection warnings even
+when execution fails before persistence or inspection fails. Compilation and
+formatting pass. No tests or failure-branch runtime exercise ran.
+
 ## Copy workspace source-review corrections
 
 Coordinator corrected all four Copy workspace findings. Every admitted execution

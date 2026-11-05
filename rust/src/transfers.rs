@@ -2360,6 +2360,7 @@ impl RunCounts {
             return;
         }
         let Some(event) = event.filter(|event| event.state == state) else {
+            self.committed_bytes = None;
             return;
         };
         self.committed_bytes = self
@@ -2392,6 +2393,20 @@ impl RunCounts {
 }
 
 impl RunInspection {
+    /// Count only a consistent inspection; unfinished runs need no final summary.
+    pub(crate) fn confirmed_counts(&self) -> Option<RunCounts> {
+        if self.detail_error.is_some() || self.items.iter().any(|item| item.message_error.is_some())
+        {
+            return None;
+        }
+        let mut counts = RunCounts::empty();
+        for item in &self.items {
+            counts.add(item.state, 1);
+            counts.add_bytes(item.state, item.events.last());
+        }
+        Some(counts)
+    }
+
     /// Every recovery path the items reported, in event order.
     pub fn recovery_paths(&self) -> Vec<&Path> {
         self.items
