@@ -32,14 +32,25 @@ egui_extras = { version = "=0.37.0", default-features = false }
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-# U1 "Add existing folder": native folder picker. `xdg-portal` (DBus portal, with
-# the backend's own zenity fallback) is the default Linux backend and needs no
-# GTK link; the dialog runs on a worker thread, never in a frame.
-rfd = "=0.17.2"
 # P2 tokenizer for the legacy Linux Nuke launch command. Used only for
 # `shlex::split`, the POSIX-shell word splitting the legacy `shlex.split` did —
 # not a hand-written quote parser, and never a shell.
 shlex = "=2.0.1"
+
+# U1 "Add existing folder": native folder picker, always on a worker thread, never
+# in a frame. Linux selects rfd's GTK3 backend because the desktop portal has no
+# fallback: a portal provider that never answers the FileChooser request (flea 0.4
+# left one pending for the whole session here) hangs the picker. The GTK3 backend
+# initializes GTK on a thread rfd owns and blocks only the asking worker, so no
+# portal, service or desktop setting is changed. It links libgtk3 at runtime, so
+# packaging must ship GTK3 3.24.
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "=0.17.2", default-features = false, features = ["gtk3"] }
+
+# Windows and macOS use rfd's native dialogs, which need no feature flag;
+# `default-features = false` drops the Linux-only portal and wayland features.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "=0.17.2", default-features = false }
 
 # Windows-only: drive-type classification for the catalog location check
 # (`GetDriveTypeW`) and native write-through file replacement for config saves

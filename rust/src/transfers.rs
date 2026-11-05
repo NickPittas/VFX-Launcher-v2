@@ -20,6 +20,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fmt, fs,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
@@ -322,8 +323,10 @@ pub struct SourceStamp {
 pub enum DestinationExpectation {
     /// Must still be absent when execution writes it.
     Absent,
-    /// Must be an existing directory (add-to-existing).
-    Directory,
+    /// Must be an existing directory (add-to-existing). Its observable identity is
+    /// retained; its modification time is not, because creating children inside it
+    /// changes that time without changing the directory.
+    Directory { identity: Option<NativeIdentity> },
     /// Reviewed existing regular file; Replace may overwrite it.
     RegularFile { stamp: SourceStamp },
     /// Expected skip: the reviewed destination must still match the stamp.
@@ -596,6 +599,13 @@ pub fn plan_extension_copy(
             "source and destination resolve to the same directory through a link or mount alias",
         ));
     }
+    if let Err(reason) = refuse_resolved_root_overlap(&snapshot.root, destination_root) {
+        return Err(TransferError::new(
+            TransferCategory::Refused,
+            Some(destination_root),
+            reason,
+        ));
+    }
 
     let scanned_identity = paths::inspect_root(&snapshot.root)?;
     match snapshot.root_identity {
@@ -643,6 +653,7 @@ pub fn plan_extension_copy(
 
     let normalized_root = paths::normalize_lexical(&snapshot.root, &snapshot.root)?;
     let mut seen = HashSet::new();
+    let mut directories = HashSet::new();
     let mut missing_mtime = 0usize;
     let mut actions = Vec::with_capacity(snapshot.entries.len());
     for entry in &snapshot.entries {
@@ -676,6 +687,19 @@ pub fn plan_extension_copy(
         if expected.modified_ns.is_none() {
             missing_mtime += 1;
         }
+        let mut parents = relative.ancestors().skip(1).collect::<Vec<_>>();
+        parents.reverse();
+        for parent in parents {
+            if parent.as_os_str().is_empty() {
+                continue;
+            }
+            let destination = destination_root.join(parent);
+            if directories.insert(paths::path_key(&destination, destination_root)?) {
+                actions.push(PlannedAction::CreateDirectory {
+                    relative: StoredPath::from_native(parent, destination_root)?,
+                });
+            }
+        }
         actions.push(PlannedAction::File {
             source: StoredPath::from_native(&entry.path, &snapshot.root)?,
             relative: StoredPath::from_native(relative, &snapshot.root)?,
@@ -706,7 +730,7 @@ pub fn plan_extension_copy(
         revision,
         origin: PlanOrigin::ExtensionCopy,
         destination_root: StoredPath::from_native(destination_root, destination_root)?,
-        add_to_existing: false,
+        add_to_existing: true,
         policy,
         source_root: Some(StoredPath::from_native(&snapshot.root, &snapshot.root)?),
         source_evidence: Some(evidence),
@@ -729,10 +753,18 @@ fn expected_stamp(entry: &FileEntry) -> Result<SourceStamp, TransferError> {
     Ok(SourceStamp {
         size: entry.stamp.size,
         modified_ns,
-        // Discovery's identity value has no readable fields; validation records
-        // the fresh identity it stats instead of inventing one here.
-        identity: None,
+        // Discovery already holds the identity it statted; keeping it here makes the
+        // reviewed expectation comparable during validation instead of dropping the
+        // only hard evidence and trusting size and time alone.
+        identity: entry.stamp.identity.map(native_identity),
     })
+}
+
+/// Converts discovery's identity evidence into the durable transfer type. The
+/// platform rules stay in `paths`; nothing is re-statted or guessed here.
+fn native_identity(identity: paths::FileIdentity) -> NativeIdentity {
+    let (unix, windows) = identity.evidence();
+    NativeIdentity { unix, windows }
 }
 
 fn issue_summary(issue: &PathIssue) -> IssueSummary {
@@ -888,18 +920,65 @@ struct Resolution {
     expectation: DestinationExpectation,
     effect: ItemEffect,
     displaced: Option<PathBuf>,
+    /// Observable identity of the reviewed existing destination, when it exists.
+    existing_identity: Option<NativeIdentity>,
+    /// Observable identity of the reviewed preservation target, when it exists.
+    displaced_identity: Option<NativeIdentity>,
 }
 
 struct Validator<'a> {
     plan: &'a OperationPlan,
     destination_root: &'a Path,
     source_root_key: Option<PathKey>,
+    /// Resolved (link- and mount-aware) keys of the two roots, cached once.
+    resolved_source_root_key: Option<PathKey>,
+    resolved_destination_root_key: PathKey,
     planned_directories: HashMap<PathKey, usize>,
+    /// Reviewed state of each planned directory action, so a child of a blocked
+    /// parent is blocked instead of shown ready.
+    directory_states: HashMap<PathKey, ReviewState>,
     /// Sources of items that will actually execute.
-    executing_sources: HashSet<PathKey>,
+    executing_sources: HashMap<PathKey, Vec<(usize, FileAction)>>,
+    /// Positive identity evidence of the sources that will execute: a destination
+    /// that is the same file under another name (hard link, displaced reveal) must
+    /// not be written while that source is still read.
+    executing_unix_sources: HashSet<(u64, u64)>,
+    executing_windows_sources: HashSet<(u64, u64)>,
+    /// Positive identity evidence of reviewed existing destinations and reviewed
+    /// preservation targets, paired with the item that would write them.
+    executing_destination_identities: Vec<(usize, NativeIdentity)>,
     destinations: HashSet<PathKey>,
     executing_destinations: Vec<(usize, PathKey)>,
     warnings: Vec<String>,
+}
+
+/// Link- and mount-aware overlap check between two existing roots, shared by
+/// planning and validation. Canonicalizing resolves symlinked ancestors anywhere in
+/// the spelling, so a destination root that is a link into the source (or the
+/// reverse) is refused even when the lexical spellings look disjoint. Failures to
+/// resolve are refusals, never passes; this is snapshot evidence, not a race proof.
+fn refuse_resolved_root_overlap(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_key = resolved_key(source, "source root")?;
+    let destination_key = resolved_key(destination, "destination root")?;
+    match paths::relation(&source_key, &destination_key) {
+        PathRelation::Disjoint => Ok(()),
+        PathRelation::Same => Err(
+            "source and destination roots resolve to the same directory through a link or mount alias"
+                .to_string(),
+        ),
+        _ => Err(
+            "source and destination roots resolve to nested directories through a link or mount alias"
+                .to_string(),
+        ),
+    }
+}
+
+/// Canonicalized key for `path`, or the reason it cannot be resolved.
+fn resolved_key(path: &Path, what: &str) -> Result<PathKey, String> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|error| format!("{what} cannot be resolved through links: {error}"))?;
+    paths::path_key(&resolved, &resolved)
+        .map_err(|error| format!("resolved {what} is unusable: {error}"))
 }
 
 /// Validates one plan against the filesystem as it is right now.
@@ -961,6 +1040,9 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
                     "source and destination roots are the same directory through a link or mount alias",
                 );
             }
+            if let Err(reason) = refuse_resolved_root_overlap(root, destination_root) {
+                return refused_report(plan, reason);
+            }
             Some(key)
         }
         None => None,
@@ -974,6 +1056,22 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
             );
         }
     }
+
+    let source_root_path = plan
+        .source_root
+        .as_ref()
+        .map(|root| root.path().to_path_buf());
+    let resolved_destination_root_key = match resolved_key(destination_root, "destination root") {
+        Ok(key) => key,
+        Err(reason) => return refused_report(plan, reason),
+    };
+    let resolved_source_root_key = match source_root_path.as_deref() {
+        Some(root) => match resolved_key(root, "source root") {
+            Ok(key) => Some(key),
+            Err(reason) => return refused_report(plan, reason),
+        },
+        None => None,
+    };
 
     if let Some(evidence) = &plan.source_evidence {
         if evidence.coverage != EvidenceCoverage::Complete {
@@ -1022,8 +1120,14 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
         plan,
         destination_root,
         source_root_key,
+        resolved_source_root_key,
+        resolved_destination_root_key,
         planned_directories: HashMap::new(),
-        executing_sources: HashSet::new(),
+        directory_states: HashMap::new(),
+        executing_sources: HashMap::new(),
+        executing_unix_sources: HashSet::new(),
+        executing_windows_sources: HashSet::new(),
+        executing_destination_identities: Vec::new(),
         destinations: HashSet::new(),
         executing_destinations: Vec::new(),
         warnings,
@@ -1142,18 +1246,26 @@ impl<'a> Validator<'a> {
                 PlannedAction::File {
                     action: FileAction::Copy,
                     ..
-                }
+                } | PlannedAction::CreateDirectory { .. }
             )
         {
             return self.blocked(
                 index,
                 action,
-                "extension-copy plans may only copy files; other actions need their own plan origin",
+                "extension-copy plans may only copy files and create their parent folders",
             );
         }
         match action {
             PlannedAction::CreateDirectory { .. } => {
-                self.resolve_directory(index, action, destination, destination_key)
+                let item =
+                    self.resolve_directory(index, action, destination, destination_key.clone());
+                // Recorded now, and only for the action that owns this directory: a
+                // later duplicate action is blocked itself and must not overwrite the
+                // reviewed state its children depend on.
+                if self.planned_directories.get(&destination_key) == Some(&index) {
+                    self.directory_states.insert(destination_key, item.state);
+                }
+                item
             }
             PlannedAction::CreateFile { contents, .. } => self.resolve_create_file(
                 index,
@@ -1200,6 +1312,8 @@ impl<'a> Validator<'a> {
                     expectation: DestinationExpectation::Absent,
                     effect: ItemEffect::CreateDirectory,
                     displaced: None,
+                    existing_identity: None,
+                    displaced_identity: None,
                 },
                 None,
                 Some(0),
@@ -1218,9 +1332,15 @@ impl<'a> Validator<'a> {
                         Resolution {
                             destination,
                             key: destination_key,
-                            expectation: DestinationExpectation::Directory,
+                            // Identity only: creating children changes a directory's
+                            // modification time, so that time is never the evidence.
+                            expectation: DestinationExpectation::Directory {
+                                identity: identity_of(&meta),
+                            },
                             effect: ItemEffect::CreateDirectory,
                             displaced: None,
+                            existing_identity: identity_of(&meta),
+                            displaced_identity: None,
                         },
                         None,
                         Some(0),
@@ -1318,6 +1438,38 @@ impl<'a> Validator<'a> {
                     );
                 }
             }
+            // The reviewed identity is evidence, not decoration: a mismatch, or the
+            // loss of the evidence it was recorded from, refuses the item.
+            match (expected.identity, stamp.identity) {
+                (Some(before), Some(now)) => match before.same(&now) {
+                    Some(true) => {}
+                    Some(false) => {
+                        return self.blocked(
+                            index,
+                            action,
+                            "source is no longer the file the scan recorded: its identity changed",
+                        );
+                    }
+                    None => {
+                        return self.blocked(
+                            index,
+                            action,
+                            "the scan identity and the current metadata share no comparable evidence; the source cannot be revalidated",
+                        );
+                    }
+                },
+                (Some(_), None) => {
+                    return self.blocked(
+                        index,
+                        action,
+                        "the source identity recorded by the scan can no longer be read; the source cannot be revalidated",
+                    );
+                }
+                (None, _) => self.warnings.push(format!(
+                    "no identity evidence was recorded for {}; only its size and modification time were rechecked",
+                    source_path.display()
+                )),
+            }
         }
         let source_key = match paths::path_key(source_path, source_path) {
             Ok(key) => key,
@@ -1346,6 +1498,9 @@ impl<'a> Validator<'a> {
                 "source and destination are the same file through a hard link or alias",
             );
         }
+        if let Err(reason) = self.check_resolved_source(source_path) {
+            return self.blocked(index, action, reason);
+        }
         let effect = match file_action {
             FileAction::Copy => ItemEffect::Copy,
             FileAction::Move => ItemEffect::Move,
@@ -1361,9 +1516,40 @@ impl<'a> Validator<'a> {
             stamp.size,
         );
         if item.state == ReviewState::Ready && item.effect != ItemEffect::Skip {
-            self.executing_sources.insert(source_key);
+            self.executing_sources
+                .entry(source_key)
+                .or_default()
+                .push((index, file_action));
+            if let Some(identity) = stamp.identity {
+                if let Some(unix) = identity.unix {
+                    self.executing_unix_sources.insert(unix);
+                }
+                if let Some(windows) = identity.windows {
+                    self.executing_windows_sources.insert(windows);
+                }
+            }
         }
         item
+    }
+
+    /// The lexical checks above cannot see links: a source whose ancestors include a
+    /// directory link can leave its declared root, or land inside the destination,
+    /// under a spelling that still looks contained. Resolved containment is refused
+    /// when it cannot be proven, and this stays a snapshot check.
+    fn check_resolved_source(&self, source_path: &Path) -> Result<(), String> {
+        let resolved = resolved_key(source_path, "source")?;
+        if let Some(root_key) = &self.resolved_source_root_key {
+            if paths::relation(&resolved, root_key) != PathRelation::FirstInsideSecond {
+                return Err(
+                    "source resolves outside its declared source root through a link".to_string(),
+                );
+            }
+        }
+        if paths::relation(&resolved, &self.resolved_destination_root_key) != PathRelation::Disjoint
+        {
+            return Err("source resolves inside the destination root through a link".to_string());
+        }
+        Ok(())
     }
 
     fn resolve_write(
@@ -1426,6 +1612,8 @@ impl<'a> Validator<'a> {
                 expectation: DestinationExpectation::Absent,
                 effect,
                 displaced: None,
+                existing_identity: None,
+                displaced_identity: None,
             });
         };
         if meta.file_type().is_symlink() {
@@ -1434,6 +1622,7 @@ impl<'a> Validator<'a> {
         if !meta.is_file() {
             return Err("destination exists and is not a regular file".into());
         }
+        let existing_identity = identity_of(&meta);
         let stamp = stamp_from_metadata(&meta, &destination)
             .map_err(|error| error.message().to_string())?;
         match self.plan.policy {
@@ -1445,6 +1634,8 @@ impl<'a> Validator<'a> {
                 },
                 effect: ItemEffect::Skip,
                 displaced: None,
+                existing_identity,
+                displaced_identity: None,
             }),
             ConflictPolicy::Replace => Ok(Resolution {
                 destination,
@@ -1452,6 +1643,8 @@ impl<'a> Validator<'a> {
                 expectation: DestinationExpectation::RegularFile { stamp },
                 effect,
                 displaced: None,
+                existing_identity,
+                displaced_identity: None,
             }),
             ConflictPolicy::KeepBoth => {
                 let candidate = self.free_numbered_path(&destination)?;
@@ -1463,16 +1656,39 @@ impl<'a> Validator<'a> {
                     expectation: DestinationExpectation::Absent,
                     effect,
                     displaced: None,
+                    existing_identity: None,
+                    displaced_identity: None,
                 })
             }
             ConflictPolicy::PreserveExisting => {
                 let displaced = self.free_numbered_path(&destination)?;
+                // The preservation target keeps the old file under a new name, so its
+                // identity is evidence of which file that is, exactly as for a
+                // reviewed destination.
+                let displaced_identity = match fs::symlink_metadata(&displaced) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(
+                            "preservation target is a symbolic link; renaming onto links is refused"
+                                .into(),
+                        );
+                    }
+                    Ok(meta) => identity_of(&meta),
+                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(format!(
+                            "preservation target {} cannot be inspected: {error}",
+                            displaced.display()
+                        ));
+                    }
+                };
                 Ok(Resolution {
                     destination,
                     key: destination_key,
                     expectation: DestinationExpectation::RegularFile { stamp },
                     effect,
                     displaced: Some(displaced),
+                    existing_identity,
+                    displaced_identity,
                 })
             }
         }
@@ -1487,22 +1703,25 @@ impl<'a> Validator<'a> {
             .ok_or_else(|| "numbered destination has no parent directory".to_string())?;
         let name = target
             .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                "destination file name is not valid UTF-8; automatic numbering is unsupported"
-                    .to_string()
-            })?;
+            .ok_or_else(|| "numbered destination has no file name".to_string())?;
+        // Native `OsStr` stemming, not UTF-8 text: a name this build cannot spell as
+        // text still gets a numbered neighbour, and its bytes are never re-encoded.
         let spelling = Path::new(name);
-        let stem = spelling
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or(name);
-        let suffix = match spelling.extension().and_then(|ext| ext.to_str()) {
-            Some(extension) => format!(".{extension}"),
-            None => String::new(),
+        let stem = spelling.file_stem().unwrap_or(name);
+        let suffix = match spelling.extension() {
+            Some(extension) => {
+                let mut suffix = OsString::from(".");
+                suffix.push(extension);
+                suffix
+            }
+            None => OsString::new(),
         };
         for counter in 1..=MAX_NUMBERED_ATTEMPTS {
-            let candidate = parent.join(format!("{counter}_{stem}{suffix}"));
+            let mut numbered = OsString::from(counter.to_string());
+            numbered.push("_");
+            numbered.push(stem);
+            numbered.push(&suffix);
+            let candidate = parent.join(numbered);
             let key = paths::path_key(&candidate, self.destination_root)
                 .map_err(|error| error.message().to_string())?;
             if self.destinations.contains(&key) {
@@ -1543,7 +1762,23 @@ impl<'a> Validator<'a> {
                         prefix.display()
                     ));
                 }
-                continue;
+                // A planned directory that is itself blocked cannot make its children
+                // ready: the child would be written into a folder that is never made.
+                match self.directory_states.get(&key) {
+                    Some(ReviewState::Blocked) => {
+                        return Err(format!(
+                            "parent directory {} is blocked and cannot receive this item",
+                            prefix.display()
+                        ));
+                    }
+                    Some(_) => continue,
+                    None => {
+                        return Err(format!(
+                            "parent directory {} was not reviewed before this item",
+                            prefix.display()
+                        ));
+                    }
+                }
             }
             match fs::symlink_metadata(&parent) {
                 Ok(meta) if meta.is_dir() => continue,
@@ -1618,6 +1853,10 @@ impl<'a> Validator<'a> {
                 );
             }
             self.executing_destinations.push((index, resolution.key));
+            if let Some(identity) = resolution.existing_identity {
+                self.executing_destination_identities
+                    .push((index, identity));
+            }
         }
         let mut displaced = None;
         if let Some(path) = &resolution.displaced {
@@ -1634,6 +1873,10 @@ impl<'a> Validator<'a> {
                         );
                     }
                     self.executing_destinations.push((index, key));
+                    if let Some(identity) = resolution.displaced_identity {
+                        self.executing_destination_identities
+                            .push((index, identity));
+                    }
                     displaced = Some(path);
                 }
                 Err(error) => {
@@ -1705,19 +1948,60 @@ impl<'a> Validator<'a> {
     /// A destination that is also the source of an executing item would read a
     /// file another item already overwrote, or overwrite a pending source.
     fn block_destination_source_chains(&self, items: &mut [ItemValidation]) {
-        for (index, key) in &self.executing_destinations {
-            if self.executing_sources.contains(key) {
-                if let Some(item) = items.get_mut(*index) {
-                    if item.state == ReviewState::Ready {
-                        item.state = ReviewState::Blocked;
-                        item.effect = ItemEffect::Skip;
-                        item.message = Some(
-                            "destination is the source of another transferring item in this plan"
-                                .to_string(),
-                        );
-                    }
+        for sources in self.executing_sources.values() {
+            if sources.len() > 1
+                && sources
+                    .iter()
+                    .any(|(_, action)| *action == FileAction::Move)
+            {
+                for (index, _) in sources {
+                    block_item(
+                        items,
+                        *index,
+                        "source is shared by a move and another transferring item in this plan",
+                    );
                 }
             }
+        }
+        for (index, key) in &self.executing_destinations {
+            if self.executing_sources.contains_key(key) {
+                block_item(
+                    items,
+                    *index,
+                    "destination is the source of another transferring item in this plan",
+                );
+            }
+        }
+        // Normalized keys cannot see a hard link: two names for one file are
+        // different keys. Positive identity evidence is indexed for the sources that
+        // will execute and for the reviewed existing destinations (including the
+        // preservation target), so a cross-item hard link is refused instead of
+        // reading a file another item already replaced.
+        for (index, identity) in &self.executing_destination_identities {
+            let linked = identity
+                .unix
+                .is_some_and(|id| self.executing_unix_sources.contains(&id))
+                || identity
+                    .windows
+                    .is_some_and(|id| self.executing_windows_sources.contains(&id));
+            if linked {
+                block_item(
+                    items,
+                    *index,
+                    "destination is the same file as the source of another transferring item in this plan (hard link or alias)",
+                );
+            }
+        }
+    }
+}
+
+/// Marks one reviewed item blocked without touching an already terminal review.
+fn block_item(items: &mut [ItemValidation], index: usize, reason: &str) {
+    if let Some(item) = items.get_mut(index) {
+        if item.state == ReviewState::Ready {
+            item.state = ReviewState::Blocked;
+            item.effect = ItemEffect::Skip;
+            item.message = Some(reason.to_string());
         }
     }
 }
@@ -1878,7 +2162,7 @@ impl RunTerminal {
                 Ok(())
             }
             Self::Failed => {
-                if counts.failed == 0 && counts.total > 0 {
+                if counts.failed == 0 && counts.copied_source_retained == 0 && counts.total > 0 {
                     return Err(
                         "no item failed; finalize as succeeded, partial or cancelled".to_string(),
                     );
@@ -1903,6 +2187,9 @@ impl RunTerminal {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunCounts {
+    /// Bytes committed by successful item outcomes; None for older unknown data.
+    #[serde(default)]
+    pub committed_bytes: Option<u64>,
     pub total: usize,
     pub pending: usize,
     pub running: usize,
@@ -1916,6 +2203,31 @@ pub struct RunCounts {
 }
 
 impl RunCounts {
+    fn empty() -> Self {
+        Self {
+            committed_bytes: Some(0),
+            ..Self::default()
+        }
+    }
+
+    fn add_bytes(&mut self, state: ItemState, event: Option<&ItemEvent>) {
+        if matches!(
+            state,
+            ItemState::Copied
+                | ItemState::Moved
+                | ItemState::Created
+                | ItemState::CopiedSourceRetained
+        ) {
+            self.committed_bytes = self
+                .committed_bytes
+                .zip(
+                    event
+                        .filter(|event| event.state == state)
+                        .and_then(|event| event.committed_bytes),
+                )
+                .and_then(|(total, bytes)| total.checked_add(bytes));
+        }
+    }
     fn add(&mut self, state: ItemState, count: usize) {
         self.total += count;
         match state {
@@ -1959,6 +2271,9 @@ pub struct ItemEvent {
     pub state: ItemState,
     pub message: Option<String>,
     pub recovery: Vec<StoredPath>,
+    /// Committed destination bytes, not attempted or staged bytes.
+    #[serde(default)]
+    pub committed_bytes: Option<u64>,
 }
 
 impl ItemEvent {
@@ -2011,6 +2326,11 @@ pub struct ItemInspection {
     pub destination_display: Option<String>,
     pub source_undecodable: bool,
     pub destination_undecodable: bool,
+    /// Which platform the stored source spelling belongs to (`posix`, `windows` or
+    /// `unknown`), so an unresolved row can say why instead of claiming the current
+    /// platform. `None` when the item recorded no source spelling.
+    pub source_platform: Option<String>,
+    pub destination_platform: Option<String>,
     pub events: Vec<ItemEvent>,
     pub message_error: Option<String>,
 }
@@ -2037,6 +2357,23 @@ pub struct RunInspection {
 pub struct InterruptReport {
     pub run_ids: Vec<i64>,
     pub marked_at: String,
+    pub refused: Vec<(i64, String)>,
+}
+
+/// A successfully persisted intent bound to its private, immutable review.
+/// Outcome writes use this token instead of reparsing the whole plan per file.
+pub struct JournaledPlan {
+    run_id: i64,
+    validated: ValidatedPlan,
+}
+
+impl JournaledPlan {
+    pub fn run_id(&self) -> i64 {
+        self.run_id
+    }
+    pub fn validated(&self) -> &ValidatedPlan {
+        &self.validated
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,8 +2386,11 @@ pub struct InterruptReport {
 pub fn persist_validated_intent(
     catalog: &Catalog,
     validated: ValidatedPlan,
-) -> StorageResult<Pending<i64>> {
-    catalog.transaction(move |tx| insert_intent(tx, &validated))
+) -> StorageResult<Pending<JournaledPlan>> {
+    catalog.transaction(move |tx| {
+        let run_id = insert_intent(tx, &validated)?;
+        Ok(JournaledPlan { run_id, validated })
+    })
 }
 
 fn insert_intent(tx: &mut Transaction<'_>, validated: &ValidatedPlan) -> StorageResult<i64> {
@@ -2121,6 +2461,8 @@ fn insert_intent(tx: &mut Transaction<'_>, validated: &ValidatedPlan) -> Storage
 /// other state is a state-machine violation with a readable cause.
 pub fn mark_run_running(catalog: &Catalog, run_id: i64) -> StorageResult<Pending<RunCounts>> {
     catalog.transaction(move |tx| {
+        let envelope = load_run_envelope(tx, run_id)?;
+        verify_reviewed_items(tx, run_id, &envelope)?;
         let affected = tx
             .execute(
                 "UPDATE operation_runs SET state='running' WHERE id=?1 AND state='pending'",
@@ -2148,12 +2490,22 @@ pub fn mark_run_running(catalog: &Catalog, run_id: i64) -> StorageResult<Pending
 /// overwritten; a recorded event is appended so prior recovery paths survive.
 pub fn update_item_outcome(
     catalog: &Catalog,
-    run_id: i64,
+    run: &JournaledPlan,
     ordinal: i64,
     state: ItemState,
+    committed_bytes: u64,
     message: Option<String>,
     recovery: &[PathBuf],
-) -> StorageResult<Pending<RunCounts>> {
+) -> StorageResult<Pending<()>> {
+    let run_id = run.run_id;
+    let index = usize::try_from(ordinal).map_err(|_| invalid("negative item ordinal"))?;
+    let reviewed = run
+        .validated
+        .items
+        .get(index)
+        .filter(|item| item.index == index)
+        .cloned()
+        .ok_or_else(|| invalid("item ordinal is outside this journaled plan"))?;
     let recovery = recovery
         .iter()
         .map(|path| StoredPath::absolute(path))
@@ -2167,15 +2519,15 @@ pub fn update_item_outcome(
                 run_state.as_str()
             )));
         }
-        let row: Option<(String, Option<String>)> = tx
+        let row: Option<(String, Option<String>, Option<Vec<u8>>, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT state, message FROM operation_items WHERE run_id=?1 AND ordinal=?2",
+                "SELECT state, message, source_spelling, destination_spelling FROM operation_items WHERE run_id=?1 AND ordinal=?2",
                 params![run_id, ordinal],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| db_error("could not read the operation item", error))?;
-        let Some((current, existing_message)) = row else {
+        let Some((current, existing_message, source, destination)) = row else {
             return Err(invalid(format!(
                 "operation run {run_id} has no item at ordinal {ordinal}"
             )));
@@ -2185,23 +2537,48 @@ pub fn update_item_outcome(
                 "item {ordinal} of run {run_id} has an unrecognized persisted state"
             ))
         })?;
-        item_transition(current, state).map_err(invalid)?;
+        if source.as_deref() != reviewed.source.as_ref().map(StoredPath::spelling)
+            || destination.as_deref() != reviewed.destination.as_ref().map(StoredPath::spelling) {
+            return Err(invalid("item path rows disagree with the journaled review"));
+        }
+        item_transition(current, state, reviewed.effect).map_err(invalid)?;
+        check_committed_bytes(&reviewed, state, committed_bytes).map_err(invalid)?;
         write_item_event(
             tx,
             run_id,
             ordinal,
             existing_message,
             state,
+            committed_bytes,
             message,
             &recovery,
         )?;
-        count_items(tx, run_id)
+        Ok(())
     })
 }
 
-fn item_transition(current: ItemState, next: ItemState) -> Result<(), String> {
+fn item_transition(current: ItemState, next: ItemState, effect: ItemEffect) -> Result<(), String> {
     if next == ItemState::Pending {
         return Err("an item cannot move back to pending".to_string());
+    }
+    // The reviewed effect decides which terminal outcomes are possible: a copied
+    // item can never be recorded as moved, and a skipped item is never created.
+    let allowed = terminals_for(effect);
+    if next == ItemState::Running {
+        if effect == ItemEffect::Skip {
+            return Err("a skipped item is never executed, so it never runs".to_string());
+        }
+    } else if !allowed.contains(&next) {
+        return Err(format!(
+            "a reviewed {:?} item cannot be recorded as {}; it allows {}",
+            effect,
+            next.as_str(),
+            allowed
+                .iter()
+                .map(|state| state.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     match current {
         ItemState::Pending => Ok(()),
@@ -2219,12 +2596,149 @@ fn item_transition(current: ItemState, next: ItemState) -> Result<(), String> {
     }
 }
 
+/// The terminal outcomes one reviewed effect can produce. `Failed` and `Cancelled`
+/// are allowed for every effect; nothing else is interchangeable.
+fn terminals_for(effect: ItemEffect) -> &'static [ItemState] {
+    match effect {
+        ItemEffect::Copy => &[ItemState::Copied, ItemState::Failed, ItemState::Cancelled],
+        ItemEffect::Move => &[
+            ItemState::Moved,
+            ItemState::CopiedSourceRetained,
+            ItemState::Failed,
+            ItemState::Cancelled,
+        ],
+        ItemEffect::CreateDirectory | ItemEffect::CreateFile => {
+            &[ItemState::Created, ItemState::Failed, ItemState::Cancelled]
+        }
+        ItemEffect::Skip => &[ItemState::Skipped, ItemState::Failed, ItemState::Cancelled],
+    }
+}
+
+fn check_committed_bytes(
+    item: &ItemValidation,
+    state: ItemState,
+    bytes: u64,
+) -> Result<(), String> {
+    let expected = if matches!(
+        state,
+        ItemState::Copied | ItemState::Moved | ItemState::Created | ItemState::CopiedSourceRetained
+    ) {
+        item.bytes
+            .ok_or_else(|| "reviewed item has no byte count".to_string())?
+    } else {
+        0
+    };
+    if bytes != expected {
+        return Err(format!(
+            "{} outcome reports {bytes} committed bytes; the reviewed action requires {expected}",
+            state.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the intent envelope of one run inside a transaction.
+fn load_run_envelope(tx: &Transaction<'_>, run_id: i64) -> StorageResult<RunEnvelope> {
+    let detail: Option<String> = tx
+        .query_row(
+            "SELECT detail FROM operation_runs WHERE id=?1",
+            [run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| db_error("could not read the operation intent envelope", error))?
+        .flatten();
+    parse_run_envelope(detail, run_id)
+}
+
+fn verify_review_counts(envelope: &RunEnvelope, run_id: i64) -> StorageResult<()> {
+    if envelope.items.len() != envelope.intent.actions.len() {
+        return Err(invalid(format!(
+            "the intent envelope of run {run_id} reviews {} item(s) for {} action(s); refusing to guess which reviewed item an outcome belongs to",
+            envelope.items.len(),
+            envelope.intent.actions.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The journal must still describe exactly the reviewed plan: one persisted item per
+/// reviewed ordinal, no gaps or duplicates, and every terminal state compatible with
+/// the reviewed effect. Nothing is repaired or rewritten when this fails.
+fn verify_reviewed_items(
+    tx: &Transaction<'_>,
+    run_id: i64,
+    envelope: &RunEnvelope,
+) -> StorageResult<()> {
+    verify_review_counts(envelope, run_id)?;
+    let ordinals: Vec<(i64, String)> = {
+        let mut statement = tx
+            .prepare("SELECT ordinal, state FROM operation_items WHERE run_id=?1 ORDER BY ordinal")
+            .map_err(|error| db_error("could not read operation items", error))?;
+        let rows = statement
+            .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| db_error("could not read operation items", error))?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row.map_err(|error| db_error("could not read an operation item", error))?);
+        }
+        items
+    };
+    if ordinals.len() != envelope.items.len() {
+        return Err(invalid(format!(
+            "operation run {run_id} holds {} item(s) but reviewed {}; the journal no longer matches its intent",
+            ordinals.len(),
+            envelope.items.len()
+        )));
+    }
+    for (position, (ordinal, state)) in ordinals.iter().enumerate() {
+        if *ordinal != position as i64 {
+            return Err(invalid(format!(
+                "operation run {run_id} holds item ordinal {ordinal} at position {position}; the reviewed ordinals are not contiguous"
+            )));
+        }
+        let reviewed = &envelope.items[position];
+        if reviewed.index != position {
+            return Err(invalid(format!(
+                "reviewed item at position {position} of run {run_id} carries index {}; the review order is inconsistent",
+                reviewed.index
+            )));
+        }
+        let state = ItemState::parse(state).ok_or_else(|| {
+            invalid(format!(
+                "item {ordinal} of run {run_id} has an unrecognized persisted state"
+            ))
+        })?;
+        if state.is_terminal() && !terminals_for(reviewed.effect).contains(&state) {
+            return Err(invalid(format!(
+                "item {ordinal} of run {run_id} is recorded as {} but the review action was {:?}",
+                state.as_str(),
+                reviewed.effect
+            )));
+        }
+    }
+    let inspected =
+        load_run(tx, run_id)?.ok_or_else(|| invalid(format!("run {run_id} disappeared")))?;
+    if let Some(error) = inspected.detail_error {
+        return Err(invalid(error));
+    }
+    if let Some(error) = inspected
+        .items
+        .iter()
+        .find_map(|item| item.message_error.as_ref())
+    {
+        return Err(invalid(error.clone()));
+    }
+    Ok(())
+}
+
 fn write_item_event(
     tx: &Transaction<'_>,
     run_id: i64,
     ordinal: i64,
     existing_message: Option<String>,
     state: ItemState,
+    committed_bytes: u64,
     message: Option<String>,
     recovery: &[StoredPath],
 ) -> StorageResult<()> {
@@ -2234,6 +2748,7 @@ fn write_item_event(
         state,
         message,
         recovery: recovery.to_vec(),
+        committed_bytes: Some(committed_bytes),
     });
     let text = serde_json::to_string(&envelope)
         .map_err(|error| db_error("could not encode the item envelope", error))?;
@@ -2322,6 +2837,9 @@ pub fn finalize_run(
                 "operation run {run_id} already recorded a terminal result"
             )));
         }
+        // The result is only written over a journal that still matches its reviewed
+        // intent; a mismatched or unknown journal is reported, never repaired.
+        verify_reviewed_items(tx, run_id, &envelope)?;
         let result = RunResultSummary {
             recorded_at: utc_timestamp_now(),
             state: terminal.state(),
@@ -2383,6 +2901,7 @@ fn cancel_unfinished_items(tx: &Transaction<'_>, run_id: i64) -> StorageResult<(
             ordinal,
             message,
             ItemState::Cancelled,
+            0,
             Some("run cancelled before this item completed".to_string()),
             &[],
         )?;
@@ -2409,22 +2928,23 @@ pub fn mark_unfinished_interrupted(catalog: &Catalog) -> StorageResult<Pending<I
             ids
         };
         let marked_at = utc_timestamp_now();
-        let affected = tx
-            .execute(
-                "UPDATE operation_runs SET state='interrupted', finished_at=?1 WHERE state IN ('pending','running')",
-                params![marked_at],
-            )
-            .map_err(|error| db_error("could not mark unfinished runs interrupted", error))?;
-        if affected != run_ids.len() {
-            return Err(db_error(
-                "could not mark unfinished runs interrupted",
-                format!(
-                    "updated {affected} row(s) but read {} unfinished run(s)",
-                    run_ids.len()
-                ),
-            ));
+        let mut marked = Vec::new();
+        let mut refused = Vec::new();
+        for run_id in run_ids {
+            let recognized = load_run_envelope(tx, run_id)
+                .and_then(|envelope| verify_reviewed_items(tx, run_id, &envelope));
+            if let Err(error) = recognized {
+                refused.push((run_id, error.to_string()));
+                continue;
+            }
+            let affected = tx.execute(
+                "UPDATE operation_runs SET state='interrupted', finished_at=?1 WHERE id=?2 AND state IN ('pending','running')",
+                params![marked_at, run_id],
+            ).map_err(|error| db_error("could not mark unfinished run interrupted", error))?;
+            if affected != 1 { return Err(invalid(format!("run {run_id} changed during interruption marking"))); }
+            marked.push(run_id);
         }
-        Ok(InterruptReport { run_ids, marked_at })
+        Ok(InterruptReport { run_ids: marked, marked_at, refused })
     })
 }
 
@@ -2521,7 +3041,12 @@ fn load_run(
             }
         },
     }
-    Ok(Some(RunInspection {
+    let items = load_items(
+        connection,
+        run_id,
+        intent.as_ref().map(|_| reviewed_items.as_slice()),
+    )?;
+    let mut inspection = RunInspection {
         run_id,
         kind,
         state,
@@ -2532,13 +3057,16 @@ fn load_run(
         warnings,
         result,
         detail_error,
-        items: load_items(connection, run_id)?,
-    }))
+        items,
+    };
+    check_inspection(&mut inspection);
+    Ok(Some(inspection))
 }
 
 fn load_items(
     connection: &rusqlite::Connection,
     run_id: i64,
+    reviewed: Option<&[ItemValidation]>,
 ) -> StorageResult<Vec<ItemInspection>> {
     let mut statement = connection
         .prepare(
@@ -2568,8 +3096,15 @@ fn load_items(
                 "item {ordinal} of run {run_id} has an unrecognized persisted state"
             ))
         })?;
-        let (source, source_undecodable) = decode_spelling(source);
-        let (destination, destination_undecodable) = decode_spelling(destination);
+        let reviewed_item = usize::try_from(ordinal)
+            .ok()
+            .and_then(|index| reviewed.and_then(|items| items.get(index)))
+            .filter(|item| item.index as i64 == ordinal);
+        let source = decode_spelling(source, reviewed_item.and_then(|item| item.source.as_ref()));
+        let destination = decode_spelling(
+            destination,
+            reviewed_item.and_then(|item| item.destination.as_ref()),
+        );
         let mut events = Vec::new();
         let mut message_error = None;
         if let Some(text) = message {
@@ -2590,15 +3125,30 @@ fn load_items(
                 }
             }
         }
+        if source.undecodable || destination.undecodable {
+            append_issue(
+                &mut message_error,
+                "item path bytes have no matching tagged intent; paths remain unresolved".into(),
+            );
+        }
+        if events.last().map(|event| event.state) != (state != ItemState::Pending).then_some(state)
+        {
+            append_issue(
+                &mut message_error,
+                "item state disagrees with its last journal event".into(),
+            );
+        }
         items.push(ItemInspection {
             ordinal,
             state,
-            source,
+            source: source.path,
             source_display,
-            destination,
+            destination: destination.path,
             destination_display,
-            source_undecodable,
-            destination_undecodable,
+            source_undecodable: source.undecodable,
+            destination_undecodable: destination.undecodable,
+            source_platform: source.platform,
+            destination_platform: destination.platform,
             events,
             message_error,
         });
@@ -2606,21 +3156,186 @@ fn load_items(
     Ok(items)
 }
 
-fn decode_spelling(spelling: Option<Vec<u8>>) -> (Option<PathBuf>, bool) {
-    match spelling {
-        None => (None, false),
-        Some(bytes) => {
-            let columns = PathColumns {
-                storage: None,
-                platform: CURRENT_PLATFORM,
-                spelling: bytes,
-                display: None,
-            };
-            match columns.decode() {
-                Some(path) => (Some(path), false),
-                None => (None, true),
-            }
+fn append_issue(target: &mut Option<String>, message: String) {
+    if let Some(existing) = target {
+        existing.push_str("; ");
+        existing.push_str(&message);
+    } else {
+        *target = Some(message);
+    }
+}
+
+/// Inspection reports corruption without rewriting it or presenting a false result.
+fn check_inspection(run: &mut RunInspection) {
+    let Some(intent) = &run.intent else {
+        run.result = None;
+        return;
+    };
+    if run.kind != intent.origin.kind() {
+        append_issue(
+            &mut run.detail_error,
+            "run kind disagrees with its reviewed intent".into(),
+        );
+    }
+    if run.reviewed_items.len() != intent.actions.len() || run.items.len() != intent.actions.len() {
+        append_issue(
+            &mut run.detail_error,
+            "journal item count disagrees with reviewed actions".into(),
+        );
+    }
+    let mut counts = RunCounts::empty();
+    for (index, item) in run.items.iter_mut().enumerate() {
+        counts.add(item.state, 1);
+        counts.add_bytes(item.state, item.events.last());
+        let Some(reviewed) = run.reviewed_items.get(index) else {
+            append_issue(
+                &mut item.message_error,
+                "item has no reviewed action".into(),
+            );
+            continue;
+        };
+        if item.ordinal != index as i64 || reviewed.index != index {
+            append_issue(
+                &mut item.message_error,
+                "persisted and reviewed item ordinals disagree".into(),
+            );
         }
+        if reviewed.state == ReviewState::Blocked {
+            append_issue(
+                &mut item.message_error,
+                "journal contains a blocked review item".into(),
+            );
+        }
+        let effect_matches = intent.actions.get(index).is_some_and(|action| {
+            reviewed.kind == action.kind()
+                && (reviewed.effect == ItemEffect::Skip
+                    || match action {
+                        PlannedAction::File {
+                            action: FileAction::Copy,
+                            ..
+                        } => reviewed.effect == ItemEffect::Copy,
+                        PlannedAction::File {
+                            action: FileAction::Move,
+                            ..
+                        } => reviewed.effect == ItemEffect::Move,
+                        PlannedAction::CreateDirectory { .. } => {
+                            reviewed.effect == ItemEffect::CreateDirectory
+                        }
+                        PlannedAction::CreateFile { .. } => {
+                            reviewed.effect == ItemEffect::CreateFile
+                        }
+                    })
+        });
+        if !effect_matches {
+            append_issue(
+                &mut item.message_error,
+                "review effect disagrees with its planned action".into(),
+            );
+        }
+        let mut previous = ItemState::Pending;
+        for event in &item.events {
+            let checked = item_transition(previous, event.state, reviewed.effect).and_then(|()| {
+                event.committed_bytes.map_or(Ok(()), |bytes| {
+                    check_committed_bytes(reviewed, event.state, bytes)
+                })
+            });
+            if let Err(error) = checked {
+                append_issue(
+                    &mut item.message_error,
+                    format!("invalid event history: {error}"),
+                );
+                break;
+            }
+            previous = event.state;
+        }
+        if item.state.is_terminal() && !terminals_for(reviewed.effect).contains(&item.state) {
+            append_issue(
+                &mut item.message_error,
+                "item outcome disagrees with the reviewed action".into(),
+            );
+        }
+    }
+    if let Some(result) = &run.result {
+        let terminal = match run.state {
+            RunState::Succeeded => Some(RunTerminal::Succeeded),
+            RunState::Partial => Some(RunTerminal::Partial),
+            RunState::Failed => Some(RunTerminal::Failed),
+            RunState::Cancelled => Some(RunTerminal::Cancelled),
+            _ => None,
+        };
+        match terminal {
+            Some(terminal) => {
+                if counts.unfinished() > 0 {
+                    append_issue(
+                        &mut run.detail_error,
+                        "terminal run still has unfinished items".into(),
+                    );
+                }
+                if let Err(reason) = terminal.check(&counts) {
+                    append_issue(
+                        &mut run.detail_error,
+                        format!("invalid terminal result: {reason}"),
+                    );
+                }
+            }
+            None => append_issue(
+                &mut run.detail_error,
+                "nonterminal or interrupted run contains a terminal result".into(),
+            ),
+        }
+        if result.state != run.state || result.counts != counts {
+            append_issue(
+                &mut run.detail_error,
+                "stored result disagrees with run state or persisted item counts/bytes".into(),
+            );
+        }
+    } else if matches!(
+        run.state,
+        RunState::Succeeded | RunState::Partial | RunState::Failed | RunState::Cancelled
+    ) {
+        append_issue(
+            &mut run.detail_error,
+            "terminal run has no result summary".into(),
+        );
+    }
+    if run.items.iter().any(|item| item.message_error.is_some()) {
+        append_issue(
+            &mut run.detail_error,
+            "one or more journal items are inconsistent".into(),
+        );
+    }
+    if run.detail_error.is_some() {
+        run.result = None;
+    }
+}
+
+/// One stored spelling decoded against the platform it actually belongs to.
+struct DecodedSpelling {
+    path: Option<PathBuf>,
+    undecodable: bool,
+    platform: Option<String>,
+}
+
+/// The tagged intent is the decoding authority; raw bytes cannot identify a platform.
+fn decode_spelling(spelling: Option<Vec<u8>>, expected: Option<&StoredPath>) -> DecodedSpelling {
+    let Some(bytes) = spelling else {
+        return DecodedSpelling {
+            path: None,
+            undecodable: expected.is_some(),
+            platform: None,
+        };
+    };
+    match expected {
+        Some(path) if path.spelling() == bytes => DecodedSpelling {
+            path: Some(path.path().to_path_buf()),
+            undecodable: false,
+            platform: Some(CURRENT_PLATFORM.into()),
+        },
+        _ => DecodedSpelling {
+            path: None,
+            undecodable: true,
+            platform: Some("unknown".into()),
+        },
     }
 }
 
@@ -2675,29 +3390,31 @@ fn parse_run_envelope(detail: Option<String>, run_id: i64) -> StorageResult<RunE
 
 fn count_items(tx: &Transaction<'_>, run_id: i64) -> StorageResult<RunCounts> {
     let mut statement = tx
-        .prepare("SELECT state, COUNT(*) FROM operation_items WHERE run_id=?1 GROUP BY state")
+        .prepare(
+            "SELECT ordinal, state, message FROM operation_items WHERE run_id=?1 ORDER BY ordinal",
+        )
         .map_err(|error| db_error("could not count operation items", error))?;
     let rows = statement
         .query_map([run_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .map_err(|error| db_error("could not count operation items", error))?;
-    let mut counts = RunCounts::default();
+    let mut counts = RunCounts::empty();
     for row in rows {
-        let (state, count) =
+        let (ordinal, state, message) =
             row.map_err(|error| db_error("could not count operation items", error))?;
         let state = ItemState::parse(&state).ok_or_else(|| {
             invalid(format!(
                 "operation run {run_id} holds an item with an unrecognized state"
             ))
         })?;
-        let count = usize::try_from(count).map_err(|_| {
-            db_error(
-                "could not count operation items",
-                "a negative item count was returned",
-            )
-        })?;
-        counts.add(state, count);
+        let envelope = parse_item_envelope(message, run_id, ordinal)?;
+        counts.add(state, 1);
+        counts.add_bytes(state, envelope.events.last());
     }
     Ok(counts)
 }

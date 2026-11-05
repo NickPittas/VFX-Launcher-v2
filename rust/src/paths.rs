@@ -820,6 +820,13 @@ impl FileIdentity {
     pub fn compare_file(&self, other: &FileIdentity) -> Option<bool> {
         identity_verdict(self.unix, other.unix, self.windows, other.windows)
     }
+
+    /// The observable evidence pairs themselves, for a module that has to record a
+    /// discovery identity in its own durable type. Reading them here keeps the
+    /// platform rules in one place instead of duplicating the stat conversion.
+    pub fn evidence(&self) -> (Option<(u64, u64)>, Option<(u64, u64)>) {
+        (self.unix, self.windows)
+    }
 }
 
 /// `Some(agreement)` per evidence kind present on both sides, `None` when no

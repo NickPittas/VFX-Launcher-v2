@@ -14,10 +14,18 @@
 //! Cancellation is a result: a cancelled scan reconciles nothing
 //! (`reconcile_scan` rolls back), and the workspace says so instead of reporting a
 //! generic failure.
+//!
+//! Each accepted launch keeps its own reply slot together with the identity and
+//! file it was accepted for, so two launches never replace each other and a later
+//! user change cannot re-attribute or drop the access record. Closing stops new
+//! requests, drains the accepted launch and reveal replies and the access records
+//! they produce, and only then consumes the catalog: no queued write is lost and
+//! no frame waits on a thread.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use eframe::egui;
@@ -173,6 +181,37 @@ pub struct Notice {
     pub error: bool,
 }
 
+/// How many notices are retained before the oldest is dropped, so a burst of
+/// launches cannot grow this list without bound.
+const NOTICE_LIMIT: usize = 6;
+
+/// One accepted launch. Tool, path, file and identity are captured when the
+/// command is accepted, so a later view, project or identity change cannot
+/// re-attribute the access record or lose it. The worker handle is reaped only
+/// after it finished, never joined while it runs, and it only covers the spawn:
+/// the launched application itself is never awaited.
+struct LaunchRequest {
+    tool: Tool,
+    path: PathBuf,
+    file: FileId,
+    user: UserId,
+    replies: Receiver<Result<(), LaunchError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// One accepted reveal in the platform file manager.
+struct RevealRequest {
+    replies: Receiver<Result<(), LaunchError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+/// One accepted favorite write. The reply is kept, not discarded, so a failure
+/// is reported and the affected user's list is re-read afterwards.
+struct FavoriteWrite {
+    user: UserId,
+    pending: Pending<bool>,
+}
+
 /// Async state behind the Projects view.
 pub struct ProjectWorkspace {
     ctx: egui::Context,
@@ -207,10 +246,13 @@ pub struct ProjectWorkspace {
     recent: Option<Pending<String>>,
     registration: Registration,
     scan: Scan,
-    launch: Option<(Tool, PathBuf, FileId, Receiver<Result<(), LaunchError>>)>,
-    reveal: Option<Receiver<Result<(), LaunchError>>>,
-    access: Option<Pending<()>>,
-    notice: Option<Notice>,
+    launches: Vec<LaunchRequest>,
+    reveals: Vec<RevealRequest>,
+    access: Vec<Pending<()>>,
+    favorites: Vec<FavoriteWrite>,
+    /// A coordinated stop started: no new request is accepted any more.
+    closing: bool,
+    notices: Vec<Notice>,
 }
 
 impl ProjectWorkspace {
@@ -248,10 +290,12 @@ impl ProjectWorkspace {
             recent: None,
             registration: Registration::Idle,
             scan: Scan::default(),
-            launch: None,
-            reveal: None,
-            access: None,
-            notice: None,
+            launches: Vec::new(),
+            reveals: Vec::new(),
+            access: Vec::new(),
+            favorites: Vec::new(),
+            closing: false,
+            notices: Vec::new(),
         };
         workspace.start_settings();
         workspace
@@ -271,7 +315,20 @@ impl ProjectWorkspace {
         self.poll_launch();
         self.poll_reveal();
         self.poll_access();
+        self.poll_favorites();
         self.poll_recent();
+        // Only after the accepted launch, reveal and access replies drained is the
+        // catalog queue closed; until then its queued writes must stay accepted.
+        self.try_close_catalog();
+    }
+
+    /// Appends one result, keeping the newest few instead of silently overwriting
+    /// the outcome of a concurrent launch or reveal.
+    fn push_notice(&mut self, notice: Notice) {
+        self.notices.push(notice);
+        while self.notices.len() > NOTICE_LIMIT {
+            self.notices.remove(0);
+        }
     }
 
     // ---------------------------------------------------------------- settings
@@ -367,6 +424,11 @@ impl ProjectWorkspace {
     // ----------------------------------------------------------------- catalog
 
     fn poll_catalog(&mut self) {
+        // A closing or closed catalog is never reopened: the coordinated stop owns
+        // the queue from here on.
+        if self.closing || self.shutdown.is_some() {
+            return;
+        }
         if matches!(
             self.catalog_stage,
             CatalogStage::Settings | CatalogStage::Failed | CatalogStage::Ready
@@ -514,6 +576,9 @@ impl ProjectWorkspace {
 
     /// Chooses who the recorded actions are attributed to.
     pub fn choose_user(&mut self, id: UserId) {
+        if self.closing {
+            return;
+        }
         let Some(user) = self.users_list.iter().find(|user| user.id == id) else {
             return;
         };
@@ -544,7 +609,7 @@ impl ProjectWorkspace {
     }
 
     pub fn set_filter(&mut self, text: String) {
-        if self.filter_edit == text {
+        if self.closing || self.filter_edit == text {
             return;
         }
         self.filter_edit = text;
@@ -552,7 +617,7 @@ impl ProjectWorkspace {
     }
 
     pub fn set_tab(&mut self, tab: ProjectList) {
-        if self.tab == tab {
+        if self.closing || self.tab == tab {
             return;
         }
         self.tab = tab;
@@ -561,6 +626,9 @@ impl ProjectWorkspace {
 
     /// Re-reads the project list for the current user, tab and filter.
     pub fn refresh_projects(&mut self) {
+        if self.closing {
+            return;
+        }
         let (Some(catalog), Some(user)) = (&self.catalog, &self.user) else {
             return;
         };
@@ -612,7 +680,7 @@ impl ProjectWorkspace {
 
     /// Selects a project: loads its files and records the access for this user.
     pub fn select_project(&mut self, id: ProjectId) {
-        if self.selected == Some(id) {
+        if self.closing || self.selected == Some(id) {
             return;
         }
         self.selected = Some(id);
@@ -665,7 +733,7 @@ impl ProjectWorkspace {
         };
         match crate::projects::mark_recent(catalog, user.id, id) {
             Ok(pending) => self.recent = Some(pending),
-            Err(error) => self.notice = Some(notice_from_error("Recent projects", &error)),
+            Err(error) => self.push_notice(notice_from_error("Recent projects", &error)),
         }
     }
 
@@ -683,14 +751,19 @@ impl ProjectWorkspace {
             }
             ReplyState::Failed(error) => {
                 self.recent = None;
-                self.notice = Some(notice_from_error("Recent projects", &error));
+                self.push_notice(notice_from_error("Recent projects", &error));
             }
             ReplyState::Finished => self.recent = None,
         }
     }
 
-    /// Adds or removes the current user's favorite for one project.
+    /// Adds or removes the current user's favorite for one project. The reply is
+    /// retained: a failed write is reported and the affected user's list is re-read
+    /// instead of the outcome being discarded.
     pub fn toggle_favorite(&mut self, id: ProjectId) {
+        if self.closing {
+            return;
+        }
         let (Some(catalog), Some(user)) = (&self.catalog, &self.user) else {
             return;
         };
@@ -701,11 +774,38 @@ impl ProjectWorkspace {
             .map(|project| project.favorite)
             .unwrap_or(false);
         match crate::projects::set_favorite(catalog, user.id, id, favorite) {
-            Ok(_) => {
-                // Re-read the list instead of guessing the new row state.
-                self.refresh_projects();
+            Ok(pending) => self.favorites.push(FavoriteWrite {
+                user: user.id,
+                pending,
+            }),
+            Err(error) => self.push_notice(notice_from_error("Favorites", &error)),
+        }
+    }
+
+    /// Every accepted favorite write is polled on its own, so a later write never
+    /// replaces an earlier one. The list is re-read only while the write's own user
+    /// is still the one on screen, so a stale reply never replaces another
+    /// identity's list.
+    fn poll_favorites(&mut self) {
+        let mut index = 0;
+        while index < self.favorites.len() {
+            let reply = self.favorites[index].pending.try_poll();
+            match reply {
+                ReplyState::Waiting => index += 1,
+                ReplyState::Ready(_) => {
+                    let user = self.favorites.remove(index).user;
+                    if self.user.as_ref().map(|current| current.id) == Some(user) {
+                        self.refresh_projects();
+                    }
+                }
+                ReplyState::Failed(error) => {
+                    self.favorites.remove(index);
+                    self.push_notice(notice_from_error("Favorites", &error));
+                }
+                ReplyState::Finished => {
+                    self.favorites.remove(index);
+                }
             }
-            Err(error) => self.notice = Some(notice_from_error("Favorites", &error)),
         }
     }
 
@@ -817,7 +917,7 @@ impl ProjectWorkspace {
                 self.scan.queue.clear();
                 self.scan.lines.clear();
             }
-            Err(error) => self.notice = Some(notice_from_error("Scan", &error)),
+            Err(error) => self.push_notice(notice_from_error("Scan", &error)),
         }
     }
 
@@ -858,7 +958,7 @@ impl ProjectWorkspace {
                         .collect();
                     if self.scan.queue.is_empty() {
                         self.scan.running = false;
-                        self.notice = Some(Notice {
+                        self.push_notice(Notice {
                             title: "No folders to scan.".to_string(),
                             detail: Some(
                                 "Scans only cover folders of registered projects. Add a project folder first."
@@ -871,7 +971,7 @@ impl ProjectWorkspace {
                 ReplyState::Failed(error) => {
                     self.scan.projects = None;
                     self.scan.running = false;
-                    self.notice = Some(notice_from_error("Scan", &error));
+                    self.push_notice(notice_from_error("Scan", &error));
                 }
                 ReplyState::Finished => self.scan.projects = None,
             }
@@ -939,7 +1039,7 @@ impl ProjectWorkspace {
                         if summary.cancelled {
                             self.scan.running = false;
                             self.scan.queue.clear();
-                            self.notice = Some(Notice {
+                            self.push_notice(Notice {
                                 title: "Scan cancelled. Nothing was recorded.".to_string(),
                                 detail: summary.prune_suppressed.clone(),
                                 error: false,
@@ -1004,8 +1104,13 @@ impl ProjectWorkspace {
         if !self.actions_enabled() {
             return;
         }
+        // Captured with the request: the access record keeps this identity even if
+        // the user, view or selected project changes before the reply arrives.
+        let Some(user) = self.user.as_ref().map(|user| user.id) else {
+            return;
+        };
         let Some(path) = file.path.clone() else {
-            self.notice = Some(Notice {
+            self.push_notice(Notice {
                 title: "This file has no usable path on this machine.".to_string(),
                 detail: file.display.clone(),
                 error: true,
@@ -1013,7 +1118,7 @@ impl ProjectWorkspace {
             return;
         };
         let Some(tool) = file.filetype.as_deref().and_then(Tool::from_filetype) else {
-            self.notice = Some(Notice {
+            self.push_notice(Notice {
                 title: "This file type has no configured application.".to_string(),
                 detail: file.display.clone(),
                 error: true,
@@ -1024,75 +1129,122 @@ impl ProjectWorkspace {
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         let worker_path = path.clone();
-        let _ = std::thread::Builder::new()
+        // The worker only covers planning and the spawn; the launched application
+        // itself is never awaited, so closing never waits for the DCC to exit.
+        let worker = std::thread::Builder::new()
             .name("vfx-launch".to_string())
             .spawn(move || {
                 let result = launch::start(tool, &worker_path, &applications);
                 let _ = tx.send(result);
                 ctx.request_repaint();
-            });
-        self.launch = Some((tool, path, file.file, rx));
+            })
+            .ok();
+        self.launches.push(LaunchRequest {
+            tool,
+            path,
+            file: file.file,
+            user,
+            replies: rx,
+            worker,
+        });
+        // A worker that never sends (dropped sender) is noticed on a later frame.
+        self.ctx.request_repaint_after(Duration::from_millis(40));
     }
 
+    /// Drains every accepted launch independently, so a second launch never
+    /// replaces the first one's reply, identity or access record.
     fn poll_launch(&mut self) {
-        let Some((tool, path, file, rx)) = self.launch.take() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(())) => {
-                // Only now is the access real: the OS accepted the spawn.
-                self.log_access(file);
-                self.notice = Some(Notice {
-                    title: format!("{} launch command started.", tool.label()),
-                    detail: Some(format!(
-                        "{}\n\nThis build cannot confirm that {} finished loading the file.",
-                        path.display(),
-                        tool.label()
-                    )),
-                    error: false,
-                });
+        let mut index = 0;
+        while index < self.launches.len() {
+            let reply = self.launches[index].replies.try_recv();
+            match reply {
+                Err(TryRecvError::Empty) => {
+                    reap_finished(&mut self.launches[index].worker);
+                    index += 1;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let mut request = self.launches.remove(index);
+                    reap_finished(&mut request.worker);
+                    self.push_notice(Notice {
+                        title: format!("{} launch stopped without a result.", request.tool.label()),
+                        detail: Some(request.path.display().to_string()),
+                        error: true,
+                    });
+                }
+                Ok(Ok(())) => {
+                    let mut request = self.launches.remove(index);
+                    reap_finished(&mut request.worker);
+                    // Only now is the access real: the OS accepted the spawn, and it
+                    // is recorded for the identity that was captured on acceptance.
+                    self.log_access(request.user, request.file);
+                    self.push_notice(Notice {
+                        title: format!("{} launch command started.", request.tool.label()),
+                        detail: Some(format!(
+                            "{}\n\nThis build cannot confirm that {} finished loading the file.",
+                            request.path.display(),
+                            request.tool.label()
+                        )),
+                        error: false,
+                    });
+                }
+                Ok(Err(error)) => {
+                    let mut request = self.launches.remove(index);
+                    reap_finished(&mut request.worker);
+                    self.push_notice(Notice {
+                        title: format!("{} could not be started.", request.tool.label()),
+                        detail: Some(format!("{}\n\n{}", error.message(), request.path.display())),
+                        error: true,
+                    });
+                }
             }
-            Ok(Err(error)) => {
-                self.notice = Some(Notice {
-                    title: format!("{} could not be started.", tool.label()),
-                    detail: Some(format!("{}\n\n{}", error.message(), path.display())),
-                    error: true,
-                });
-            }
-            Err(TryRecvError::Empty) => self.launch = Some((tool, path, file, rx)),
-            Err(TryRecvError::Disconnected) => {}
         }
     }
 
-    fn log_access(&mut self, file: FileId) {
-        let (Some(catalog), Some(user)) = (&self.catalog, &self.user) else {
+    /// Queues the access record for the identity captured when the launch was
+    /// accepted, so a later user change cannot re-attribute it.
+    fn log_access(&mut self, user: UserId, file: FileId) {
+        let Some(catalog) = &self.catalog else {
             return;
         };
-        match crate::projects::log_file_access(catalog, user.id, file) {
-            Ok(pending) => self.access = Some(pending),
-            Err(error) => self.notice = Some(notice_from_error("File access", &error)),
+        match crate::projects::log_file_access(catalog, user, file) {
+            Ok(pending) => {
+                self.access.push(pending);
+                // Kept until answered: dropping a reply would lose a write failure.
+                self.ctx.request_repaint_after(Duration::from_millis(40));
+            }
+            Err(error) => self.push_notice(notice_from_error("File access", &error)),
         }
     }
 
+    /// Every accepted access record is answered on its own, so a burst of launches
+    /// never replaces an earlier reply.
     fn poll_access(&mut self) {
-        let Some(pending) = self.access.as_mut() else {
-            return;
-        };
-        match pending.try_poll() {
-            ReplyState::Waiting => {}
-            ReplyState::Ready(()) => self.access = None,
-            ReplyState::Failed(error) => {
-                self.access = None;
-                self.notice = Some(notice_from_error("File access", &error));
+        let mut index = 0;
+        while index < self.access.len() {
+            let reply = self.access[index].try_poll();
+            match reply {
+                ReplyState::Waiting => index += 1,
+                ReplyState::Ready(()) => {
+                    self.access.remove(index);
+                }
+                ReplyState::Failed(error) => {
+                    self.access.remove(index);
+                    self.push_notice(notice_from_error("File access", &error));
+                }
+                ReplyState::Finished => {
+                    self.access.remove(index);
+                }
             }
-            ReplyState::Finished => self.access = None,
         }
     }
 
     /// Reveals one file in the native file manager, off the UI thread.
     pub fn reveal(&mut self, file: &ProjectFile) {
+        if self.closing {
+            return;
+        }
         let Some(path) = file.path.clone() else {
-            self.notice = Some(Notice {
+            self.push_notice(Notice {
                 title: "This file has no usable path on this machine.".to_string(),
                 detail: file.display.clone(),
                 error: true,
@@ -1101,41 +1253,60 @@ impl ProjectWorkspace {
         };
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
-        let _ = std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("vfx-reveal".to_string())
             .spawn(move || {
                 let result = launch::reveal(&path);
                 let _ = tx.send(result);
                 ctx.request_repaint();
-            });
-        self.reveal = Some(rx);
+            })
+            .ok();
+        self.reveals.push(RevealRequest {
+            replies: rx,
+            worker,
+        });
     }
 
+    /// Every accepted reveal is drained independently; a running worker is never
+    /// joined, so no frame waits for the file manager.
     fn poll_reveal(&mut self) {
-        let Some(rx) = &self.reveal else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(())) => self.reveal = None,
-            Ok(Err(error)) => {
-                self.notice = Some(Notice {
-                    title: "The file manager could not be opened.".to_string(),
-                    detail: Some(error.message().to_string()),
-                    error: true,
-                });
-                self.reveal = None;
+        let mut index = 0;
+        while index < self.reveals.len() {
+            let reply = self.reveals[index].replies.try_recv();
+            match reply {
+                Err(TryRecvError::Empty) => {
+                    reap_finished(&mut self.reveals[index].worker);
+                    index += 1;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    let mut request = self.reveals.remove(index);
+                    reap_finished(&mut request.worker);
+                }
+                Ok(Ok(())) => {
+                    let mut request = self.reveals.remove(index);
+                    reap_finished(&mut request.worker);
+                }
+                Ok(Err(error)) => {
+                    let mut request = self.reveals.remove(index);
+                    reap_finished(&mut request.worker);
+                    self.push_notice(Notice {
+                        title: "The file manager could not be opened.".to_string(),
+                        detail: Some(error.message().to_string()),
+                        error: true,
+                    });
+                }
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => self.reveal = None,
         }
     }
 
     // ----------------------------------------------------------------- closing
 
-    /// Consumes the catalog handle and starts its coordinated shutdown. The
-    /// returned handle is polled by [`Self::shutdown_pending`] and never dropped
-    /// early, so accepted requests still resolve and no queued write is lost.
+    /// Starts the coordinated stop. No new request is accepted, and the catalog
+    /// queue is closed only after every accepted launch, reveal and access record
+    /// drained, so no queued write is lost and no reply is dropped. Nothing here
+    /// blocks: a live worker thread is never joined.
     pub fn begin_shutdown(&mut self) {
+        self.closing = true;
         self.scan.cancelled = true;
         self.scan.queue.clear();
         self.scan.projects = None;
@@ -1145,7 +1316,19 @@ impl ProjectWorkspace {
         if let Some(worker) = &mut self.settings_worker {
             worker.begin_shutdown();
         }
-        if self.shutdown.is_some() {
+        self.try_close_catalog();
+    }
+
+    /// True while an accepted launch, reveal or access record is still unanswered.
+    fn actions_pending(&self) -> bool {
+        !self.launches.is_empty() || !self.reveals.is_empty() || !self.access.is_empty()
+    }
+
+    /// Closes the catalog request queue once the accepted actions drained. Called
+    /// from `poll`, so the drain continues during closing while the catalog still
+    /// accepts the access records those launches produced.
+    fn try_close_catalog(&mut self) {
+        if !self.closing || self.shutdown.is_some() || self.actions_pending() {
             return;
         }
         if let Some(catalog) = self.catalog.take() {
@@ -1153,9 +1336,10 @@ impl ProjectWorkspace {
         }
     }
 
-    /// True while the catalog worker has not finished. Keeps repainting so the
-    /// pending shutdown is observed without a frame ever blocking on it.
+    /// True while the coordinated stop is unfinished. Keeps repainting so pending
+    /// replies are observed without a frame ever blocking on a thread.
     pub fn shutdown_pending(&mut self) -> bool {
+        self.try_close_catalog();
         let settings_pending = self
             .settings_worker
             .as_mut()
@@ -1168,7 +1352,7 @@ impl ProjectWorkspace {
                 catalog_pending = true;
             }
         }
-        if !settings_pending && !catalog_pending {
+        if !settings_pending && !catalog_pending && !self.actions_pending() {
             return false;
         }
         self.ctx.request_repaint_after(Duration::from_millis(40));
@@ -1234,18 +1418,22 @@ impl ProjectWorkspace {
         self.files_error.as_deref()
     }
 
-    pub fn notice(&self) -> Option<&Notice> {
-        self.notice.as_ref()
+    /// Every result shown in the Projects pane, newest last.
+    pub fn notices(&self) -> &[Notice] {
+        &self.notices
     }
 
-    pub fn dismiss_notice(&mut self) {
-        self.notice = None;
+    pub fn dismiss_notice(&mut self, index: usize) {
+        if index < self.notices.len() {
+            self.notices.remove(index);
+        }
     }
 
-    /// Catalog open, no startup failure, and an identity chosen: the gate for
-    /// every action that writes to the catalog or starts a process.
+    /// Catalog open, no startup failure, an identity chosen and no coordinated stop
+    /// in progress: the gate for every action that writes or starts a process.
     pub fn actions_enabled(&self) -> bool {
-        self.catalog.is_some()
+        !self.closing
+            && self.catalog.is_some()
             && (self.catalog_stage == CatalogStage::Ready
                 || self.catalog_stage == CatalogStage::CreatingAdmin)
             && self.catalog_error.is_none()
@@ -1255,6 +1443,9 @@ impl ProjectWorkspace {
 
     /// Why actions are unavailable, for the disabled control's tooltip.
     pub fn actions_blocked_reason(&self) -> Option<String> {
+        if self.closing {
+            return Some("The application is closing.".to_string());
+        }
         if let Some(error) = &self.catalog_error {
             return Some(error.clone());
         }
@@ -1329,6 +1520,16 @@ fn notice_from_error(context: &str, error: &StorageError) -> Notice {
         title: format!("{context} could not be updated."),
         detail: Some(error.message().to_string()),
         error: true,
+    }
+}
+
+/// Joins a worker that already finished and keeps a live one for a later frame, so
+/// closing never waits on a running thread; a dropped handle only detaches it.
+fn reap_finished(worker: &mut Option<JoinHandle<()>>) {
+    if worker.as_ref().is_some_and(JoinHandle::is_finished) {
+        if let Some(handle) = worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 

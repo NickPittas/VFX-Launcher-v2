@@ -1169,3 +1169,257 @@ summary. No other public backend signature changed.
 - Settings editing, structure creation, incoming organization, file-type copy,
   backup, legacy import and operation history remain placeholders; their views
   stay visibly disabled.
+
+## Packet U1b + P2b — Projects review completion, app-local Linux picker, X1a review fixes (2026-11-05)
+
+Coordinator handoff: finish the remaining Projects review items, repair the Linux
+folder picker inside this app only, then correct the Kimi X1a foundation findings.
+`transfers.rs` was added to the ownership for the X1a fixes; no executor (X1b) work
+was started, per the explicit instruction. The coordinator's earlier source fixes
+(cancellation rollback after root inspection, stale project rows cleared on user
+change, signed timestamp formatting, Menu key, body text empty state) are preserved
+unchanged.
+
+### Remaining Projects review fixes (app.rs, project_workspace.rs)
+
+- **Launch identity capture and concurrency.** The single `launch`
+  `Option<(Tool, PathBuf, FileId, Receiver<…>)>` slot is replaced by
+  `launches: Vec<LaunchRequest>`; each accepted launch stores its tool, path,
+  `FileId` and the `UserId` captured at acceptance, plus its own reply channel and
+  worker handle. A second launch no longer replaces the first: `poll_launch` drains
+  every accepted request independently, so no outcome and no access record is
+  dropped, and a later user, view or project switch cannot re-attribute the record.
+- **Access logging.** `log_file_access` is still queued only after the worker
+  reports an accepted spawn, and now takes the captured `UserId`. `access` became
+  `Vec<Pending<()>>` (was one slot), so concurrent records never replace each other
+  and a write failure is still reported as a notice.
+- **Notices.** `notice: Option<Notice>` became `notices: Vec<Notice>` with
+  `push_notice` (bounded at 6, oldest dropped), `notices()` and
+  `dismiss_notice(index)`. Two launches completing in one frame both keep their
+  outcome; `app.rs` renders one row per notice with its own Dismiss button.
+- **Favorites.** `set_favorite` replies are no longer discarded: each accepted
+  write is kept in `favorites: Vec<FavoriteWrite>` and polled per transaction.
+  A failure is shown; a success re-reads the list only when that write's own user
+  is still the one on screen, so a stale reply never replaces another identity's
+  list. Enqueue failures were already reported and still are.
+- **Worker handles and close coordination.** Launch and reveal workers are spawned
+  with `thread::Builder` and their `JoinHandle`s are kept. `reap_finished` joins a
+  handle only when it already finished; a live worker is left alone, so no frame
+  and no close path waits on a thread. `begin_shutdown` now sets `closing` first,
+  cancels scan/settings work, and defers the catalog until the accepted actions
+  drained: `try_close_catalog` consumes `Catalog::shutdown()` only once
+  `launches`, `reveals` and `access` are empty. `poll` runs
+  `poll_launch → poll_reveal → poll_access → poll_favorites → poll_recent →
+  try_close_catalog` every frame, so results keep being processed while closing,
+  and `shutdown_pending` stays true during the drain (with a 40 ms repaint hint).
+  `poll_catalog` returns early while closing or after the shutdown handle exists,
+  so the catalog is never reopened behind the stop.
+- **No new requests while closing.** `actions_enabled()` now also requires
+  `!closing`, and `choose_user`, `set_filter`, `set_tab`, `refresh_projects`,
+  `select_project`, `toggle_favorite`, `reveal` and the launch/scan/registration
+  entry points return early while closing. `actions_blocked_reason` explains it as
+  "The application is closing."
+- **Child DCC lifetime.** `launch::spawn` still only spawns and hands the child to
+  a detached reaping thread, so the tracked launch worker covers planning plus the
+  spawn, never the launched application's lifetime. Closing therefore cannot wait
+  for Nuke or After Effects to exit; nothing in `launch.rs` was changed.
+- **Approved Projects file view.** The files pane now has Nuke / After Effects
+  tabs and a "Filter files" field above the table (`file_tab`, `file_filter` in
+  `app.rs`). Filtering happens on the already-grouped data:
+  `visible_groups` keeps each bucket's timeline/shot label and row order, drops
+  only buckets whose files all filter out, and never merges or re-groups buckets;
+  context menus, path tooltips, the approved column order and the resizable equal
+  panes are unchanged. Text matching folds case through
+  `paths::fold_native_text` over the file name and version text. A distinct empty
+  state says when the filter or tab hides everything.
+
+### Linux folder picker (Cargo.toml, Cargo.lock)
+
+- Diagnosis carried forward from WORK-QUEUE item 4: the portal `FileChooser`
+  preference resolves to `flea;gtk`, and the flea 0.4 provider logged Vulkan
+  initialization but never a QML-loaded/response event, so the request hung. No
+  global portal configuration, service restart or desktop change was made.
+- `rfd` is now target-specific: Linux uses `default-features = false,
+  features = ["gtk3"]` (rfd's GTK3 backend, `gtk-sys` v3_24), Windows and macOS
+  use `default-features = false` with their native backends. The old comment that
+  promised a backend-owned zenity fallback on a portal hang was wrong and is
+  replaced by the real reason for the choice.
+- Read from the vendored rfd 0.17.2 source: the GTK3 backend spawns its own
+  `GtkGlobalThread`, calls `gtk_init_check` there, and `run_blocking`s the asking
+  thread's closure on a condvar until the dialog answers. That is why the existing
+  worker-thread call is correct: GTK is never initialized on, or touched from, a
+  thread it does not own, and no timeout/kill wrapper exists that could leave an
+  outstanding chooser request. One picker at a time is still enforced by
+  `registration_busy()` (`Choosing`/`Planning`/`Registering`).
+- Packaging consequence, documented rather than changed: the Linux binary now
+  links `libgtk-3.so.0`, so any future package/AppImage must ship GTK3 3.24.
+
+### X1a review corrections (transfers.rs, one accessor in paths.rs)
+
+All P1/P2 findings from the Kimi X1a review are addressed in the foundation, with
+no executor work.
+
+- **P1 resolved containment.** `refuse_resolved_root_overlap` canonicalizes both
+  existing roots and refuses same/nested resolutions; it is shared by
+  `plan_extension_copy` and `validate_plan`, so a destination root that is a link
+  into the source (or the reverse) is refused even when the lexical spellings look
+  disjoint. Per item, `Validator::check_resolved_source` canonicalizes the source
+  and requires it to stay inside the resolved declared root and outside the
+  resolved destination root, closing the "final component only" symlink gap that
+  let a linked ancestor escape. Every resolution failure is a refusal
+  (fail closed), and both functions are documented as snapshot checks, never a
+  race proof.
+- **P1 cross-item hard links.** The validator now indexes positive
+  `NativeIdentity` evidence: `executing_source_identities` for sources that will
+  execute, and `executing_destination_identities` for reviewed existing
+  destinations plus the reviewed preservation target (whose identity is now
+  statted and refused if it is a link). `block_destination_source_chains` keeps
+  the key check and additionally blocks any item whose destination is provably the
+  same file as an executing source, which the normalized keys cannot see.
+- **P1 journal action outcomes.** `update_item_outcome` reads the persisted intent
+  (`load_run_envelope` + `reviewed_item`, which refuses missing, extra or
+  reordered reviews), and `item_transition` now whitelists terminal states per
+  reviewed effect: Copy → Copied; Move → Moved/CopiedSourceRetained;
+  CreateDirectory/CreateFile → Created; Skip → Skipped; Failed/Cancelled for all.
+  `Running` is refused for a skipped item, so it only marks actions that are
+  actually executed. Terminal overwrite refusal is unchanged, and `finalize_run`
+  now calls `verify_reviewed_items` so a result can only be written over a journal
+  whose ordinals are contiguous, one per reviewed action, and consistent with the
+  reviewed effects.
+- **P2 expected identity.** `expected_stamp` now preserves the discovery identity
+  (via the new `FileIdentity::evidence()` accessor in `paths.rs`) instead of
+  dropping it, and validation compares it: a mismatch, or the loss of comparable
+  evidence on either side, blocks the item; an expectation that never carried
+  identity adds an explicit warning that only size and time were rechecked.
+  `DestinationExpectation::Directory` now keeps the directory's observable
+  identity and explicitly not its modification time, which creating children
+  changes.
+- **P2 blocked prerequisites.** `directory_states` records each planned
+  directory's reviewed state (only for the action that owns it), and
+  `check_parent_chain` refuses a child whose planned parent is blocked, or whose
+  parent action was never reviewed, instead of showing the child as ready. The
+  same pass makes `free_numbered_path` native: `OsStr` file stem/extension plus an
+  ASCII counter, so non-UTF-8 and unpaired-unit names get numbered neighbours
+  without re-encoding or leaving the destination root.
+- **Labeled unresolved spellings.** `decode_spelling` no longer claims the current
+  platform for bytes it did not classify. It classifies the stored spelling first
+  (`spelling_platform`, using the catalog's own marker rules), decodes only when
+  that platform is this build's, and otherwise reports it as undecodable with the
+  label. `ItemInspection` gained `source_platform`/`destination_platform` for that
+  label; `detail_error`/`message_error` and the "left untouched" behavior for
+  unknown envelopes are unchanged, and nothing replays, deletes or rewrites
+  unknown intent.
+- **Exact non-owned edit (paths.rs, +7 lines).** `impl FileIdentity { pub fn
+  evidence(&self) -> (Option<(u64, u64)>, Option<(u64, u64)>) }` — a read-only
+  accessor so the transfer layer can record discovery's identity without
+  duplicating the platform stat rules or adding an unsafe conversion. No other
+  change was made outside `app.rs`, `project_workspace.rs`, `transfers.rs`,
+  `Cargo.toml` and `Cargo.lock`.
+
+### Verification actually performed
+
+- `cargo check --manifest-path rust/Cargo.toml --lib --bin vfx-launcher` and
+  `cargo build --lib --bin vfx-launcher` with
+  `CARGO_HOME=artifacts/verification/cargo-home`,
+  `CARGO_TARGET_DIR=rust/target`, `TMPDIR=artifacts/verification/tmp`: **pass,
+  no errors and no warnings**. Every command ran under `timeout 30s`.
+- Dependency resolution: `Cargo.lock` gained the GTK3 build chain
+  (`gtk-sys 0.18.2`, `gdk-sys`, `pango-sys`, `atk-sys`, `cairo-sys-rs`,
+  `gdk-pixbuf-sys`, `gobject-sys`, `glib-sys`, `gio-sys`, `system-deps`,
+  `toml_edit`, `toml`, `shlex` unchanged at 2.0.1). No existing version was
+  removed or downgraded.
+- `pkg-config --modversion gtk+-3.0` → 3.24.52 (matches rfd's `v3_24` feature);
+  `ldd rust/target/debug/vfx-launcher` → `libgtk-3.so.0`, `libgdk-3.so.0`,
+  `libglib-2.0.so.0` resolve from `/usr/lib`, so the picker backend is linked,
+  not merely compiled.
+- Source hand-traces (no execution): concurrent launch ×2 with a user switch
+  between acceptance and reply (both outcomes kept, access records attributed to
+  the captured user), close during an accepted launch (catalog consumed only after
+  the launch reply and its `log_file_access` reply), close with a failed spawn
+  (no access record, no catalog write), favorite write success/failure across a
+  user switch (no stale refresh), tab/filter filtering over groups with mixed
+  filetypes and an emptied bucket, and for X1a: destination root that is a
+  symlink into the source, source under a linked ancestor, cross-item hard link,
+  blocked parent directory, Copy→Moved, Skip→Running, Running→Created,
+  terminal overwrite, and a foreign-platform stored spelling.
+- **No tests, no test suites, no self-check scripts, no launches of the app,
+  Nuke, After Effects, a folder dialog or any reveal, no screenshots, no
+  production database/config access, no commits/pushes/PRs/worktrees.**
+
+### Deliberate limits of this packet
+
+- No runtime or visual verification of the new tabs, filter or notice rows: the
+  application was not launched (task constraint), so this stays a compile-level
+  and source-trace claim. `DESIGN-APPROVAL.md` remains a design baseline.
+- The live GTK3 picker was not exercised either; the link evidence above shows the
+  backend is compiled and linked, not that a dialog was shown and answered. The
+  earlier flea/portal hang was not retested.
+- The Windows and macOS rfd configurations and the `cfg(windows)` identity and
+  reveal paths are written against documented behavior but are not compiled here.
+- Resolved containment and identity checks are stat-snapshot evidence. A link or
+  mount that appears between validation and a future write is still X1b's problem;
+  this packet claims no race safety.
+- X1b (executor) is **not started** and remains blocked on the user's priority
+  order (validation/journal completion first) and on the coordinator's go-ahead.
+- Kimi's X1a review is recorded as **not safe to execute**; this packet corrects
+  the foundation findings but does not re-review them, so a fresh read-only review
+  of `transfers.rs` is still required before X1b.
+
+## Coordinator completion of journal review corrections
+
+The preceding packet did not address every journal finding. The coordinator
+completed the remaining changes in `transfers.rs` before starting X1b:
+
+- Persist committed destination bytes per item event and derive optional run byte
+  totals from those persisted events. Older unknown byte values remain unknown.
+  Successful outcomes must match reviewed bytes; other outcomes carry zero.
+- Decode item-table path blobs only through the matching tagged intent path;
+  unknown/foreign envelopes and mismatches remain unresolved with diagnostics.
+- Check intent/row counts and ordinals, operation kinds, historical item transitions,
+  final-event/state agreement, allowed effects, result state, counts and bytes.
+  Inconsistent result claims are suppressed; inspection diagnostics remain visible.
+- Interruption marking verifies each known run and reports refused IDs separately;
+  corrupt/newer envelopes are not mutated and do not prevent handling known runs.
+- `persist_validated_intent` returns a private `JournaledPlan` token, with read-only
+  accessors. `update_item_outcome` accepts that token and explicit committed bytes.
+  There are no callers yet. Each outcome checks its indexed item and reviewed action
+  without reparsing the entire plan per file; full consistency is checked at run
+  start, finalization and inspection. This avoids quadratic journal processing.
+
+`cargo check --offline --locked --lib --bin vfx-launcher` passes without warnings
+under `timeout 30s`; formatting was checked and the workspace module normalized.
+These are compile/source claims. No journal runtime exercise, transfers, test
+suites or global tests occurred. X1b remains unimplemented pending fresh review.
+
+The native GTK picker, registration, scan and file-type tabs were separately
+exercised with disposable data; see `NATIVE-PROJECTS-WORKFLOW.md` and its actual
+screenshots. This exposed the still-missing approved version selector. The live
+workflow does not verify launch attribution or shutdown during pending launches.
+
+## X1a second review — five findings corrected
+
+Kimi confirmed private journal provenance, bytes, identity, path decoding and
+unknown-envelope refusal, and found three remaining blockers plus two improvements.
+The coordinator corrected all five in `transfers.rs`:
+
+- Failed finalization accepts source-retained Move outcomes when no Move completed;
+  a run containing only those outcomes can now leave Running.
+- Extension-copy planning emits deduplicated parent directory actions before files,
+  permits those actions and reuses existing directories. Original relative depth
+  and native naming remain preserved.
+- Executing source keys retain their item indexes/actions; when a source is shared
+  and any action moves it, every affected ready item is blocked. Copy/Copy remains
+  allowed. Skipped actions do not participate.
+- Result inspection rejects unfinished terminal runs, terminal-state/count mismatch,
+  and terminal results attached to Pending, Running or Interrupted runs.
+- Source identities are indexed in native Unix/Windows hash sets for constant-time
+  conflict lookup instead of scanning all sources for each destination.
+
+No callers exist yet for these transfer APIs. `cargo check --offline --locked
+--lib --bin vfx-launcher` passes without warnings (0.66s, hard ceiling 30s), and
+rustfmt passes. Source readback covered parent order/deduplication, existing parent
+handling, both orders of Copy/Move and Move/Move, retained-only finalization, and
+terminal inspection. No runtime transfer/journal exercise or tests were performed.
+These small corrections have not received another independent review. The next
+packet establishes X1b native primitives and implements the executor separately;
+X1a itself still makes no filesystem writes or race-safety claim.

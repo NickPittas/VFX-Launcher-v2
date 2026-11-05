@@ -16,7 +16,7 @@ use eframe::egui;
 use crate::jobs::{JobId, JobStatus, Jobs, LIVE_POLL_INTERVAL};
 use crate::launch::Tool;
 use crate::project_workspace::{ProjectWorkspace, RegistrationStatus};
-use crate::projects::{ProjectFile, ProjectList};
+use crate::projects::{FileGroup, FileKind, ProjectFile, ProjectList};
 use crate::storage::ProjectId;
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
@@ -154,6 +154,10 @@ pub struct VfxLauncherApp {
     jobs: Jobs,
     workspace: ProjectWorkspace,
     project_filter: String,
+    /// Approved Projects layout: the selected project's files are shown under a
+    /// Nuke / After Effects tab and the file filter beside it.
+    file_tab: FileKind,
+    file_filter: String,
     incoming_source: String,
     incoming_destination: String,
     incoming_move: bool,
@@ -181,6 +185,8 @@ impl VfxLauncherApp {
             jobs: Jobs::new(),
             workspace: ProjectWorkspace::new(&cc.egui_ctx, data_dir),
             project_filter: String::new(),
+            file_tab: FileKind::Nuke,
+            file_filter: String::new(),
             incoming_source: String::new(),
             incoming_destination: String::new(),
             incoming_move: false,
@@ -439,7 +445,13 @@ impl VfxLauncherApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            project_files_pane(&self.workspace, ui, &mut actions)
+            project_files_pane(
+                &self.workspace,
+                ui,
+                &mut actions,
+                &mut self.file_tab,
+                &mut self.file_filter,
+            )
         });
 
         for action in actions {
@@ -634,14 +646,27 @@ impl VfxLauncherApp {
             });
         }
 
-        if let Some(notice) = self.workspace.notice() {
-            let title = notice.title.clone();
-            let detail = notice.detail.clone();
-            let error = notice.error;
-            notice_row(ui, &title, detail.as_deref(), error);
-            if ui.small_button("Dismiss").clicked() {
-                self.workspace.dismiss_notice();
-            }
+        let notices: Vec<(String, Option<String>, bool)> = self
+            .workspace
+            .notices()
+            .iter()
+            .map(|notice| (notice.title.clone(), notice.detail.clone(), notice.error))
+            .collect();
+        let mut dismiss: Option<usize> = None;
+        for (index, (title, detail, error)) in notices.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    notice_row(ui, title, detail.as_deref(), *error);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if ui.small_button("Dismiss").clicked() {
+                        dismiss = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = dismiss {
+            self.workspace.dismiss_notice(index);
         }
     }
 
@@ -1211,7 +1236,13 @@ fn project_list_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: &
     });
 }
 
-fn project_files_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+fn project_files_pane(
+    workspace: &ProjectWorkspace,
+    ui: &mut egui::Ui,
+    actions: &mut Vec<Action>,
+    tab: &mut FileKind,
+    filter: &mut String,
+) {
     let Some(project) = workspace.selected_project() else {
         empty_state(
             ui,
@@ -1221,18 +1252,51 @@ fn project_files_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: 
         return;
     };
 
+    // File tabs and the file filter sit above the files pane; both narrow the
+    // grouped rows without merging or re-grouping a bucket.
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(project.name.clone()).small().weak());
-        if let Some(error) = workspace.files_error() {
-            ui.label(egui::RichText::new(error).small());
+        for kind in [FileKind::Nuke, FileKind::AfterEffects] {
+            let selected = *tab == kind;
+            if ui
+                .add(egui::Button::new(file_kind_label(kind)).selected(selected))
+                .clicked()
+            {
+                *tab = kind;
+            }
         }
+        ui.separator();
+        ui.add(
+            egui::TextEdit::singleline(filter)
+                .hint_text("Filter files")
+                .desired_width(200.0),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(error) = workspace.files_error() {
+                ui.label(egui::RichText::new(error).small());
+            }
+            ui.label(egui::RichText::new(project.name.clone()).small().weak());
+        });
     });
+    ui.separator();
 
     if workspace.files().is_empty() {
         empty_state(
             ui,
             "No files in this project yet.",
             "Scan folders to record its Nuke and After Effects files.",
+        );
+        return;
+    }
+
+    let groups = visible_groups(workspace.files(), *tab, filter);
+    if groups.is_empty() {
+        empty_state(
+            ui,
+            "No matching files.",
+            &format!(
+                "This project has no {} files under the current filter. Clear the filter or switch tabs.",
+                file_kind_label(*tab)
+            ),
         );
         return;
     }
@@ -1265,7 +1329,7 @@ fn project_files_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: 
             }
         })
         .body(|mut body| {
-            for group in workspace.files() {
+            for (group, files) in &groups {
                 let bucket = (group.timeline.clone(), group.shot.clone());
                 if previous_bucket.as_ref() != Some(&bucket) {
                     previous_bucket = Some(bucket.clone());
@@ -1279,7 +1343,7 @@ fn project_files_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: 
                         }
                     });
                 }
-                for file in &group.files {
+                for file in files.iter().copied() {
                     body.row(22.0, |mut row| {
                         row.col(|ui| {
                             let name = file_name(file);
@@ -1511,6 +1575,68 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
         ui.add_space(2.0);
         ui.label(egui::RichText::new(hint).color(egui::Color32::from_gray(180)));
     });
+}
+
+fn file_kind_label(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Nuke => "Nuke",
+        FileKind::AfterEffects => "After Effects",
+    }
+}
+
+/// The stored `filetype` a tab shows, matching the catalog's own file-kind filter.
+fn file_kind_extension(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Nuke => "nk",
+        FileKind::AfterEffects => "aep",
+    }
+}
+
+/// The rows one tab and the file filter keep. Buckets are filtered, never merged
+/// or re-grouped: each surviving group keeps its own timeline/shot label, its row
+/// order and its context menu, and an emptied group is dropped.
+fn visible_groups<'a>(
+    groups: &'a [FileGroup],
+    kind: FileKind,
+    filter: &str,
+) -> Vec<(&'a FileGroup, Vec<&'a ProjectFile>)> {
+    let needle = crate::paths::fold_native_text(filter.trim().as_bytes());
+    let extension = file_kind_extension(kind);
+    let mut visible = Vec::new();
+    for group in groups {
+        let files: Vec<&ProjectFile> = group
+            .files
+            .iter()
+            .filter(|file| {
+                file.filetype
+                    .as_deref()
+                    .is_some_and(|filetype| filetype.eq_ignore_ascii_case(extension))
+            })
+            .filter(|file| needle.is_empty() || file_matches(file, &needle))
+            .collect();
+        if !files.is_empty() {
+            visible.push((group, files));
+        }
+    }
+    visible
+}
+
+fn file_matches(file: &ProjectFile, needle: &[u8]) -> bool {
+    let name = file_name(file);
+    let version = file
+        .version
+        .as_ref()
+        .map(|version| version.text.clone())
+        .unwrap_or_default();
+    [name.as_str(), version.as_str()]
+        .iter()
+        .any(|text| folded_contains(text, needle))
+}
+
+fn folded_contains(text: &str, needle: &[u8]) -> bool {
+    crate::paths::fold_native_text(text.as_bytes())
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn folder_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &'static str) {
