@@ -76,3 +76,6 @@ htmlcov/
 # Local source references and Rust build output
 /gitclones/
 /target/
+/rust/target/
+/worktrees/
+/artifacts/

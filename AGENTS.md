@@ -20,6 +20,14 @@
 - Never use production databases or real incoming/backup files for validation.
 - Concurrent agents that write files use orchestrator-managed worktrees with
   explicit file ownership. Do not create child checkouts in shell commands.
+- All worktrees must be inside `/home/npittas/VFX-Launcher-v2/worktrees/`.
+  Do not start isolated delegates if the orchestrator would place their checkout
+  outside this project root; report the configuration limitation instead.
+- Keep all task artifacts inside the project root, including temporary files,
+  verification inputs/results, and UI/UX evidence. Save verification screenshots
+  under `/home/npittas/VFX-Launcher-v2/artifacts/screenshots/` and other verification
+  outputs under `artifacts/verification/`. UI/UX verification must include actual
+  screenshots; do not claim visual verification from source inspection alone.
 - Do not push or create PRs unless assigned. Leave unrelated changes untouched.
 
 ## Direction and model allocation
@@ -31,10 +39,22 @@
 - Astra: architecture and planning.
 - Kimi K3.1: reviews and UI design; HTML mockups precede Rust UI implementation.
 - DeepSeek Flash and GLM 5.3 Flash: smaller implementation tasks and local checks.
+- The confirmed working Pi DeepSeek model is
+  `qwen-token-plan/deepseek-v4.1-flash-1017`. Do not reuse the failed
+  `deepseek/deepseek-flash` endpoint for this assignment.
 - Luna with high reasoning: difficult implementation tasks, sparingly.
 - Use the requested models; report unavailable models instead of substituting.
 - AI provider authentication should be delegated to an existing external harness;
   the harness choice remains open. File-operation validation belongs to the app.
+- `docs/migration/USER-UI-REQUIREMENTS.md` records the user's desktop redesign
+  requirements and supersedes conflicting UI layout/copy in earlier documents.
+  No redundant headings, jargon-heavy explanations, duplicate project-creation
+  screens, or primary Activity page. Resizable panels/columns, context menus,
+  conspicuous execution controls, progress and file lists are required.
+- The DCC desktop prototype is user-approved. See
+  `docs/migration/DESIGN-APPROVAL.md`; implement this baseline rather than redesign
+  it. Approval does not constitute native/runtime validation or settle open
+  backend product decisions.
 
 ## Reference clones
 

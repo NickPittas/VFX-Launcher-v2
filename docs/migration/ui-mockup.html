@@ -1,0 +1,1452 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>VFX Launcher — desktop UI prototype</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --window: #101419;
+      --surface: #171d24;
+      --surface-raised: #1d2530;
+      --control: #222c37;
+      --control-hover: #2a3643;
+      --selected: #203c56;
+      --border: #34404c;
+      --border-strong: #596979;
+      --text: #edf1f5;
+      --muted: #b2bdc9;
+      --quiet: #8f9ba8;
+      --accent: #83b7ef;
+      --primary: #397fb7;
+      --primary-hover: #478fc9;
+      --focus: #ffd166;
+      --success: #82d6aa;
+      --warning: #edc47c;
+      --danger: #f2a0a0;
+      --sidebar-width: 212px;
+      --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-width: 960px; height: 100%; background: var(--window); color: var(--text); font: 400 13px/1.45 var(--sans); }
+    body { min-height: 0; }
+    button, input, select, textarea { font: inherit; color: var(--text); }
+    button, summary, select, label[for], .row-select { cursor: pointer; }
+    button { font-weight: 400; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+      outline: 2px solid var(--focus); outline-offset: 2px;
+    }
+    button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacity: .5; }
+    [hidden] { display: none !important; }
+    h1, h2, h3, p { margin: 0; font-weight: 400; }
+    h2 { font-size: 14px; font-weight: 500; }
+    h3 { font-size: 13px; font-weight: 500; }
+    code, .mono { font-family: var(--mono); }
+    .muted { color: var(--muted); }
+    .quiet { color: var(--quiet); }
+    .small { font-size: 12px; }
+    .danger { color: var(--danger); }
+    .warning { color: var(--warning); }
+    .success { color: var(--success); }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .skip-link { position: fixed; top: -60px; left: 12px; z-index: 100; padding: 8px 12px; background: var(--focus); color: #151515; border-radius: 4px; }
+    .skip-link:focus { top: 10px; }
+
+    .app { display: grid; grid-template-columns: var(--sidebar-width) 7px minmax(0, 1fr); height: 100vh; min-height: 640px; }
+    .sidebar { display: flex; flex-direction: column; min-width: 0; padding: 16px 10px 12px; background: #131a21; border-right: 1px solid var(--border); }
+    .brand { padding: 0 9px 18px; font-size: 15px; font-weight: 500; }
+    .brand span { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; font-weight: 400; }
+    .nav { display: grid; gap: 3px; }
+    .nav-button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 36px; padding: 7px 9px; text-align: left; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 5px; }
+    .nav-button:hover { color: var(--text); background: var(--surface-raised); }
+    .nav-button[aria-current="page"] { color: var(--text); background: var(--selected); border-color: #3d6381; }
+    .nav-symbol { width: 18px; color: var(--accent); text-align: center; }
+    .settings-nav { margin-top: auto; }
+    .prototype-note { padding: 12px 8px 0; color: var(--quiet); font-size: 11px; }
+    .sidebar-resize { cursor: col-resize; background: transparent; }
+    .sidebar-resize:hover, .sidebar-resize:focus-visible { background: var(--selected); }
+    .main { min-width: 0; min-height: 0; display: grid; grid-template-rows: 48px minmax(0, 1fr); }
+    .topbar { display: flex; align-items: center; gap: 12px; padding: 7px 18px; border-bottom: 1px solid var(--border); background: var(--surface); }
+    .topbar .spacer { flex: 1; }
+    .topbar-status { color: var(--quiet); font-size: 12px; }
+    .content { min-width: 0; min-height: 0; overflow: hidden; }
+    .view { max-width: 1680px; height: 100%; min-height: 0; margin: 0 auto; padding: 16px 18px 24px; overflow: auto; container-type: inline-size; }
+    .pinned-view { display: grid; grid-template-rows: minmax(0, 1fr) auto; padding: 0; overflow: hidden; }
+    .view-workspace { min-width: 0; min-height: 0; overflow: auto; padding: 16px 18px 18px; }
+    .action-strip { min-width: 0; padding: 10px 18px; border-top: 1px solid var(--border-strong); background: #141b22; }
+    .action-strip-inner { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+    .action-strip .push { margin-left: auto; }
+    .view:focus { outline: none; }
+    .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .toolbar .push { margin-left: auto; }
+    .toolbar-group { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+    .section { min-width: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .section + .section { margin-top: 12px; }
+    .section-head { min-height: 42px; display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding: 8px 11px; border-bottom: 1px solid var(--border); background: #192129; }
+    .section-head .push { margin-left: auto; }
+    .section-body { padding: 12px; }
+    .section-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 11px; border-top: 1px solid var(--border); color: var(--muted); background: #141b22; }
+    .section-foot .push { margin-left: auto; }
+
+    .btn { min-height: 30px; padding: 5px 11px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--control); color: var(--text); }
+    .btn:hover:not(:disabled) { background: var(--control-hover); }
+    .btn-primary { background: var(--primary); border-color: #69a7d4; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .btn-quiet { background: transparent; border-color: transparent; color: var(--muted); }
+    .btn-danger { color: #ffd7d7; border-color: #9a5c63; background: #42282c; }
+    .btn-small { min-height: 26px; padding: 3px 8px; font-size: 12px; }
+    .icon-button { min-width: 30px; padding: 4px 7px; }
+    .execution { min-height: 34px; padding-inline: 15px; font-weight: 500; }
+    .link-button { padding: 0; border: 0; background: transparent; color: var(--accent); text-align: left; }
+    .link-button:hover { text-decoration: underline; }
+    .status-text { color: var(--muted); }
+    .status-text[data-tone="ready"] { color: var(--success); }
+    .status-text[data-tone="warning"] { color: var(--warning); }
+    .status-text[data-tone="error"] { color: var(--danger); }
+
+    .field { display: grid; align-content: start; gap: 4px; min-width: 0; }
+    .field > label, .field-label { color: var(--muted); font-size: 12px; }
+    input:not([type="checkbox"]):not([type="radio"]), select, textarea { width: 100%; min-width: 0; min-height: 30px; padding: 5px 8px; border: 1px solid var(--border-strong); border-radius: 4px; background: #111820; }
+    input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; margin: 0; accent-color: var(--primary); }
+    input[readonly] { color: var(--muted); }
+    textarea { resize: vertical; }
+    .input-row { display: flex; align-items: center; gap: 6px; }
+    .input-row > input, .input-row > select { flex: 1; }
+    .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; }
+    .form-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .span-2 { grid-column: span 2; }
+    .span-all { grid-column: 1 / -1; }
+    .check { display: inline-flex; align-items: center; gap: 7px; min-height: 28px; }
+    .check-group { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
+    fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+    fieldset:disabled { opacity: .72; }
+    details { min-width: 0; }
+    details > summary { width: fit-content; color: var(--muted); }
+    details > summary:hover { color: var(--text); }
+    details[open] > summary { margin-bottom: 9px; }
+    .compact-details { padding: 8px 11px; border-top: 1px solid var(--border); }
+    .inline-note { color: var(--muted); font-size: 12px; }
+    .error-box { padding: 9px 11px; color: #ffd8d8; background: #382327; border-left: 3px solid var(--danger); }
+    .warning-box { padding: 9px 11px; color: #f5dfb8; background: #342d20; border-left: 3px solid var(--warning); }
+
+    .split-two { display: grid; grid-template-columns: minmax(220px, var(--left, 300px)) 8px minmax(400px, 1fr); align-items: stretch; }
+    .projects-workspace { display: flex; flex-direction: column; }
+    .projects-split { flex: 1; min-height: 0; }
+    .projects-split > .section { display: flex; flex-direction: column; min-height: 0; }
+    .projects-split .tabs, .projects-split .section-head, .projects-split .section-foot { flex: none; }
+    .projects-split [role="tabpanel"] { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .projects-split .table-wrap { flex: 1; min-height: 0; max-height: none !important; }
+    .splitter { position: relative; align-self: stretch; min-height: 40px; cursor: col-resize; }
+    .splitter::after { content: ""; position: absolute; inset: 0 3px; background: var(--border); border-radius: 2px; }
+    .splitter:hover::after, .splitter:focus-visible::after { background: var(--accent); }
+    .projects-split { --left: 310px; }
+    .structure-split { --left: minmax(300px, 42%); }
+    .structure-work-split > .section { min-height: 330px; max-height: 430px; display: flex; flex-direction: column; }
+    .structure-work-split .tree, .structure-editor { flex: 1; min-height: 0; overflow: auto; }
+    .structure-sequence { padding: 9px; background: var(--surface-raised); border: 1px solid var(--border); border-radius: 5px; }
+    .structure-sequence + .structure-sequence { margin-top: 9px; }
+    .structure-shot-list { display: grid; gap: 6px; margin: 8px 0 0 20px; }
+    .incoming-grid { display: grid; grid-template-columns: minmax(180px, var(--source-width, 220px)) 8px minmax(390px, 1fr); align-items: stretch; }
+    .incoming-work-panel { height: 360px; display: flex; flex-direction: column; min-height: 0; }
+    .incoming-work-panel .tree, .incoming-work-panel .table-wrap { flex: 1; min-height: 0; max-height: none !important; overflow: auto; }
+    .incoming-destination { grid-column: 1 / -1; margin-top: 12px; }
+    .incoming-destination .tree { min-height: 150px; max-height: 210px; overflow: auto; }
+    .tree { min-height: 230px; padding: 9px 10px; font: 12px/1.75 var(--mono); }
+    .tree ul { list-style: none; margin: 0; padding-left: 17px; }
+    .tree > ul { padding-left: 0; }
+    .tree-button { display: block; max-width: 100%; padding: 1px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); background: transparent; border: 0; text-align: left; }
+    .tree-button[aria-pressed="true"] { color: #d9edff; background: var(--selected); }
+    .folder { color: #b8d4ee; }
+    .new-item { color: var(--success); }
+    .existing-item { color: var(--quiet); }
+    .conflict-item { color: var(--warning); }
+
+    .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); }
+    .tab { min-height: 34px; padding: 6px 11px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; }
+    .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); background: var(--surface-raised); }
+    .table-wrap { min-width: 0; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
+    th { position: relative; padding: 7px 10px; color: var(--muted); background: #1b242d; border-bottom: 1px solid var(--border-strong); text-align: left; font-weight: 400; white-space: nowrap; }
+    td { padding: 7px 10px; border-bottom: 1px solid #2b3540; vertical-align: middle; overflow-wrap: anywhere; }
+    tbody tr:hover { background: #1b252e; }
+    tbody tr[aria-selected="true"], tbody tr.selected { background: var(--selected); box-shadow: inset 2px 0 var(--accent); }
+    tbody tr[tabindex] { cursor: default; }
+    .cell-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cell-sub { display: block; margin-top: 2px; color: var(--quiet); font-size: 11px; }
+    .cell-sub.warning { color: var(--warning); }
+    .select-cell { width: 38px; text-align: center; }
+    .number { text-align: right; font-variant-numeric: tabular-nums; }
+    .version-select { min-height: 26px; padding-block: 2px; }
+    .column-resizer { position: absolute; top: 0; right: -4px; width: 9px; height: 100%; padding: 0; cursor: col-resize; background: transparent; border: 0; z-index: 2; }
+    .column-resizer::after { content: ""; position: absolute; top: 7px; bottom: 7px; right: 4px; width: 1px; background: var(--border-strong); }
+    .column-resizer:hover::after, .column-resizer:focus-visible::after { width: 2px; background: var(--focus); }
+    .row-detail { padding: 9px 10px; background: #141d25; border-left: 2px solid var(--accent); }
+    .row-detail .form-grid { margin-top: 8px; }
+    .file-change { color: var(--muted); }
+    .file-change strong { color: var(--text); font-weight: 500; }
+
+    .progress-block { display: grid; gap: 7px; padding: 11px; border-top: 1px solid var(--border); background: #141b22; }
+    .progress-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .progress-line .push { margin-left: auto; }
+    .progress-track { height: 7px; overflow: hidden; background: #0d1319; border-radius: 4px; }
+    .progress-fill { width: 0; height: 100%; background: var(--primary); transition: width .15s linear; }
+    .current-file { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 11px var(--mono); }
+    .phase-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .phase { display: grid; gap: 5px; }
+    .phase-label { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+    .result-list { margin: 0; padding-left: 19px; color: var(--muted); }
+
+    dialog { width: min(760px, calc(100vw - 70px)); max-height: calc(100vh - 70px); padding: 0; overflow: auto; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: 0 20px 70px #000a; }
+    #new-project-dialog, #folder-browser-dialog { overflow: hidden; }
+    #new-project-form, .folder-browser-form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; max-height: calc(100vh - 72px); }
+    #new-project-form .dialog-body, .folder-browser-form .dialog-body { min-height: 0; overflow: auto; }
+    .folder-list { display: grid; gap: 3px; min-height: 190px; align-content: start; padding: 6px; border: 1px solid var(--border); border-radius: 5px; background: #111820; }
+    .folder-open { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 5px 8px; text-align: left; color: var(--text); background: transparent; border: 0; border-radius: 4px; }
+    .folder-open:hover, .folder-open:focus-visible { background: var(--selected); }
+    .breadcrumb { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-width: 0; }
+    .collapsible-head { width: 100% !important; color: var(--text) !important; }
+    dialog::backdrop { background: #05090dcc; }
+    .dialog-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+    .dialog-head .btn { margin-left: auto; }
+    .dialog-body { display: grid; gap: 12px; padding: 14px; }
+    .dialog-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 11px 14px; border-top: 1px solid var(--border); background: #141b22; }
+    .context-menu { position: fixed; z-index: 50; min-width: 190px; padding: 5px; background: #202a34; border: 1px solid var(--border-strong); border-radius: 6px; box-shadow: 0 12px 36px #0009; }
+    .context-menu button { display: block; width: 100%; padding: 7px 9px; color: var(--text); text-align: left; background: transparent; border: 0; border-radius: 3px; }
+    .context-menu button:hover, .context-menu button:focus { background: var(--selected); }
+    .shortcut-list { display: grid; grid-template-columns: 150px 1fr; gap: 8px 14px; }
+    .shortcut-list dt { color: var(--muted); }
+    .shortcut-list dd { margin: 0; }
+    .rule-row { display: grid; grid-template-columns: minmax(170px, 1fr) minmax(170px, 1fr) auto auto; gap: 6px; margin-bottom: 7px; }
+    .settings-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 14px; }
+    .settings-tabs { display: grid; align-content: start; gap: 3px; }
+    .settings-tab { padding: 7px 9px; color: var(--muted); text-align: left; background: transparent; border: 1px solid transparent; border-radius: 4px; }
+    .settings-tab[aria-selected="true"] { color: var(--text); background: var(--selected); border-color: #3d6381; }
+    .empty { padding: 36px 18px; color: var(--muted); text-align: center; }
+
+    @container (max-width: 1060px) {
+      .incoming-grid { grid-template-columns: minmax(180px, var(--source-width, 210px)) 8px minmax(0, 1fr); }
+      .tree { min-height: 170px; }
+    }
+    @container (max-width: 860px) {
+      .split-two { grid-template-columns: 1fr; gap: 10px; }
+      .split-two > .splitter { display: none; }
+      .form-grid.three { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 1100px) {
+      :root { --sidebar-width: 188px; }
+      .content { padding-inline: 12px; }
+      .topbar { padding-inline: 12px; }
+      .settings-layout { grid-template-columns: 150px minmax(0, 1fr); }
+    }
+    @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+    /* Continuous DCC-style dock workspace, not a scrolling web page. */
+    body { overflow: hidden; }
+    .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: 26px 30px minmax(0, 1fr); height: 100vh; min-height: 640px; }
+    .sidebar { grid-row: 1 / 3; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-rows: 26px 30px; min-width: 0; padding: 0; gap: 0; border-right: 0; background: #14181d; }
+    .brand { grid-column: 1 / -1; min-height: 26px; padding: 0 7px; display: flex; flex-direction: row; align-items: center; gap: 18px; border-bottom: 1px solid #30363d; font-size: 12px; }
+    .brand .app-name { font-weight: 500; color: var(--text); }
+    .brand span:not(.app-name) { margin: 0; font-size: 12px; }
+    .app-menu { display: flex; align-items: center; gap: 17px; color: var(--muted); }
+    .brand .app-menu { display: flex; white-space: nowrap; }
+    .brand .app-menu > span { display: inline-block; }
+    .nav { gap: 0; }
+    .workspace-tabs { grid-row: 2; grid-column: 1 / 3; display: flex; flex-direction: row; align-items: stretch; min-width: 0; }
+    .nav-button { width: auto; flex: none; min-height: 29px; padding: 3px 13px; border: 0; border-right: 1px solid #30363d; border-radius: 0; background: transparent; color: var(--muted); white-space: nowrap; }
+    .nav-button[aria-current="page"] { background: #252d35; color: var(--text); border-top-color: #30363d; box-shadow: inset 0 -2px var(--accent); }
+    .nav-button:hover { background: #20262d; }
+    .settings-nav { grid-row: 2; grid-column: 3; display: flex; flex-direction: row; margin: 0; }
+    .sidebar-resize, .prototype-note { display: none; }
+    .main { grid-row: 3; grid-template-rows: 34px minmax(0, 1fr); }
+    .topbar { min-height: 34px; padding: 3px 7px; gap: 6px; background: #181d22; }
+    .topbar select { max-width: 360px; }
+    .content { overflow: hidden; }
+    .view { max-width: none; padding: 0; overflow: auto; }
+    .pinned-view { overflow: hidden; }
+    .view-workspace { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+    .pinned-view fieldset { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .toolbar { min-height: 30px; margin: 0; padding: 3px 6px; gap: 5px; background: #181d22; border-bottom: 1px solid var(--border); }
+    .dock-toolbar { flex: none; }
+    .section { border-radius: 0; background: #171b20; border-color: #30363d; }
+    .section + .section { margin-top: 0; }
+    .section-head { min-height: 26px; padding: 3px 6px; gap: 6px; border-bottom: 1px solid #30363d; background: #20262c; }
+    .section-head h2 { margin: 0; font: inherit; font-weight: 400; }
+    .section-body { padding: 6px; }
+    .section-foot { min-height: 25px; padding: 3px 6px; }
+    .split-two { grid-template-columns: minmax(220px, var(--left, 300px)) 5px minmax(400px, 1fr); }
+    .splitter { border-radius: 0; background: #252c33; }
+    .splitter::after { inset: 0; border-radius: 0; background: #30363d; }
+    .splitter:hover::after, .splitter:focus-visible::after { background: #5d768b; }
+    .vertical-splitter { min-height: 5px; cursor: row-resize; }
+    .dock-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .docked-workspace { flex: 1; min-height: 0; display: grid; grid-template-rows: minmax(180px, 1fr) 5px var(--preview-height, 250px); }
+    .structure-work-split { min-height: 0; }
+    .structure-work-split > .section { min-height: 0; max-height: none; }
+    .structure-editor { flex: 1; min-height: 0; overflow: auto; padding: 4px 6px; }
+    .structure-sequence { padding: 4px 0; border: 0; border-bottom: 1px solid #30363d; border-radius: 0; background: transparent; }
+    .inset-head { margin-top: 4px !important; }
+    .structure-shot-list { gap: 3px; margin: 4px 0 0 18px; }
+    .destination-dock { min-height: 0; }
+    .destination-dock .tree { flex: 1; min-height: 0; max-height: none; overflow: auto; }
+    .dock-settings { flex: none; display: flex; align-items: center; flex-wrap: wrap; gap: 5px 10px; padding: 5px 6px; border-bottom: 1px solid #30363d; }
+    .dock-settings > label { display: inline-flex; align-items: center; gap: 5px; }
+    .compact-dimensions { display: inline-flex; align-items: center; gap: 3px; }
+    .compact-dimensions input { width: 66px; }
+    .incoming-setup { flex: none; padding: 6px; border-bottom: 1px solid #30363d; }
+    .incoming-setup .form-grid { gap: 6px; }
+    .incoming-dock { --preview-height: 230px; }
+    .incoming-grid { min-height: 0; grid-template-columns: minmax(180px, var(--source-width, 220px)) 5px minmax(390px, 1fr); }
+    .incoming-work-panel { height: auto; }
+    .incoming-work-panel .tree, .incoming-work-panel .table-wrap { max-height: none; }
+    .incoming-destination { grid-column: auto; margin: 0; }
+    .tree { min-height: 0; padding: 2px 0; }
+    .tree-row, .tree-button { padding-top: 2px; padding-bottom: 2px; border-radius: 0; }
+    .plan-table th, .plan-table td { padding-top: 4px; padding-bottom: 4px; }
+    .copy-workspace .compact-setup { flex: none; }
+    .compact-options { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 10px; margin-top: 6px; }
+    .compact-options input#copy-custom-extension { width: 140px; }
+    .compact-options select { width: 120px; }
+    .copy-files-dock { flex: 1; min-height: 130px; }
+    .copy-files-dock[open] { display: flex; flex-direction: column; }
+    .copy-files-dock .table-wrap { flex: 1; min-height: 0; overflow: auto; }
+    .copy-progress-dock { flex: none; max-height: 178px; overflow: auto; }
+    .copy-progress-dock .progress-block { margin: 0; padding: 5px 7px; border-bottom: 1px solid #30363d; }
+    .progress-track { height: 6px; border-radius: 0; }
+    .progress-fill { border-radius: 0; }
+    .action-strip { padding: 5px 7px; border-top: 1px solid #4a535d; border-radius: 0; background: #1b2127; }
+    .action-strip-inner { gap: 7px; }
+    .btn { min-height: 24px; border-radius: 1px; box-shadow: none; padding: 3px 9px; }
+    .btn-small { min-height: 22px; padding: 2px 6px; }
+    input, select, textarea { min-height: 24px; border-radius: 1px; background: #11161b; }
+    input[type="checkbox"], input[type="radio"] { min-height: 0; }
+    .tabs { min-height: 26px; border-bottom: 1px solid #30363d; background: #181d22; }
+    .tab { min-height: 25px; padding: 3px 10px; border-radius: 0; }
+    dialog { border-radius: 2px; }
+    .dialog-head, .dialog-foot { border-radius: 0; }
+    .folder-list { border-radius: 0; margin-top: 6px; }
+    .folder-open { border-radius: 0; }
+    .assistant-popover { display: grid; gap: 6px; width: min(520px, 70vw); margin-top: 6px; padding: 6px; background: #1b2127; border: 1px solid #4a535d; }
+    .incoming-rules { display: grid; gap: 4px; }
+    .row-details summary { color: var(--accent); }
+    .conflict-editor { display: grid; grid-template-columns: minmax(180px, 1fr) 130px; gap: 5px; margin-top: 5px; }
+    .conflict-editor input, .conflict-editor select { width: 100%; }
+    .projects-workspace > .toolbar { flex: none; }
+    .projects-split { min-height: 0; }
+  </style>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to current work</a>
+<div class="app" id="app">
+  <aside class="sidebar" aria-label="Application navigation">
+    <div class="brand"><span class="app-name">VFX Launcher</span><span class="app-menu" aria-label="Application menu"><span>File</span><span>Edit</span><span>View</span><span>Window</span><span>Help</span></span></div>
+    <nav class="nav workspace-tabs" aria-label="Workspaces">
+      <button type="button" class="nav-button" data-view="projects" aria-current="page">Projects</button>
+      <button type="button" class="nav-button" data-view="structure">Shots &amp; Sequences</button>
+      <button type="button" class="nav-button" data-view="incoming">Organize Incoming</button>
+      <button type="button" class="nav-button" data-view="copy">Copy by File Type</button>
+      <button type="button" class="nav-button" data-view="backup">Back Up Projects</button>
+    </nav>
+    <nav class="nav settings-nav" aria-label="Application settings">
+      <button type="button" class="nav-button" data-view="settings">Settings</button>
+      <button type="button" class="nav-button" data-dialog="shortcuts-dialog">Keyboard shortcuts</button>
+    </nav>
+  </aside>
+  <div class="sidebar-resize" id="sidebar-resize" role="separator" tabindex="0" aria-label="Resize navigation" aria-orientation="vertical" aria-valuemin="176" aria-valuemax="300" aria-valuenow="212"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <label class="muted small" for="current-project">Current project</label>
+      <select id="current-project" style="width:310px" aria-label="Current project">
+        <option value="tidal">00142_Northwind_Tidal_2026-11-05</option>
+        <option value="helios">00141_Helios_Launch_2026-10-28</option>
+        <option value="aurora">00139_Aurora_Onboarding_2026-10-14</option>
+      </select>
+      <span class="spacer"></span>
+      <span class="topbar-status">User: <span id="current-user">admin</span> · Prototype</span>
+    </header>
+
+    <main class="content" id="main-content">
+      <!-- Projects -->
+      <section class="view pinned-view" id="view-projects" aria-label="Projects" tabindex="-1">
+        <div class="view-workspace projects-workspace">
+        <div class="toolbar">
+          <button type="button" class="btn btn-primary" id="scan-projects">Scan folders</button>
+          <button type="button" class="btn" id="open-new-project">New project</button>
+          <button type="button" class="btn" id="add-existing-project">Add existing folder</button>
+          <span class="push"></span>
+          <input type="search" id="project-search" aria-label="Search projects" placeholder="Search projects" style="width:220px">
+        </div>
+        <div class="split-two projects-split" id="projects-split">
+          <section class="section" aria-label="Project list">
+            <div class="tabs" role="tablist" aria-label="Project list filter">
+              <button type="button" class="tab" role="tab" id="projects-all-tab" aria-controls="project-list-panel" aria-selected="true" data-scope="all">All</button>
+              <button type="button" class="tab" role="tab" id="projects-favorites-tab" aria-controls="project-list-panel" aria-selected="false" tabindex="-1" data-scope="favorites">Favorites</button>
+              <button type="button" class="tab" role="tab" id="projects-recents-tab" aria-controls="project-list-panel" aria-selected="false" tabindex="-1" data-scope="recents">Recent</button>
+            </div>
+            <div class="table-wrap" id="project-list-panel" role="tabpanel" aria-labelledby="projects-all-tab">
+              <table class="resizable-table" id="projects-table" aria-label="Projects">
+                <thead><tr><th scope="col">Project</th><th scope="col" style="width:66px">Files</th><th scope="col" style="width:90px">Access</th></tr></thead>
+                <tbody id="project-rows"></tbody>
+              </table>
+            </div>
+            <div class="section-foot"><span id="project-count">3 projects</span><span class="push"></span><span class="small">Right-click for project actions</span></div>
+          </section>
+          <div class="splitter" role="separator" tabindex="0" aria-label="Resize project list" aria-orientation="vertical" data-var="--left" data-min="220" data-max="520" aria-valuemin="220" aria-valuemax="520" aria-valuenow="310"></div>
+          <section class="section" aria-label="Files in selected project">
+            <div class="section-head">
+              <h2 id="selected-project-name">00142_Northwind_Tidal_2026-11-05</h2>
+              <span class="push"></span>
+              <input type="search" id="file-search" aria-label="Search project files" placeholder="Search files" style="width:210px">
+            </div>
+            <div class="tabs" role="tablist" aria-label="Project file type">
+              <button type="button" class="tab" role="tab" id="nuke-tab" aria-controls="nuke-files" aria-selected="true" data-file-type="nuke">Nuke</button>
+              <button type="button" class="tab" role="tab" id="ae-tab" aria-controls="ae-files" aria-selected="false" tabindex="-1" data-file-type="ae">After Effects</button>
+            </div>
+            <div id="nuke-files" role="tabpanel" aria-labelledby="nuke-tab">
+              <div class="table-wrap">
+                <table class="resizable-table" aria-label="Nuke files">
+                  <thead><tr><th scope="col">File</th><th scope="col" style="width:92px">Version</th><th scope="col" style="width:82px">Launch</th><th scope="col" style="width:112px">Modified</th><th scope="col" style="width:120px">Last opened</th><th scope="col" style="width:74px">By</th></tr></thead>
+                  <tbody id="nuke-file-rows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div id="ae-files" role="tabpanel" aria-labelledby="ae-tab" hidden>
+              <div class="table-wrap">
+                <table class="resizable-table" aria-label="After Effects files">
+                  <thead><tr><th scope="col">File</th><th scope="col" style="width:92px">Version</th><th scope="col" style="width:82px">Launch</th><th scope="col" style="width:112px">Modified</th><th scope="col" style="width:120px">Last opened</th><th scope="col" style="width:74px">By</th></tr></thead>
+                  <tbody id="ae-file-rows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="section-foot"><span id="file-feedback" role="status" aria-live="polite">Choose a version, then Launch.</span><span class="push"></span><span class="small">Reveal, copy path and info are in the right-click menu</span></div>
+          </section>
+        </div>
+        </div>
+      </section>
+
+      <!-- Shots & Sequences -->
+      <section class="view pinned-view" id="view-structure" aria-label="Shots and Sequences" tabindex="-1" hidden>
+        <div class="view-workspace structure-workspace">
+          <fieldset id="structure-fields">
+            <div class="toolbar dock-toolbar">
+              <button type="button" class="btn btn-quiet" data-dialog="templates-dialog">Templates &amp; clients</button>
+              <span class="push"></span>
+              <span class="status-text" id="structure-state" role="status">Draft · 1 destination folder selected</span>
+            </div>
+            <div class="docked-workspace structure-dock" id="structure-dock">
+              <div class="split-two structure-split structure-work-split" id="structure-split" style="--left:42%">
+                <section class="section dock-pane" aria-label="Existing destination folders">
+                  <div class="section-head"><span>Existing project folders</span><span class="small">Check each destination</span></div>
+                  <div class="tree" id="existing-project-tree">
+                    <div class="tree-row"><label class="check"><input type="checkbox" data-structure-folder="01_plates">01_plates/</label></div>
+                    <div class="tree-row"><label class="check"><input type="checkbox" data-structure-folder="04_vfx" checked>04_vfx/</label></div>
+                    <div class="tree-indent"><div class="tree-row"><label class="check"><input type="checkbox" data-structure-folder="04_vfx/SEQ010">SEQ010/</label></div></div>
+                    <div class="tree-indent"><div class="tree-row"><label class="check"><input type="checkbox" data-structure-folder="04_vfx/SEQ020">SEQ020/</label></div></div>
+                    <div class="tree-row"><label class="check"><input type="checkbox" data-structure-folder="05_delivery">05_delivery/</label></div>
+                  </div>
+                </section>
+                <div class="splitter" role="separator" tabindex="0" aria-label="Resize existing folders and shot editor" aria-orientation="vertical" data-var="--left" data-min="300" data-max="700" aria-valuemin="300" aria-valuemax="700" aria-valuenow="430"></div>
+                <section class="section dock-pane" aria-label="Sequence and shot editor">
+                  <div class="section-head"><span>Sequences and shots</span><button type="button" class="btn btn-small" id="add-sequence">Add sequence</button></div>
+                  <div class="structure-editor">
+                    <div id="structure-additions"></div>
+                    <div class="section-head inset-head"><span>Standalone shots</span><button type="button" class="btn btn-small" id="add-standalone-shot">Add shot</button></div>
+                    <div id="standalone-shot-list"></div>
+                  </div>
+                </section>
+              </div>
+              <div class="splitter vertical-splitter" role="separator" tabindex="0" aria-label="Resize destination preview" aria-orientation="horizontal" data-direction="vertical" data-var="--preview-height" data-min="190" data-max="430" aria-valuemin="190" aria-valuemax="430" aria-valuenow="270"></div>
+              <section class="section dock-pane destination-dock" aria-label="Destination preview">
+                <div class="section-head"><span>Destination preview</span><span class="push"></span><span class="small muted" id="structure-revision">Preview 1</span><button type="button" class="btn btn-small" id="regenerate-structure">Regenerate preview</button></div>
+                <div class="dock-settings">
+                  <label>Template <select id="structure-template"><option value="checked">Checked folder / sequence / shot</option><option value="commercial">04_vfx / sequence / shot</option><option value="episodic">03_work / sequence / shot</option></select></label>
+                  <label>Resolution <select id="structure-resolution"><option value="1920 × 1080">HD · 1920 × 1080</option><option value="3840 × 2160">UHD · 3840 × 2160</option><option value="4096 × 3112">Super 35 · 4096 × 3112</option><option value="4096 × 2160">DCP · 4096 × 2160</option><option value="custom">Custom</option></select></label>
+                  <label>FPS <select id="structure-fps"><option>23.976</option><option>24</option><option selected>25</option><option>29.97</option><option>30</option><option>60</option></select></label>
+                  <label class="check"><input type="checkbox" id="structure-generate-nuke" checked>Nuke scripts</label>
+                  <label class="check nuke-option"><input type="checkbox" id="structure-proxy">Proxy</label>
+                  <label class="check nuke-option"><input type="checkbox" id="structure-aces" checked>ACES</label>
+                  <label class="check nuke-option"><input type="checkbox" id="use-parent-sequence">Parent folder as sequence in filename</label>
+                  <span class="nuke-option compact-dimensions" id="structure-custom-dimensions" hidden><input id="structure-width" aria-label="Custom width" type="number" value="1920" min="1"><span>×</span><input id="structure-height" aria-label="Custom height" type="number" value="1080" min="1"></span>
+                </div>
+                <div class="tree" id="structure-preview" aria-label="Folder preview"></div>
+                <div class="section-foot"><span id="structure-preview-note">Preview matches the current additions.</span></div>
+                <div class="progress-block" id="structure-progress" hidden>
+                  <div class="progress-line"><span id="structure-progress-label">Adding folders and scripts</span><span class="push tabular-nums" id="structure-progress-count">0 / 3</span></div>
+                  <div class="progress-track" role="progressbar" aria-label="Add to project progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="structure-progressbar"><div class="progress-fill" id="structure-progress-fill"></div></div>
+                </div>
+              </section>
+            </div>
+          </fieldset>
+        </div>
+        <section class="action-strip" aria-label="Review and add shots">
+          <div class="action-strip-inner">
+            <button type="button" class="btn" id="validate-structure">Check additions</button>
+            <span class="status-text" id="structure-action-reason">Check the current preview to enable Add to project.</span>
+            <span class="push"></span>
+            <button type="button" class="btn btn-primary execution" id="execute-structure" disabled>Add to project</button>
+          </div>
+        </section>
+      </section>
+
+      <!-- Organize Incoming -->
+      <section class="view pinned-view" id="view-incoming" aria-label="Organize Incoming" tabindex="-1" hidden>
+        <div class="view-workspace incoming-workspace">
+          <fieldset id="incoming-fields">
+            <div class="toolbar dock-toolbar">
+              <button type="button" class="btn btn-primary" id="scan-incoming">Scan folders</button>
+              <span class="inline-note" id="incoming-scan-note">3 items · 202 files</span>
+              <span class="push"></span>
+              <details class="assistant-details"><summary>Suggest folders <span class="quiet">· assistant disconnected</span></summary><div class="assistant-popover"><label class="field"><span>Optional instruction</span><input id="assistant-instruction" value="Keep camera originals together"></label><button type="button" class="btn btn-small" id="suggest-folders">Suggest folders</button><span class="inline-note" id="assistant-feedback" role="status"></span></div></details>
+            </div>
+            <div class="incoming-setup">
+              <div class="form-grid three">
+                <div class="field"><label for="incoming-source">Source folder</label><div class="input-row"><input id="incoming-source" class="mono incoming-draft-input" value="/mnt/Ingest/Northwind/day_03"><button type="button" class="btn" data-folder-browser="incoming-source">Browse…</button></div></div>
+                <div class="field"><label for="incoming-destination">Destination folder</label><div class="input-row"><input id="incoming-destination" class="mono incoming-draft-input" value="/mnt/Projects/00142_Northwind_Tidal_2026-11-05"><button type="button" class="btn" data-folder-browser="incoming-destination">Browse…</button></div></div>
+                <div class="field"><label for="incoming-layout">Folder layout <button type="button" class="link-button small" data-dialog="rules-dialog">How does this work?</button></label><select id="incoming-layout" class="incoming-draft-input"><option value="shot">Shot / task / version</option><option value="department">Department / shot / task</option><option value="flat">One folder for all files</option></select></div>
+              </div>
+            </div>
+            <div class="docked-workspace incoming-dock" id="incoming-dock">
+              <div class="split-two incoming-grid" id="incoming-grid">
+                <section class="section dock-pane incoming-work-panel" aria-label="Source folders">
+                  <div class="section-head"><h2>Source</h2><span class="small">day_03</span></div>
+                  <div class="tree"><ul><li><span class="folder">day_03/</span><ul><li><button type="button" class="tree-button" aria-pressed="false" data-source-filter="camera">▾ camera_a/</button><ul><li><button type="button" class="tree-button" data-source-filter="A012C003">A012C003_261105.mxf</button></li></ul></li><li><button type="button" class="tree-button" aria-pressed="true" data-source-filter="all">▾ renders/</button><ul><li><button type="button" class="tree-button" data-source-filter="beauty">SH010_beauty_v003.####.exr</button></li><li><button type="button" class="tree-button" data-source-filter="cryptomatte">SH010_cryptomatte_v003.####.exr</button></li></ul></li></ul></li></ul></div>
+                  <div class="section-foot small">Filters the file list</div>
+                </section>
+                <div class="splitter" role="separator" tabindex="0" aria-label="Resize incoming source tree" aria-orientation="vertical" data-var="--source-width" data-min="180" data-max="400" aria-valuemin="180" aria-valuemax="400" aria-valuenow="220"></div>
+                <section class="section dock-pane incoming-work-panel" aria-label="Planned file changes">
+                  <div class="section-head"><h2>Files and destinations</h2><span class="push"></span><button type="button" class="btn btn-small" id="incoming-select-all">Select all</button><button type="button" class="btn btn-small" id="incoming-clear">Clear</button></div>
+                  <div class="table-wrap plan-table-wrap"><table class="resizable-table" id="incoming-table" aria-label="Incoming files and destinations"><thead><tr><th scope="col" class="select-cell"><span class="sr-only">Select</span></th><th scope="col">Source</th><th scope="col">Destination</th><th scope="col" style="width:84px">Count</th></tr></thead><tbody id="incoming-rows"></tbody></table></div>
+                  <div class="section-foot"><span id="incoming-selection">3 items selected · 202 files</span><span class="push"></span><span id="incoming-conflict-summary" class="warning">1 existing file</span></div>
+                </section>
+              </div>
+              <div class="splitter vertical-splitter" role="separator" tabindex="0" aria-label="Resize Incoming destination preview" aria-orientation="horizontal" data-direction="vertical" data-var="--preview-height" data-min="170" data-max="360" aria-valuemin="170" aria-valuemax="360" aria-valuenow="230"></div>
+              <section class="section dock-pane destination-dock incoming-destination" aria-label="Destination preview">
+                <div class="section-head"><h2>Destination preview</h2><span class="small">Existing content and planned files</span></div>
+                <div class="tree" id="incoming-destination-tree"></div>
+                <div class="progress-block" id="incoming-progress" hidden><div class="progress-line"><span id="incoming-progress-label">Copying selected files</span><span class="push tabular-nums" id="incoming-progress-count">0 / 202 files</span></div><div class="progress-track" role="progressbar" aria-label="Incoming transfer progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="incoming-progressbar"><div class="progress-fill" id="incoming-progress-fill"></div></div><div class="current-file" id="incoming-current-file">Waiting to start</div></div>
+                <details class="compact-details" id="incoming-results" hidden><summary>Run details</summary><div id="incoming-result-content"></div></details>
+              </section>
+            </div>
+          </fieldset>
+        </div>
+        <section class="action-strip" aria-label="Review and organize Incoming files"><div class="action-strip-inner">
+          <label class="check"><input type="radio" name="incoming-action" value="copy" checked>Copy</label><label class="check"><input type="radio" name="incoming-action" value="move">Move</label>
+          <button type="button" class="btn" id="validate-incoming">Validate selection</button><span class="status-text" id="incoming-state" role="status">Draft · review destinations, then validate</span><span class="push"></span>
+          <button type="button" class="btn btn-primary execution" id="execute-incoming" disabled>Copy selected</button><button type="button" class="btn" id="pause-incoming" hidden>Pause</button><button type="button" class="btn btn-danger" id="cancel-incoming" hidden>Cancel</button>
+        </div></section>
+      </section>
+
+      <!-- Copy by File Type -->
+      <section class="view pinned-view" id="view-copy" aria-label="Copy by File Type" tabindex="-1" hidden>
+        <div class="view-workspace copy-workspace">
+        <fieldset id="copy-fields">
+          <div class="toolbar dock-toolbar"><button type="button" class="btn btn-primary" id="find-copy-files">Scan folders</button><span class="muted">Copy selected file types and keep folders and filenames.</span><span class="push"></span><span id="copy-discovery-state">4 matching files</span></div>
+          <section class="section compact-setup">
+            <div class="section-body" style="display:grid;gap:11px">
+              <div class="form-grid">
+                <div class="field"><label for="copy-source">Source folder</label><div class="input-row"><input id="copy-source" class="mono copy-draft-input" value="/mnt/Projects/00142_Northwind_Tidal_2026-11-05"><button type="button" class="btn browse-button" data-target="copy-source">Browse…</button></div></div>
+                <div class="field"><label for="copy-destination">Destination folder</label><div class="input-row"><input id="copy-destination" class="mono copy-draft-input" value="/mnt/Transfer/Northwind_review"><button type="button" class="btn browse-button" data-target="copy-destination">Browse…</button></div></div>
+              </div>
+              <div class="compact-options"><span class="field-label">File types</span><label class="check"><input type="checkbox" class="copy-extension" value="nk" checked>.nk</label><label class="check"><input type="checkbox" class="copy-extension" value="autosave" checked>.autosave</label><label class="check"><input type="checkbox" class="copy-extension" value="aep" checked>.aep</label><label class="check"><input type="checkbox" class="copy-extension" value="exr" checked>.exr</label><input id="copy-custom-extension" aria-label="Other file extension" placeholder="Other, e.g. .mov"><label for="copy-conflict">Existing files</label><select id="copy-conflict"><option value="skip">Skip</option><option value="both">Keep both</option><option value="replace">Replace</option></select></div>
+            </div>
+          </section>
+
+          <details class="section dock-pane copy-files-dock" id="copy-files-details" open>
+            <summary class="section-head collapsible-head"><span>Files to copy</span><span class="push"></span><span class="small muted" id="copy-list-summary">4 selected · 3 will copy · 1 will be skipped</span></summary>
+            <div class="table-wrap">
+              <table class="resizable-table" aria-label="Matching files">
+                <thead><tr><th scope="col" class="select-cell"><span class="sr-only">Select</span></th><th scope="col">File and folder</th><th scope="col">Destination</th><th scope="col" style="width:105px">Size</th><th scope="col" style="width:120px">Current state</th></tr></thead>
+                <tbody id="copy-file-rows"></tbody>
+              </table>
+            </div>
+            <div class="section-foot"><span>Source-relative paths</span><span class="push"></span><button type="button" class="btn btn-small" id="copy-select-all">Select all</button><button type="button" class="btn btn-small" id="copy-clear">Clear</button></div>
+          </details>
+          <section class="section copy-progress-dock" aria-label="Scan and copy progress">
+            <div class="progress-block" id="copy-find-progress"><div class="progress-line"><span>Scan folders</span><span class="push tabular-nums" id="copy-find-count">Ready</span></div><div class="progress-track" role="progressbar" aria-label="Folder scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="copy-find-progressbar"><div class="progress-fill" id="copy-find-fill"></div></div><div class="current-file" id="copy-find-current">Waiting to scan source folders</div></div>
+            <div class="progress-block" id="copy-progress"><div class="progress-line"><span id="copy-progress-label">Copy files</span><span class="push tabular-nums" id="copy-progress-count">Waiting for a validated file list</span></div><div class="progress-track" role="progressbar" aria-label="File type copy progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="copy-progressbar"><div class="progress-fill" id="copy-progress-fill"></div></div><div class="current-file" id="copy-current-file">Waiting to copy</div></div>
+            <details class="compact-details" id="copy-results" hidden><summary>Results and errors</summary><div id="copy-result-content"></div></details>
+          </section>
+        </fieldset>
+        </div>
+
+        <section class="action-strip" aria-label="Validate and copy files"><div class="action-strip-inner"><button type="button" class="btn" id="validate-copy">Validate selection</button><span class="status-text" id="copy-state" role="status">Draft · validate the current file list before copying</span><span class="push"></span><button type="button" class="btn btn-primary execution" id="execute-copy" disabled>Copy selected</button><button type="button" class="btn btn-danger" id="cancel-copy" hidden>Cancel</button></div></section>
+      </section>
+
+      <!-- Back Up Projects -->
+      <section class="view" id="view-backup" aria-label="Back Up Projects" tabindex="-1" hidden>
+        <fieldset id="backup-fields">
+          <section class="section">
+            <div class="section-body" style="display:grid;gap:11px">
+              <div class="form-grid">
+                <div class="field"><label for="backup-source">Project folder</label><div class="input-row"><input id="backup-source" class="mono" value="/mnt/Projects/00142_Northwind_Tidal_2026-11-05"><button type="button" class="btn browse-button" data-target="backup-source">Browse…</button></div></div>
+                <div class="field"><label for="backup-destination">Backup folder</label><div class="input-row"><input id="backup-destination" class="mono" value="/mnt/NAS/Backups/Northwind_Tidal"><button type="button" class="btn browse-button" data-target="backup-destination">Browse…</button></div></div>
+              </div>
+              <div class="field"><label for="backup-excludes">Leave out folders or names</label><input id="backup-excludes" class="mono" value="#Backup, .backup, *autosave*"></div>
+              <div class="check-group"><label class="check"><input type="checkbox" id="backup-schedule">Run automatically while VFX Launcher is open</label><select id="backup-schedule-mode" aria-label="Backup schedule" style="width:190px"><option>Every 4 hours</option><option>Every day at 02:00</option></select></div>
+              <details>
+                <summary>Advanced options</summary>
+                <div class="form-grid three" style="margin-top:10px">
+                  <div class="field"><label for="backup-workers">Copies at a time</label><input id="backup-workers" type="number" min="1" max="16" value="4"></div>
+                  <div class="field"><label for="backup-conflict">When a newer file exists</label><select id="backup-conflict"><option>Keep the old file as 1_name.ext</option><option>Skip the newer file</option><option>Replace the old file</option></select></div>
+                  <div class="field"><span class="field-label">Saved jobs</span><div class="toolbar-group"><button type="button" class="btn btn-small" id="import-backup">Import…</button><button type="button" class="btn btn-small" id="export-backup">Export…</button></div></div>
+                </div>
+              </details>
+            </div>
+          </section>
+
+          <section class="section">
+            <div class="section-head"><h2>Files in this backup</h2><span class="push"></span><span class="small" id="backup-list-summary">4 to copy · 26 already up to date · 1 needs attention</span></div>
+            <div class="table-wrap" style="max-height:390px">
+              <table class="resizable-table" aria-label="Backup file comparison">
+                <thead><tr><th scope="col">File and folder</th><th scope="col" style="width:140px">Source modified</th><th scope="col" style="width:155px">Comparison</th><th scope="col">What will happen</th></tr></thead>
+                <tbody id="backup-file-rows"></tbody>
+              </table>
+            </div>
+            <details class="compact-details"><summary>Show 26 files already up to date</summary><div class="section-body muted small">Tidal_Promo_03.aep and 25 other Nuke scripts have the same or an older modification time. They will not be copied.</div></details>
+          </section>
+        </fieldset>
+
+        <section class="section">
+          <div class="section-body" style="display:flex;align-items:center;flex-wrap:wrap;gap:9px">
+            <button type="button" class="btn btn-primary execution" id="run-backup">Back up now</button>
+            <button type="button" class="btn" id="pause-backup" hidden>Pause</button>
+            <button type="button" class="btn btn-danger" id="cancel-backup" hidden>Cancel</button>
+            <span class="status-text" id="backup-state" role="status">Ready to scan this project</span>
+          </div>
+          <div class="progress-block" id="backup-progress" hidden>
+            <div class="phase-list">
+              <div class="phase"><div class="phase-label"><span>Scan folders</span><span id="backup-scan-count">0 / 31</span></div><div class="progress-track" role="progressbar" aria-label="Backup scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="backup-scan-bar"><div class="progress-fill" id="backup-scan-fill"></div></div></div>
+              <div class="phase"><div class="phase-label"><span>Find changes</span><span id="backup-find-count">Waiting</span></div><div class="progress-track" role="progressbar" aria-label="Backup comparison progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="backup-find-bar"><div class="progress-fill" id="backup-find-fill"></div></div></div>
+              <div class="phase"><div class="phase-label"><span>Copy files</span><span id="backup-copy-count">Waiting</span></div><div class="progress-track" role="progressbar" aria-label="Backup copy progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="backup-copy-bar"><div class="progress-fill" id="backup-copy-fill"></div></div></div>
+            </div>
+            <div class="current-file" id="backup-current-file">Starting scan</div>
+          </div>
+          <details class="compact-details" id="backup-results" hidden>
+            <summary>Results and errors</summary>
+            <div id="backup-result-content" style="padding-top:8px"></div>
+          </details>
+        </section>
+      </section>
+
+      <!-- Settings -->
+      <section class="view" id="view-settings" aria-label="Settings" tabindex="-1" hidden>
+        <div class="settings-layout">
+          <div class="settings-tabs" role="tablist" aria-label="Settings sections" aria-orientation="vertical">
+            <button type="button" class="settings-tab" role="tab" id="settings-applications-tab" aria-controls="settings-applications" aria-selected="true" data-settings="applications">Applications</button>
+            <button type="button" class="settings-tab" role="tab" id="settings-projects-tab" aria-controls="settings-projects" aria-selected="false" tabindex="-1" data-settings="projects">Project discovery</button>
+            <button type="button" class="settings-tab" role="tab" id="settings-users-tab" aria-controls="settings-users" aria-selected="false" tabindex="-1" data-settings="users">Users</button>
+            <button type="button" class="settings-tab" role="tab" id="settings-logs-tab" aria-controls="settings-logs" aria-selected="false" tabindex="-1" data-settings="logs">Logs</button>
+          </div>
+          <div>
+            <section class="section" id="settings-applications" role="tabpanel" aria-labelledby="settings-applications-tab">
+              <div class="section-body" style="display:grid;gap:12px">
+                <div class="field"><label for="setting-nuke">Nuke executable</label><div class="input-row"><input id="setting-nuke" class="mono" value="/opt/Nuke17.1v2/Nuke17.1"><button type="button" class="btn browse-button" data-target="setting-nuke">Browse…</button></div></div>
+                <div class="field"><label for="setting-ae">After Effects editor</label><div class="input-row"><input id="setting-ae" class="mono" value="C:\Program Files\Adobe\Adobe After Effects 2026\Support Files\AfterFX.exe"><button type="button" class="btn browse-button" data-target="setting-ae">Browse…</button></div></div>
+                <details><summary>Custom Nuke launch command</summary><textarea id="setting-command" class="mono" rows="3" style="margin-top:8px">ghostty -e env QT_QPA_PLATFORM=xcb LC_NUMERIC=C /opt/Nuke17.1v2/Nuke17.1 --nukex</textarea></details>
+                <div><button type="button" class="btn btn-primary" id="save-settings">Save settings</button> <span class="inline-note" id="settings-feedback" role="status"></span></div>
+              </div>
+            </section>
+            <section class="section" id="settings-projects" role="tabpanel" aria-labelledby="settings-projects-tab" hidden>
+              <div class="section-body" style="display:grid;gap:12px">
+                <div class="field"><label for="setting-project-names">Folder names to scan</label><input id="setting-project-names" value="project, projects, Project, Projects"></div>
+                <div class="field"><label for="setting-project-root">Default project folder</label><input id="setting-project-root" class="mono" value="/mnt/Projects"></div>
+                <details><summary>Import settings from an earlier version</summary><div class="toolbar-group" style="margin-top:9px"><button type="button" class="btn" id="choose-import">Choose import file…</button><span class="inline-note">Review changes before anything is replaced.</span></div></details>
+              </div>
+            </section>
+            <section class="section" id="settings-users" role="tabpanel" aria-labelledby="settings-users-tab" hidden>
+              <div class="section-head"><span>Names used for favorites and file history</span><span class="push"></span><button type="button" class="btn btn-small" id="add-user">Add user</button></div>
+              <table class="resizable-table" aria-label="Users"><thead><tr><th scope="col">User</th><th scope="col">Used for</th><th scope="col" style="width:220px">Actions</th></tr></thead><tbody id="user-rows"></tbody></table>
+              <div class="section-foot small">Deleting a name keeps its earlier file history.</div>
+            </section>
+            <section class="section" id="settings-logs" role="tabpanel" aria-labelledby="settings-logs-tab" hidden>
+              <div class="section-head"><label for="log-level">Show</label><select id="log-level" style="width:150px"><option>Information and above</option><option>Warnings and errors</option><option>Errors only</option></select><span class="push"></span><button type="button" class="btn btn-small" id="clear-log-view">Clear this view</button></div>
+              <div class="section-body mono small" id="log-lines" style="display:grid;gap:7px"><span>12:04:18  Incoming copy finished: 201 copied, 1 skipped</span><span class="warning">12:04:18  Existing destination skipped: SH010_beauty_v003.1001.exr</span><span>11:30:02  Backup finished: no changes</span></div>
+              <div class="section-foot small">Clearing this view does not remove saved run results.</div>
+            </section>
+            <details class="section" style="margin-top:12px;padding:10px 12px" id="prototype-controls">
+              <summary>Prototype controls</summary>
+              <div class="toolbar-group" style="margin-top:10px"><button type="button" class="btn btn-small" id="reset-prototype">Reset demo</button><button type="button" class="btn btn-small" id="demo-stale">Show stale Incoming review</button><button type="button" class="btn btn-small" id="demo-partial">Show partial backup result</button></div>
+              <p class="small quiet" style="margin-top:8px">These controls change only this mock interface.</p>
+            </details>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- New project is the only project-creation surface. -->
+<dialog id="new-project-dialog" aria-labelledby="new-project-title">
+  <form id="new-project-form">
+    <div class="dialog-head"><h2 id="new-project-title">New project</h2><button type="button" class="btn icon-button" data-close aria-label="Close new project">×</button></div>
+    <div class="dialog-body">
+      <div class="form-grid">
+        <div class="field span-2"><label for="new-parent">Create inside</label><input id="new-parent" class="mono" value="/mnt/Projects" required></div>
+        <div class="field"><label for="new-number">Number</label><input id="new-number" class="mono new-project-input" value="00143" required></div>
+        <div class="field"><label for="new-client">Client</label><input id="new-client" class="new-project-input" list="client-names" value="Northwind"><datalist id="client-names"><option value="Northwind"></option><option value="Helios"></option><option value="Aurora · 制作"></option></datalist></div>
+        <div class="field"><label for="new-name">Project name</label><input id="new-name" class="new-project-input" value="Breakwater" required></div>
+        <div class="field"><label for="new-template">Folder template</label><select id="new-template" class="new-project-input"><option>Commercial</option><option>Episodic</option><option>Minimal</option></select></div>
+        <div class="field span-2"><label for="new-root-preview">Folder to add</label><output id="new-root-preview" class="mono" for="new-number new-client new-name">/mnt/Projects/00143_Northwind_Breakwater_2026-11-05</output></div>
+      </div>
+      <details open>
+        <summary>Sequences and shots</summary>
+        <div style="display:grid;gap:8px;margin-top:9px"><div id="new-project-additions" class="mono small"></div><div class="toolbar-group"><button type="button" class="btn btn-small" id="new-add-sequence">Add sequence</button><button type="button" class="btn btn-small" id="new-add-shot">Add shot</button><button type="button" class="btn btn-small" id="new-add-standalone">Add standalone shot</button></div></div>
+      </details>
+      <details>
+        <summary>Nuke scripts</summary>
+        <div style="display:grid;gap:10px;margin-top:9px"><label class="check"><input type="checkbox" id="new-generate-nuke" checked>Generate comp scripts</label><div class="form-grid three" id="new-nuke-options"><div class="field"><label for="new-fps">Frame rate</label><select id="new-fps"><option>24</option><option selected>25</option><option>30</option></select></div><div class="field"><label for="new-resolution">Resolution</label><select id="new-resolution"><option>1920 × 1080</option><option selected>3840 × 2160</option></select></div><div class="field"><span class="field-label">Options</span><div class="check-group"><label class="check"><input type="checkbox" id="new-proxy">Proxy</label><label class="check"><input type="checkbox" id="new-aces" checked>ACES</label></div></div></div></div>
+      </details>
+      <span class="inline-note" id="new-project-feedback" role="status"></span>
+    </div>
+    <div class="dialog-foot"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn btn-primary">Add project</button></div>
+  </form>
+</dialog>
+
+<dialog id="folder-browser-dialog" aria-labelledby="folder-browser-title">
+  <form class="folder-browser-form" method="dialog" onsubmit="return false">
+    <div class="dialog-head"><h2 id="folder-browser-title">Choose folder</h2><button type="button" class="btn icon-button" data-close aria-label="Close folder browser">×</button></div>
+    <div class="dialog-body">
+      <div class="toolbar"><button type="button" class="btn btn-small" id="folder-browser-up">Up</button><div class="breadcrumb" id="folder-breadcrumb" aria-label="Folder breadcrumb"></div></div>
+      <label class="field"><span>Folder path</span><input class="mono" id="folder-browser-path"></label>
+      <div class="folder-list" id="folder-browser-list" aria-label="Folders"></div>
+      <span class="inline-note" id="folder-browser-feedback" role="status"></span>
+    </div>
+    <div class="dialog-foot"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn btn-primary" id="folder-browser-select">Select folder</button></div>
+  </form>
+</dialog>
+
+<dialog id="templates-dialog" aria-labelledby="templates-title">
+  <div class="dialog-head"><h2 id="templates-title">Templates &amp; clients</h2><button type="button" class="btn icon-button" data-close aria-label="Close templates and clients">×</button></div>
+  <div class="dialog-body">
+    <div class="field"><label for="template-to-edit">Template</label><select id="template-to-edit"><option>Commercial</option><option>Episodic</option></select></div>
+    <div class="rule-row"><input value="01_plates" aria-label="First template folder"><span></span><button type="button" class="btn btn-small rule-up" aria-label="Move first folder up">↑</button><button type="button" class="btn btn-small rule-down" aria-label="Move first folder down">↓</button></div>
+    <div class="rule-row"><input value="04_vfx/{sequence}/{shot}" aria-label="Second template folder"><span></span><button type="button" class="btn btn-small rule-up" aria-label="Move second folder up">↑</button><button type="button" class="btn btn-small rule-down" aria-label="Move second folder down">↓</button></div>
+    <button type="button" class="btn btn-small" id="add-template-folder">Add folder</button>
+    <div class="field"><label for="template-clients">Client names</label><textarea id="template-clients" rows="3">Northwind
+Helios
+Aurora · 制作</textarea></div>
+    <span class="inline-note" id="template-feedback" role="status">Changes apply to future projects and additions.</span>
+  </div>
+  <div class="dialog-foot"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn btn-primary" id="save-template">Save template</button></div>
+</dialog>
+
+<dialog id="rules-dialog" aria-labelledby="rules-title">
+  <div class="dialog-head"><h2 id="rules-title">Folder layout and filename rules</h2><button type="button" class="btn icon-button" data-close aria-label="Close folder rules">×</button></div>
+  <div class="dialog-body">
+    <p class="muted">Shot / task / version puts renders beside their shot and keeps camera originals under Video/Footage. The filename decides the task; the current source folder name does not.</p>
+    <div class="rule-row"><input value="04_vfx/{shot}/{task}/{version}" aria-label="Render destination"><input value="beauty, cryptomatte" aria-label="Render filename words"><button type="button" class="btn btn-small rule-up" aria-label="Move render rule up">↑</button><button type="button" class="btn btn-small rule-down" aria-label="Move render rule down">↓</button></div>
+    <div class="rule-row"><input value="Video/Footage/ARRI" aria-label="Camera destination"><input value="ARRI, camera" aria-label="Camera filename words"><button type="button" class="btn btn-small rule-up" aria-label="Move camera rule up">↑</button><button type="button" class="btn btn-small rule-down" aria-label="Move camera rule down">↓</button></div>
+    <details><summary>Filename patterns</summary><div style="display:grid;gap:7px;margin-top:8px"><label class="field"><span>Shot</span><input class="mono" value="SH\d{3}"></label><label class="field"><span>Version</span><input class="mono" value="_v(\d+)"></label></div></details>
+    <span class="inline-note" id="rules-feedback" role="status">Editing a rule changes the draft and requires validation again.</span>
+  </div>
+  <div class="dialog-foot"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn btn-primary" id="apply-rules">Use these rules</button></div>
+</dialog>
+
+<dialog id="info-dialog" aria-labelledby="info-title">
+  <div class="dialog-head"><h2 id="info-title">Information</h2><button type="button" class="btn icon-button" data-close aria-label="Close information">×</button></div>
+  <div class="dialog-body"><dl class="shortcut-list" id="info-content"></dl><label class="field"><span>Full path</span><textarea id="info-path" class="mono" rows="4" readonly></textarea></label></div>
+  <div class="dialog-foot"><button type="button" class="btn btn-primary" data-close>Done</button></div>
+</dialog>
+
+<dialog id="delete-user-dialog" aria-labelledby="delete-user-title">
+  <div class="dialog-head"><h2 id="delete-user-title">Delete user</h2><button type="button" class="btn icon-button" data-close aria-label="Close delete user">×</button></div>
+  <div class="dialog-body"><p id="delete-user-message"></p><p class="muted">Earlier file history will keep this name. No files or project records are deleted.</p></div>
+  <div class="dialog-foot"><button type="button" class="btn" data-close>Cancel</button><button type="button" class="btn btn-danger" id="confirm-delete-user">Delete user</button></div>
+</dialog>
+
+<dialog id="shortcuts-dialog" aria-labelledby="shortcuts-title">
+  <div class="dialog-head"><h2 id="shortcuts-title">Keyboard shortcuts</h2><button type="button" class="btn icon-button" data-close aria-label="Close keyboard shortcuts">×</button></div>
+  <div class="dialog-body"><dl class="shortcut-list"><dt>Alt+1 … Alt+6</dt><dd>Open a main task or Settings</dd><dt>Ctrl+K</dt><dd>Focus the current search field</dd><dt>F6 / Shift+F6</dt><dd>Move between navigation, project picker and current work</dd><dt>Arrow keys</dt><dd>Move within tabs, menus and tree rows</dd><dt>Shift+F10 / Menu</dt><dd>Open the selected project or file menu</dd><dt>Arrow keys on a resize handle</dt><dd>Resize a panel or table column; Shift resizes faster</dd><dt>Escape</dt><dd>Close a menu or dialog, then clear a focused search</dd><dt>?</dt><dd>Open this shortcut list when not typing</dd></dl></div>
+  <div class="dialog-foot"><button type="button" class="btn btn-primary" data-close>Done</button></div>
+</dialog>
+
+<div class="context-menu" id="context-menu" role="menu" hidden></div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = (selector, root) => (root || document).querySelector(selector);
+  const $$ = (selector, root) => Array.from((root || document).querySelectorAll(selector));
+  const escapeHTML = value => String(value).replace(/[&<>'"]/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[character]));
+  const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
+  const timers = { incoming: null, copyFind: null, copy: null, backup: null, structure: null };
+  const viewNames = ['projects', 'structure', 'incoming', 'copy', 'backup', 'settings'];
+  const state = {
+    view: 'projects', projectScope: 'all', selectedProject: 'tidal', fileType: 'nuke', selectedFile: 'SH010_comp.nk',
+    structureStatus: 'draft', structureRevision: 7, structurePreviewStale: false,
+    incomingStatus: 'draft', incomingSelected: new Set(['beauty', 'camera', 'cryptomatte']), incomingActive: 'beauty', incomingConflictOpen: false, incomingAction: 'copy', incomingLayout: 'shot', incomingFilter: 'all', incomingConflict: 'skip', incomingDestinationOverrides: {}, pendingUserDelete: null,
+    copyStatus: 'draft', copySelected: new Set(['script', 'autosave', 'aep', 'exr']),
+    backupStatus: 'idle', users: [{name:'admin', selected:true}, {name:'maya', selected:false}, {name:'jules', selected:false}]
+  };
+
+  const projects = [
+    {id:'tidal', name:'00142_Northwind_Tidal_2026-11-05', path:'/mnt/Projects/00142_Northwind_Tidal_2026-11-05', files:38, favorite:true, recent:true, access:'Available'},
+    {id:'helios', name:'00141_Helios_Launch_2026-10-28', path:'/mnt/Projects/00141_Helios_Launch_2026-10-28', files:17, favorite:true, recent:true, access:'Available'},
+    {id:'aurora', name:'00139_Aurora_Onboarding_2026-10-14', path:'/mnt/Projects/00139_Aurora_Onboarding_2026-10-14', files:21, favorite:false, recent:false, access:'Offline'}
+  ];
+  const projectFiles = {
+    tidal: {
+      nuke: [
+        {id:'SH010_comp.nk', name:'SH010_comp.nk', versions:['v012','v011','v009'], version:'v012', modified:'Today 11:42', opened:'Today 11:48', by:'admin', folder:'Projects/Nuke/Timeline_01/SH010'},
+        {id:'SH010_precomp.nk', name:'SH010_precomp.nk', versions:['v004','v003'], version:'v004', modified:'Today 10:16', opened:'Yesterday', by:'maya', folder:'Projects/Nuke/Timeline_01/SH010'},
+        {id:'SH020_comp.nk', name:'SH020_comp.nk', versions:['v007','v006'], version:'v007', modified:'Today 09:03', opened:'Never', by:'—', folder:'Projects/Nuke/Timeline_01/SH020'}
+      ],
+      ae: [{id:'Tidal_Promo.aep', name:'Tidal_Promo.aep', versions:['03','02'], version:'03', modified:'Yesterday', opened:'Yesterday', by:'admin', folder:'Projects/After Effects'}]
+    },
+    helios: {nuke:[{id:'SH010_comp.nk', name:'SH010_comp.nk', versions:['v003'], version:'v003', modified:'Oct 28', opened:'Oct 28', by:'jules', folder:'Projects/Nuke/SH010'}], ae:[]},
+    aurora: {nuke:[], ae:[]}
+  };
+  const newProject = {sequences:[{name:'SEQ010', shots:['SH010','SH020']}], standalone:['SH900']};
+  const structure = {sequences:[{name:'SEQ030', shots:['SH010']}], standalone:['SH920'], added:false};
+
+  const beautyFrames = Array.from({length:104}, (_, index) => 1001 + index).filter(frame => ![1002,1048,1099].includes(frame));
+  const cryptoFrames = Array.from({length:100}, (_, index) => 1001 + index);
+  const incomingItems = [
+    {id:'beauty', name:'SH010_beauty_v003.####.exr', detail:'EXR sequence · 101 frames', count:101, task:'beauty', destination:'04_vfx/SH010/beauty/v003', members:beautyFrames.map(frame => `SH010_beauty_v003.${frame}.exr`)},
+    {id:'camera', name:'A012C003_261105.mxf', detail:'MXF video · 2.8 GB', count:1, task:'camera', destination:'Video/Footage/ARRI', members:['A012C003_261105.mxf']},
+    {id:'cryptomatte', name:'SH010_cryptomatte_v003.####.exr', detail:'EXR sequence · 100 frames', count:100, task:'cryptomatte', destination:'04_vfx/SH010/cryptomatte/v003', members:cryptoFrames.map(frame => `SH010_cryptomatte_v003.${frame}.exr`)}
+  ];
+  const conflictName = 'SH010_beauty_v003.1001.exr';
+  const copyItems = [
+    {id:'script', extension:'nk', name:'SH010_comp_v012.nk', folder:'Projects/Nuke/Timeline_01/SH010', size:'184 KB', conflict:false},
+    {id:'autosave', extension:'autosave', name:'SH010_comp_v012.nk.autosave', folder:'Projects/Nuke/Timeline_01/SH010', size:'190 KB', conflict:false},
+    {id:'aep', extension:'aep', name:'Tidal_Promo_03.aep', folder:'Projects/After Effects', size:'82 MB', conflict:false},
+    {id:'exr', extension:'exr', name:conflictName, folder:'04_vfx/SH010/beauty/v003', size:'18 MB', conflict:true}
+  ];
+  const backupItems = [
+    {name:'SH020_comp_v008.nk', folder:'Projects/Nuke/Timeline_01/SH020', modified:'11:58', comparison:'Missing at destination', action:'Copy', status:'pending'},
+    {name:'SH010_comp_v012.nk', folder:'Projects/Nuke/Timeline_01/SH010', modified:'11:42', comparison:'Source is newer', action:'Keep old file as 1_SH010_comp_v012.nk', status:'pending'},
+    {name:'SH010_precomp_v004.nk', folder:'Projects/Nuke/Timeline_01/SH010', modified:'10:16', comparison:'Missing at destination', action:'Copy', status:'pending'},
+    {name:'Tidal_Promo_04.aep', folder:'Projects/After Effects', modified:'09:44', comparison:'Source is newer', action:'Keep old file as 1_Tidal_Promo_04.aep', status:'pending'},
+    {name:'SH090_comp_v002.nk', folder:'Projects/Nuke/Timeline_02/SH090', modified:'Unavailable', comparison:'Cannot read file information', action:'Needs attention', status:'blocked'}
+  ];
+
+  function showDialog(id) {
+    const dialog = document.getElementById(id);
+    if (dialog && !dialog.open) {
+      dialog.showModal();
+      $$('.resizable-table', dialog).forEach(makeColumnsResizable);
+    }
+  }
+  function switchView(name) {
+    if (!viewNames.includes(name)) return;
+    state.view = name;
+    $$('.view').forEach(view => { view.hidden = view.id !== `view-${name}`; });
+    $$('.nav-button[data-view]').forEach(button => {
+      if (button.dataset.view === name) button.setAttribute('aria-current', 'page');
+      else button.removeAttribute('aria-current');
+    });
+    $$('.resizable-table', $(`#view-${name}`)).forEach(makeColumnsResizable);
+    $(`#view-${name}`).focus({preventScroll:true});
+  }
+  $$('.nav-button[data-view]').forEach(button => button.addEventListener('click', () => switchView(button.dataset.view)));
+  $$('[data-dialog]').forEach(button => button.addEventListener('click', () => showDialog(button.dataset.dialog)));
+  $$('[data-close]').forEach(button => button.addEventListener('click', () => button.closest('dialog').close()));
+  $$('dialog').forEach(dialog => dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); }));
+
+  function setupTabs(selector, activate) {
+    const tabs = $$(selector);
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => activate(tab));
+      tab.addEventListener('keydown', event => {
+        if (!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)) return;
+        event.preventDefault();
+        let next = tabs.indexOf(tab);
+        if (['ArrowRight','ArrowDown'].includes(event.key)) next = (next + 1) % tabs.length;
+        if (['ArrowLeft','ArrowUp'].includes(event.key)) next = (next - 1 + tabs.length) % tabs.length;
+        if (event.key === 'Home') next = 0;
+        if (event.key === 'End') next = tabs.length - 1;
+        activate(tabs[next]); tabs[next].focus();
+      });
+      tab.dataset.tabIndex = index;
+    });
+  }
+  function activateProjectScope(tab) {
+    $$('[data-scope]').forEach(button => { const active = button === tab; button.setAttribute('aria-selected', active); button.tabIndex = active ? 0 : -1; });
+    $('#project-list-panel').setAttribute('aria-labelledby', tab.id);
+    state.projectScope = tab.dataset.scope; renderProjects();
+  }
+  setupTabs('[data-scope]', activateProjectScope);
+  function activateFileType(tab) {
+    $$('[data-file-type]').forEach(button => { const active = button === tab; button.setAttribute('aria-selected', active); button.tabIndex = active ? 0 : -1; });
+    state.fileType = tab.dataset.fileType;
+    $('#nuke-files').hidden = state.fileType !== 'nuke'; $('#ae-files').hidden = state.fileType !== 'ae';
+    $$('.resizable-table', $(`#${state.fileType === 'nuke' ? 'nuke' : 'ae'}-files`)).forEach(makeColumnsResizable);
+  }
+  setupTabs('[data-file-type]', activateFileType);
+  function activateSettings(tab) {
+    $$('[data-settings]').forEach(button => { const active = button === tab; button.setAttribute('aria-selected', active); button.tabIndex = active ? 0 : -1; });
+    $$('.settings-layout [role="tabpanel"]').forEach(panel => { panel.hidden = panel.id !== `settings-${tab.dataset.settings}`; });
+  }
+  setupTabs('[data-settings]', activateSettings);
+
+  function setupSplitter(handle) {
+    const container = handle.parentElement;
+    const variable = handle.dataset.var, vertical = handle.dataset.direction === 'vertical';
+    const minimum = Number(handle.dataset.min), maximum = Number(handle.dataset.max);
+    function currentSize() { const raw = getComputedStyle(container).getPropertyValue(variable).trim(); return raw.endsWith('%') ? container.clientWidth * parseFloat(raw) / 100 : parseFloat(raw) || Number(handle.getAttribute('aria-valuenow')); }
+    function resize(size) {
+      const next = clamp(Math.round(size), minimum, maximum);
+      container.style.setProperty(variable, `${next}px`); handle.setAttribute('aria-valuenow', next);
+    }
+    handle.addEventListener('keydown', event => {
+      const keys = vertical ? ['ArrowUp','ArrowDown','Home','End'] : ['ArrowLeft','ArrowRight','Home','End'];
+      if (!keys.includes(event.key)) return;
+      event.preventDefault();
+      if (event.key === 'Home') resize(minimum); else if (event.key === 'End') resize(maximum);
+      else resize(currentSize() + (['ArrowRight','ArrowUp'].includes(event.key) ? 1 : -1) * (event.shiftKey ? 24 : 6));
+    });
+    handle.addEventListener('pointerdown', event => {
+      event.preventDefault(); handle.setPointerCapture(event.pointerId);
+      const start = vertical ? event.clientY : event.clientX, startSize = currentSize();
+      function move(moveEvent) { const position = vertical ? moveEvent.clientY : moveEvent.clientX; resize(startSize + (position - start) * (vertical ? -1 : 1)); }
+      function stop() { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', stop); }
+      handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', stop);
+    });
+  }
+  $$('.splitter').forEach(setupSplitter);
+  const sidebarHandle = $('#sidebar-resize');
+  function resizeSidebar(width) {
+    const next = clamp(Math.round(width), 176, 300); document.documentElement.style.setProperty('--sidebar-width', `${next}px`); sidebarHandle.setAttribute('aria-valuenow', next);
+  }
+  sidebarHandle.addEventListener('keydown', event => {
+    const current = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width'));
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); resizeSidebar(current + (event.key === 'ArrowRight' ? 1 : -1) * (event.shiftKey ? 24 : 6)); }
+    if (event.key === 'Home') { event.preventDefault(); resizeSidebar(176); }
+    if (event.key === 'End') { event.preventDefault(); resizeSidebar(300); }
+  });
+  sidebarHandle.addEventListener('pointerdown', event => {
+    event.preventDefault(); sidebarHandle.setPointerCapture(event.pointerId);
+    const startX = event.clientX, startWidth = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--sidebar-width'));
+    function move(moveEvent) { resizeSidebar(startWidth + moveEvent.clientX - startX); }
+    function stop() { sidebarHandle.removeEventListener('pointermove', move); sidebarHandle.removeEventListener('pointerup', stop); }
+    sidebarHandle.addEventListener('pointermove', move); sidebarHandle.addEventListener('pointerup', stop);
+  });
+
+  function makeColumnsResizable(table) {
+    if (table.dataset.resizersReady || !table.getClientRects().length) return;
+    table.dataset.resizersReady = 'true';
+    const headers = $$('thead th', table);
+    const group = document.createElement('colgroup');
+    headers.forEach(header => {
+      const column = document.createElement('col'), label = header.textContent.trim();
+      const fallback = header.classList.contains('select-cell') ? 38 : ({'File and folder':300,'Source':280,'Destination':340,'What will happen':310,'Used for':170}[label] || 220);
+      column.style.width = header.style.width || `${Math.max(header.classList.contains('select-cell') ? 38 : 70, header.getBoundingClientRect().width || fallback)}px`; group.appendChild(column);
+    });
+    table.insertBefore(group, table.firstChild);
+    headers.forEach((header, index) => {
+      const handle = document.createElement('button'); handle.type = 'button'; handle.className = 'column-resizer';
+      handle.setAttribute('aria-label', `Resize ${header.textContent.trim() || 'selection'} column`); handle.setAttribute('role', 'separator'); handle.setAttribute('aria-orientation', 'vertical');
+      function width() { return group.children[index].getBoundingClientRect().width || parseFloat(group.children[index].style.width); }
+      function resize(value) { const next = clamp(Math.round(value), 48, 700); group.children[index].style.width = `${next}px`; handle.setAttribute('aria-valuenow', next); }
+      handle.setAttribute('aria-valuenow', Math.round(width()));
+      handle.addEventListener('keydown', event => {
+        if (!['ArrowLeft','ArrowRight'].includes(event.key)) return; event.preventDefault(); resize(width() + (event.key === 'ArrowRight' ? 1 : -1) * (event.shiftKey ? 24 : 6));
+      });
+      handle.addEventListener('pointerdown', event => {
+        event.preventDefault(); event.stopPropagation(); handle.setPointerCapture(event.pointerId);
+        const startX = event.clientX, startWidth = width();
+        function move(moveEvent) { resize(startWidth + moveEvent.clientX - startX); }
+        function stop() { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', stop); }
+        handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', stop);
+      });
+      header.appendChild(handle);
+    });
+  }
+  $$('.resizable-table').forEach(makeColumnsResizable);
+  document.addEventListener('toggle', event => {
+    if (event.target.open) $$('.resizable-table', event.target).forEach(makeColumnsResizable);
+  }, true);
+
+  function projectPath(project) { return project.path; }
+  function renderProjects() {
+    const query = $('#project-search').value.trim().toLowerCase();
+    const visible = projects.filter(project => (!query || project.name.toLowerCase().includes(query)) && (state.projectScope === 'all' || (state.projectScope === 'favorites' && project.favorite) || (state.projectScope === 'recents' && project.recent)));
+    $('#project-rows').innerHTML = visible.map(project => `<tr tabindex="0" data-project-id="${escapeHTML(project.id)}" aria-selected="${project.id === state.selectedProject}" title="${escapeHTML(project.path)}"><td><button type="button" class="link-button favorite-button" data-favorite="${escapeHTML(project.id)}" aria-label="${project.favorite ? 'Remove' : 'Add'} ${escapeHTML(project.name)} ${project.favorite ? 'from' : 'to'} favorites" style="float:left;margin-right:7px;color:${project.favorite ? 'var(--warning)' : 'var(--quiet)'}">${project.favorite ? '★' : '☆'}</button><span class="cell-title">${escapeHTML(project.name)}</span></td><td class="number">${project.files}</td><td class="${project.access === 'Offline' ? 'warning' : ''}">${project.access}</td></tr>`).join('');
+    $('#project-count').textContent = `${visible.length} of ${projects.length} projects`;
+  }
+  function currentProject() { return projects.find(project => project.id === state.selectedProject) || projects[0]; }
+  function filePath(file) { return `${currentProject().path}/${file.folder}/${file.name.replace(/\.nk$/, `_${file.version}.nk`).replace(/\.aep$/, `_${file.version}.aep`)}`; }
+  function renderFiles() {
+    const project = currentProject(); $('#selected-project-name').textContent = project.name;
+    const files = projectFiles[project.id] || {nuke:[],ae:[]};
+    ['nuke','ae'].forEach(type => {
+      const query = $('#file-search').value.trim().toLowerCase();
+      const rows = files[type].filter(file => !query || `${file.name} ${file.folder}`.toLowerCase().includes(query));
+      $(`#${type}-file-rows`).innerHTML = rows.length ? rows.map(file => `<tr tabindex="0" data-file-id="${escapeHTML(file.id)}" data-file-type-value="${type}" aria-selected="${state.selectedFile === file.id}" title="${escapeHTML(filePath(file))}"><td><span class="cell-title">${escapeHTML(file.name)}</span><span class="cell-sub">${escapeHTML(file.folder)}</span></td><td><select class="version-select" data-version-file="${escapeHTML(file.id)}" data-version-type="${type}" aria-label="Version for ${escapeHTML(file.name)}">${file.versions.map(version => `<option ${version === file.version ? 'selected' : ''}>${version}</option>`).join('')}</select></td><td><button type="button" class="btn btn-small launch-file" data-launch-file="${escapeHTML(file.id)}" data-launch-type="${type}">Launch</button></td><td>${file.modified}</td><td class="last-opened">${file.opened}</td><td>${file.by}</td></tr>`).join('') : '<tr><td colspan="6" class="empty">No files in this view</td></tr>';
+    });
+  }
+  function selectProject(id) {
+    if (!projects.some(project => project.id === id)) return;
+    state.selectedProject = id; $('#current-project').value = id;
+    renderProjects(); renderFiles();
+  }
+  renderProjects(); renderFiles();
+  $('#project-search').addEventListener('input', renderProjects); $('#file-search').addEventListener('input', renderFiles);
+  $('#project-rows').addEventListener('click', event => {
+    const favorite = event.target.closest('[data-favorite]');
+    if (favorite) { const project = projects.find(item => item.id === favorite.dataset.favorite); project.favorite = !project.favorite; renderProjects(); return; }
+    const row = event.target.closest('[data-project-id]'); if (row) selectProject(row.dataset.projectId);
+  });
+  $('#current-project').addEventListener('change', event => selectProject(event.target.value));
+  $('#project-rows').addEventListener('keydown', event => {
+    const row = event.target.closest('[data-project-id]');
+    if (row && event.target === row && ['Enter',' '].includes(event.key)) { event.preventDefault(); selectProject(row.dataset.projectId); const selected = $(`[data-project-id="${row.dataset.projectId}"]`); if (selected) selected.focus(); }
+  });
+  $('#nuke-file-rows').addEventListener('click', handleFileClick); $('#ae-file-rows').addEventListener('click', handleFileClick);
+  function handleFileClick(event) {
+    const row = event.target.closest('[data-file-id]'); if (!row) return;
+    state.selectedFile = row.dataset.fileId; renderFiles();
+  }
+  function findFile(id, type) { const files = projectFiles[state.selectedProject] || {nuke:[],ae:[]}; return (files[type] || []).find(file => file.id === id); }
+  document.addEventListener('change', event => {
+    const select = event.target.closest('[data-version-file]');
+    if (select) { const file = findFile(select.dataset.versionFile, select.dataset.versionType); file.version = select.value; state.selectedFile = file.id; $('#file-feedback').textContent = `${file.version} selected for ${file.name}.`; renderFiles(); }
+  });
+  document.addEventListener('click', event => {
+    const launch = event.target.closest('[data-launch-file]');
+    if (!launch) return;
+    const file = findFile(launch.dataset.launchFile, launch.dataset.launchType); file.opened = 'Just now'; state.selectedFile = file.id;
+    $('#file-feedback').textContent = `Launching ${file.name} ${file.version} (simulated).`; renderFiles();
+  });
+  $('#add-existing-project').addEventListener('click', () => { $('#file-feedback').textContent = 'Choose a project folder in the native app. This prototype keeps the current list.'; });
+  $('#scan-projects').addEventListener('click', event => {
+    const button = event.currentTarget; button.disabled = true; $('#file-feedback').textContent = 'Scanning 3 projects…';
+    setTimeout(() => { button.disabled = false; $('#file-feedback').textContent = 'Scan complete: 38 files in Northwind Tidal; no catalog files removed.'; }, 700);
+  });
+
+  const contextMenu = $('#context-menu'); let contextTarget = null;
+  function closeContextMenu() { contextMenu.hidden = true; contextMenu.innerHTML = ''; }
+  function openContextMenu(target, x, y) {
+    contextTarget = target;
+    const isProject = Boolean(target.dataset.projectId);
+    const items = isProject ? ['Reveal in file manager','Copy path','Project information','Unregister from launcher'] : ['Reveal in file manager','Copy path','File information'];
+    contextMenu.innerHTML = items.map((item, index) => `<button type="button" role="menuitem" data-menu-action="${index}" ${index === 0 ? '' : 'tabindex="-1"'}>${item}</button>`).join('');
+    contextMenu.hidden = false;
+    const left = Math.min(x, window.innerWidth - 220), top = Math.min(y, window.innerHeight - contextMenu.offsetHeight - 10);
+    contextMenu.style.left = `${Math.max(8,left)}px`; contextMenu.style.top = `${Math.max(8,top)}px`;
+    $('button', contextMenu).focus();
+  }
+  document.addEventListener('contextmenu', event => {
+    const target = event.target.closest('[data-project-id], [data-file-id]'); if (!target) return;
+    event.preventDefault(); if (target.dataset.projectId) selectProject(target.dataset.projectId); openContextMenu(target, event.clientX, event.clientY);
+  });
+  document.addEventListener('keydown', event => {
+    if ((event.key === 'F10' && event.shiftKey) || event.key === 'ContextMenu') {
+      const target = event.target.closest('[data-project-id], [data-file-id]');
+      if (target) { event.preventDefault(); const rect = target.getBoundingClientRect(); openContextMenu(target, rect.left + 20, rect.bottom + 3); }
+    }
+  });
+  contextMenu.addEventListener('keydown', event => {
+    const items = $$('button', contextMenu), index = items.indexOf(document.activeElement);
+    if (event.key === 'Escape') { event.preventDefault(); closeContextMenu(); if (contextTarget) contextTarget.focus(); }
+    if (['ArrowDown','ArrowUp','Home','End'].includes(event.key)) {
+      event.preventDefault(); let next = index;
+      if (event.key === 'ArrowDown') next = (index + 1) % items.length; if (event.key === 'ArrowUp') next = (index - 1 + items.length) % items.length;
+      if (event.key === 'Home') next = 0; if (event.key === 'End') next = items.length - 1;
+      items.forEach((item, itemIndex) => item.tabIndex = itemIndex === next ? 0 : -1); items[next].focus();
+    }
+  });
+  contextMenu.addEventListener('click', event => {
+    const button = event.target.closest('[data-menu-action]'); if (!button || !contextTarget) return;
+    const action = Number(button.dataset.menuAction); const isProject = Boolean(contextTarget.dataset.projectId);
+    let name, path;
+    if (isProject) { const project = projects.find(item => item.id === contextTarget.dataset.projectId); name = project.name; path = project.path; }
+    else { const file = findFile(contextTarget.dataset.fileId, contextTarget.dataset.fileTypeValue); name = `${file.name} ${file.version}`; path = filePath(file); }
+    closeContextMenu();
+    if (action === 0) { $('#file-feedback').textContent = `Reveal requested for ${name} (simulated).`; contextTarget.focus(); }
+    else if (action === 1) { $('#info-title').textContent = 'Path ready to copy'; $('#info-content').innerHTML = `<dt>Selected item</dt><dd>${escapeHTML(name)}</dd>`; $('#info-path').value = path; showDialog('info-dialog'); $('#info-path').focus(); $('#info-path').select(); }
+    else if (action === 2) { $('#info-title').textContent = isProject ? 'Project information' : 'File information'; $('#info-content').innerHTML = `<dt>Name</dt><dd>${escapeHTML(name)}</dd><dt>Location</dt><dd>${escapeHTML(path)}</dd><dt>Access</dt><dd>${isProject ? escapeHTML(currentProject().access) : 'Available'}</dd>`; $('#info-path').value = path; showDialog('info-dialog'); }
+    else { $('#file-feedback').textContent = `${name} remains on disk; only its launcher entry would be removed.`; contextTarget.focus(); }
+  });
+  document.addEventListener('click', event => { if (!event.target.closest('#context-menu')) closeContextMenu(); });
+  document.addEventListener('scroll', closeContextMenu, true);
+
+  function updateNewProjectPreview() {
+    const clean = value => value.trim().replace(/[\\/]/g, '_') || 'Untitled';
+    $('#new-root-preview').textContent = `${$('#new-parent').value.replace(/\/$/, '')}/${clean($('#new-number').value)}_${clean($('#new-client').value)}_${clean($('#new-name').value)}_2026-11-05`;
+    $('#new-project-additions').innerHTML = [...newProject.sequences.map(sequence => `${escapeHTML(sequence.name)} → ${sequence.shots.map(escapeHTML).join(', ')}`), `Standalone → ${newProject.standalone.map(escapeHTML).join(', ')}`].join('<br>');
+  }
+  $$('.new-project-input').forEach(input => input.addEventListener('input', updateNewProjectPreview));
+  $('#new-parent').addEventListener('input', updateNewProjectPreview);
+  $('#open-new-project').addEventListener('click', () => { updateNewProjectPreview(); showDialog('new-project-dialog'); });
+  function addNewSequence() { const number = 10 + newProject.sequences.length * 10; newProject.sequences.push({name:`SEQ${String(number).padStart(3,'0')}`, shots:[]}); updateNewProjectPreview(); }
+  function addNewShot(standalone) {
+    if (standalone) newProject.standalone.push(`SH${900 + newProject.standalone.length * 10}`);
+    else { const sequence = newProject.sequences[newProject.sequences.length - 1]; sequence.shots.push(`SH${String((sequence.shots.length + 1) * 10).padStart(3,'0')}`); }
+    updateNewProjectPreview();
+  }
+  $('#new-add-sequence').addEventListener('click', addNewSequence); $('#new-add-shot').addEventListener('click', () => addNewShot(false)); $('#new-add-standalone').addEventListener('click', () => addNewShot(true));
+  function toggleNukeOptions(checkbox, container) { $$(`input, select`, $(container)).forEach(control => { control.disabled = !checkbox.checked; }); }
+  $('#new-generate-nuke').addEventListener('change', event => toggleNukeOptions(event.target, '#new-nuke-options'));
+  $('#new-project-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const name = `${$('#new-number').value.trim()}_${$('#new-client').value.trim()}_${$('#new-name').value.trim()}_2026-11-05`;
+    const id = `project-${projects.length + 1}`, path = `${$('#new-parent').value.replace(/\/$/, '')}/${name}`;
+    const scriptCount = $('#new-generate-nuke').checked ? newProject.sequences.reduce((sum, item) => sum + item.shots.length, 0) + newProject.standalone.length : 0;
+    projects.push({id,name,path,files:scriptCount,favorite:false,recent:true,access:'Available'}); projectFiles[id] = {nuke:[],ae:[]};
+    const option = document.createElement('option'); option.value = id; option.textContent = name; $('#current-project').appendChild(option);
+    $('#new-project-dialog').close(); selectProject(id); switchView('projects');
+    $('#file-feedback').textContent = `Added ${name} with ${scriptCount} planned Nuke scripts (simulated).`;
+  });
+
+  function invalidateStructure() {
+    if (state.structureStatus === 'running') return;
+    state.structureStatus = 'draft'; state.structurePreviewStale = true; structure.added = false;
+    $('#structure-state').textContent = 'Draft · regenerate the preview after this change'; $('#structure-state').dataset.tone = 'warning';
+    $('#execute-structure').disabled = true; $('#structure-action-reason').textContent = 'The preview is out of date. Regenerate and check it first.';
+  }
+  function checkedStructureFolders() { return $$('[data-structure-folder]:checked').map(input => input.dataset.structureFolder); }
+  function namedStructureSequences() { return structure.sequences.filter(sequence => sequence.name.trim()).map(sequence => ({name:sequence.name.trim(),shots:sequence.shots.filter(shot => shot.trim())})); }
+  function structureAdditionCount() {
+    const folders = checkedStructureFolders().length;
+    return folders * (namedStructureSequences().length + namedStructureSequences().reduce((sum, sequence) => sum + sequence.shots.length, 0) + structure.standalone.filter(shot => shot.trim()).length);
+  }
+  function renderStructurePreview() {
+    const root = currentProject().name, folders = checkedStructureFolders();
+    const generate = $('#structure-generate-nuke').checked, custom = $('#structure-resolution').value === 'custom';
+    const resolution = custom ? `${$('#structure-width').value} × ${$('#structure-height').value}` : $('#structure-resolution').value;
+    const settings = `${$('#structure-fps').value} fps · ${resolution}${$('#structure-proxy').checked ? ' · proxy' : ''}${$('#structure-aces').checked ? ' · ACES' : ''}`;
+    const useParent = $('#use-parent-sequence').checked;
+    const destinations = folders.map(folder => {
+      const base = $('#structure-template').value === 'checked' ? folder : $('#structure-template').value === 'commercial' ? '04_vfx' : '03_work';
+      const parent = folder.split('/').pop();
+      const sequenceLines = namedStructureSequences().map(sequence => `<li><span class="folder new-item">${escapeHTML(sequence.name)}/ · new</span><ul>${sequence.shots.map(shot => { const scriptSequence = useParent ? parent : sequence.name; return `<li><span class="folder new-item">${escapeHTML(shot)}/</span>${generate ? `<ul><li class="new-item">${escapeHTML(scriptSequence)}_${escapeHTML(shot)}_comp_v001.nk</li></ul>` : ''}</li>`; }).join('')}</ul></li>`).join('');
+      const standaloneLines = structure.standalone.filter(shot => shot.trim()).map(shot => `<li><span class="folder new-item">${escapeHTML(shot)}/ · standalone</span>${generate ? `<ul><li class="new-item">${escapeHTML(useParent ? `${parent}_${shot}` : shot)}_comp_v001.nk</li></ul>` : ''}</li>`).join('');
+      return `<li><span class="folder">${escapeHTML(base)}/ · checked destination</span><ul>${sequenceLines}${standaloneLines}</ul></li>`;
+    }).join('');
+    $('#structure-preview').innerHTML = `<ul><li><span class="folder existing-item">${escapeHTML(root)}/</span><ul><li><span class="folder existing-item">04_vfx/SEQ010/SH010/ · existing</span><ul><li class="existing-item">SEQ010_SH010_comp_v012.nk · unchanged</li></ul></li>${destinations}</ul></li></ul><p class="small muted" style="margin:5px 6px">${generate ? `Nuke: ${settings}` : 'No Nuke scripts will be generated.'}</p>`;
+    $('#structure-state').textContent = `${folders.length} destination ${folders.length === 1 ? 'folder' : 'folders'} selected · ${structureAdditionCount()} additions`;
+  }
+  function renderStructureAdditions() {
+    $('#structure-additions').innerHTML = structure.sequences.map((sequence, sequenceIndex) => `<div class="structure-sequence"><div class="input-row"><input data-sequence-name="${sequenceIndex}" value="${escapeHTML(sequence.name)}" placeholder="Sequence name, e.g. SEQ030" aria-label="Sequence ${sequenceIndex + 1} name"><button type="button" class="btn btn-small" data-add-shot="${sequenceIndex}">Add shot</button><button type="button" class="btn btn-small" data-remove-sequence="${sequenceIndex}">Remove</button></div><div class="structure-shot-list">${sequence.shots.map((shot, shotIndex) => `<div class="input-row"><input data-shot-name="${sequenceIndex}:${shotIndex}" value="${escapeHTML(shot)}" placeholder="Shot name, e.g. SH010" aria-label="Shot name in sequence ${sequenceIndex + 1}"><button type="button" class="btn btn-small" data-remove-shot="${sequenceIndex}:${shotIndex}" aria-label="Remove shot">Remove</button></div>`).join('')}</div></div>`).join('');
+    $('#standalone-shot-list').innerHTML = structure.standalone.map((shot, index) => `<div class="input-row" style="margin-top:4px"><input data-standalone-name="${index}" value="${escapeHTML(shot)}" placeholder="Standalone shot name" aria-label="Standalone shot ${index + 1} name"><button type="button" class="btn btn-small" data-remove-standalone="${index}">Remove</button></div>`).join('');
+  }
+  function addStructureSequence() { structure.sequences.push({name:'', shots:['']}); renderStructureAdditions(); invalidateStructure(); }
+  function addStructureShot(sequenceIndex) { structure.sequences[sequenceIndex].shots.push(''); renderStructureAdditions(); invalidateStructure(); }
+  function addStandaloneShot() { structure.standalone.push(''); renderStructureAdditions(); invalidateStructure(); }
+  $('#add-sequence').addEventListener('click', addStructureSequence); $('#add-standalone-shot').addEventListener('click', addStandaloneShot);
+  $('#structure-additions').addEventListener('click', event => {
+    const add = event.target.closest('[data-add-shot]'), removeSequence = event.target.closest('[data-remove-sequence]'), removeShot = event.target.closest('[data-remove-shot]');
+    if (add) addStructureShot(Number(add.dataset.addShot));
+    if (removeSequence) { structure.sequences.splice(Number(removeSequence.dataset.removeSequence), 1); renderStructureAdditions(); invalidateStructure(); }
+    if (removeShot) { const [sequenceIndex, shotIndex] = removeShot.dataset.removeShot.split(':').map(Number); structure.sequences[sequenceIndex].shots.splice(shotIndex, 1); renderStructureAdditions(); invalidateStructure(); }
+  });
+  $('#standalone-shot-list').addEventListener('click', event => { const button = event.target.closest('[data-remove-standalone]'); if (button) { structure.standalone.splice(Number(button.dataset.removeStandalone), 1); renderStructureAdditions(); invalidateStructure(); } });
+  $('#structure-fields').addEventListener('input', event => {
+    const target = event.target;
+    if (target.dataset.sequenceName !== undefined) structure.sequences[Number(target.dataset.sequenceName)].name = target.value;
+    if (target.dataset.shotName !== undefined) { const [sequenceIndex, shotIndex] = target.dataset.shotName.split(':').map(Number); structure.sequences[sequenceIndex].shots[shotIndex] = target.value; }
+    if (target.dataset.standaloneName !== undefined) structure.standalone[Number(target.dataset.standaloneName)] = target.value;
+    invalidateStructure();
+  });
+  $$('#structure-fields input, #structure-fields select').forEach(control => control.addEventListener('change', invalidateStructure));
+  $('#regenerate-structure').addEventListener('click', () => {
+    state.structureRevision += 1; state.structurePreviewStale = false; state.structureStatus = 'draft';
+    $('#structure-revision').textContent = `Preview ${state.structureRevision}`; $('#structure-preview-note').textContent = 'Preview matches the current additions.';
+    $('#structure-state').textContent = 'Draft · check the current preview before adding'; $('#structure-state').dataset.tone = '';
+    $('#structure-action-reason').textContent = 'Check the current preview to enable Add to project.'; $('#execute-structure').disabled = true;
+    renderStructurePreview();
+  });
+  $('#validate-structure').addEventListener('click', () => {
+    if (state.structurePreviewStale) { $('#structure-action-reason').textContent = 'Regenerate the preview before checking these additions.'; $('#structure-action-reason').dataset.tone = 'warning'; return; }
+    if (!checkedStructureFolders().length) { $('#structure-action-reason').textContent = 'Check at least one destination folder first.'; return; }
+    const count = structureAdditionCount();
+    if (!count) { $('#structure-action-reason').textContent = 'Type a sequence or shot name before checking.'; return; }
+    state.structureStatus = 'ready'; $('#structure-state').textContent = `Ready · preview ${state.structureRevision} checked`; $('#structure-state').dataset.tone = 'ready';
+    $('#structure-action-reason').textContent = `${count} additions reviewed. Existing files will not be overwritten.`; $('#structure-action-reason').dataset.tone = ''; $('#execute-structure').disabled = false;
+  });
+  function setStructureLocks(locked) {
+    $('#structure-fields').disabled = locked; $('#execute-structure').disabled = locked || state.structureStatus !== 'ready'; $('#validate-structure').disabled = locked;
+    ['#add-sequence','#add-standalone-shot','[data-dialog="templates-dialog"]'].forEach(selector => { $(selector).disabled = locked; });
+  }
+  $('#execute-structure').addEventListener('click', () => {
+    if (state.structureStatus !== 'ready') return;
+    state.structureStatus = 'running'; setStructureLocks(true);
+    $('#structure-progress').hidden = false; $('#structure-state').textContent = 'Adding reviewed items…';
+    const total = structureAdditionCount(); let completed = 0;
+    function tick() {
+      completed += 1; const percent = Math.round(completed / total * 100);
+      $('#structure-progress-count').textContent = `${completed} / ${total}`; $('#structure-progress-fill').style.width = `${percent}%`; $('#structure-progressbar').setAttribute('aria-valuenow', percent);
+      if (completed < total) { timers.structure = setTimeout(tick, 350); return; }
+      state.structureStatus = 'complete'; structure.added = true; setStructureLocks(false);
+      $('#structure-state').textContent = `Added ${total} additions to the project (simulated)`; $('#structure-state').dataset.tone = 'ready'; $('#structure-action-reason').textContent = 'Completed. Edit the additions to start a new draft.';
+    }
+    tick();
+  });
+  $('#structure-generate-nuke').addEventListener('change', event => { $$('.nuke-option input').forEach(input => { input.disabled = !event.target.checked; }); });
+  $('#structure-resolution').addEventListener('change', () => { $('#structure-custom-dimensions').hidden = $('#structure-resolution').value !== 'custom'; });
+  $('#save-template').addEventListener('click', () => { $('#template-feedback').textContent = 'Template saved for future additions (simulated).'; invalidateStructure(); });
+  $('#add-template-folder').addEventListener('click', () => { $('#template-feedback').textContent = 'New folder row added to the template draft.'; });
+  $$('.rule-up, .rule-down').forEach(button => button.addEventListener('click', () => { const row = button.closest('.rule-row'); if (button.classList.contains('rule-up') && row.previousElementSibling?.classList.contains('rule-row')) row.parentElement.insertBefore(row, row.previousElementSibling); if (button.classList.contains('rule-down') && row.nextElementSibling?.classList.contains('rule-row')) row.parentElement.insertBefore(row.nextElementSibling, row); }));
+  renderStructureAdditions(); renderStructurePreview();
+
+  function incomingDestination(item) {
+    if (state.incomingDestinationOverrides[item.id]) return state.incomingDestinationOverrides[item.id];
+    if (state.incomingLayout === 'flat') return 'Organized';
+    if (state.incomingLayout === 'department') return item.task === 'camera' ? 'Video/Footage/ARRI' : `03_render/SH010/${item.task}/v003`;
+    return item.destination;
+  }
+  function renderIncoming() {
+    const visibleItems = incomingItems.filter(item => state.incomingFilter === 'all' || item.id === state.incomingFilter || (state.incomingFilter === 'A012C003' && item.id === 'camera'));
+    $('#incoming-rows').innerHTML = visibleItems.map(item => {
+      const selected = state.incomingSelected.has(item.id), active = state.incomingActive === item.id, destination = incomingDestination(item);
+      const gap = item.id === 'beauty' ? '<span class="cell-sub warning">Missing frames: 1002, 1048, 1099</span>' : '';
+      const members = item.id === 'beauty' ? `<details class="row-details"><summary>101 frame files</summary><div class="mono small muted" style="max-height:130px;overflow:auto;margin-top:5px">${item.members.map(name => `${escapeHTML(name)}${name === conflictName ? ' · existing destination' : ''}`).join('<br>')}</div></details>` : '';
+      const editor = item.id === 'beauty' && active ? `<details class="row-details" data-conflict-details ${state.incomingConflictOpen ? 'open' : ''}><summary class="warning">1 existing file</summary><div class="conflict-editor"><label class="field"><span>Destination folder</span><input class="mono incoming-destination-edit" value="${escapeHTML(destination)}" aria-label="Beauty destination folder"></label><label class="field"><span>Existing files</span><select id="incoming-conflict-policy" aria-label="Conflict choice for ${conflictName}"><option value="skip" ${state.incomingConflict === 'skip' ? 'selected' : ''}>Skip</option><option value="both" ${state.incomingConflict === 'both' ? 'selected' : ''}>Keep both</option><option value="replace" ${state.incomingConflict === 'replace' ? 'selected' : ''}>Replace</option></select></label><span class="cell-sub" style="grid-column:1/-1">${conflictName}</span></div></details>` : '';
+      return `<tr data-incoming-row="${item.id}" aria-selected="${active}"><td class="select-cell"><input type="checkbox" class="incoming-check" data-incoming="${item.id}" ${selected ? 'checked' : ''} aria-label="Select ${escapeHTML(item.name)}"></td><td><span class="cell-title" title="${escapeHTML(item.name)}">${escapeHTML(item.name)}</span><span class="cell-sub">${escapeHTML(item.detail)}</span>${gap}${members}</td><td><span class="mono">${escapeHTML(destination)}/</span>${editor}</td><td>${item.count} ${item.count === 1 ? 'file' : 'frames'}</td></tr>`;
+    }).join('');
+    const selectedItems = incomingItems.filter(item => state.incomingSelected.has(item.id));
+    const count = selectedItems.reduce((sum,item) => sum + item.count, 0);
+    $('#incoming-selection').textContent = `${selectedItems.length} items selected · ${count} files`;
+    $('#incoming-scan-note').textContent = `${count} files · ${selectedItems.length} items`;
+    const hasConflict = state.incomingSelected.has('beauty');
+    $('#incoming-conflict-summary').hidden = !hasConflict;
+    if (hasConflict) $('#incoming-conflict-summary').textContent = `1 existing file · ${state.incomingConflict === 'skip' ? 'Skip' : state.incomingConflict === 'both' ? 'Keep both' : 'Replace'}`;
+    $('#incoming-destination-tree').innerHTML = `<ul><li><span class="folder">${escapeHTML($('#incoming-destination').value.replace(/\/$/, '').split('/').pop())}/</span><ul>${selectedItems.map(item => { const conflictPreview = state.incomingConflict === 'skip' ? `<li class="conflict-item">${conflictName} · already here</li>` : state.incomingConflict === 'both' ? `<li class="new-item">1_${conflictName} · will copy</li>` : `<li class="warning">${conflictName} · will replace</li>`; return `<li><span class="folder">${escapeHTML(incomingDestination(item))}/</span>${item.id === 'beauty' ? `<ul>${conflictPreview}<li class="new-item">SH010_beauty_v003.1003.exr · will copy</li></ul>` : '<ul><li class="new-item">Planned files</li></ul>'}</li>`; }).join('')}</ul></li></ul>`;
+    $('#execute-incoming').textContent = `${state.incomingAction === 'copy' ? 'Copy' : 'Move'} selected`;
+  }
+  function invalidateIncoming() {
+    if (['running','paused','cancelling'].includes(state.incomingStatus)) return;
+    state.incomingStatus = 'draft'; $('#incoming-state').textContent = 'Draft · changes require validation'; $('#incoming-state').dataset.tone = 'warning'; $('#execute-incoming').disabled = true;
+    $('#incoming-results').hidden = true;
+  }
+  $('#incoming-rows').addEventListener('click', event => { const row = event.target.closest('[data-incoming-row]'); if (row && !event.target.closest('input,select,button,summary')) { state.incomingActive = row.dataset.incomingRow; renderIncoming(); } });
+  $('#incoming-rows').addEventListener('toggle', event => { if (event.target.matches('[data-conflict-details]')) state.incomingConflictOpen = event.target.open; }, true);
+  $('#incoming-rows').addEventListener('change', event => {
+    if (event.target.matches('.incoming-check')) { if (event.target.checked) state.incomingSelected.add(event.target.dataset.incoming); else state.incomingSelected.delete(event.target.dataset.incoming); invalidateIncoming(); renderIncoming(); }
+    if (event.target.id === 'incoming-conflict-policy') { state.incomingConflict = event.target.value; invalidateIncoming(); renderIncoming(); }
+    if (event.target.matches('.incoming-destination-edit')) { state.incomingDestinationOverrides.beauty = event.target.value.trim() || '04_vfx/SH010/beauty/v003'; invalidateIncoming(); renderIncoming(); }
+  });
+  $('#incoming-rows').addEventListener('input', event => { if (event.target.matches('.incoming-destination-edit')) invalidateIncoming(); });
+  $$('.incoming-draft-input').forEach(control => control.addEventListener('change', event => { if (event.target.id === 'incoming-layout') { state.incomingLayout = event.target.value; state.incomingDestinationOverrides = {}; } invalidateIncoming(); renderIncoming(); }));
+  $$('input[name="incoming-action"]').forEach(input => input.addEventListener('change', event => { state.incomingAction = event.target.value; invalidateIncoming(); renderIncoming(); }));
+  $('#incoming-select-all').addEventListener('click', () => { incomingItems.forEach(item => state.incomingSelected.add(item.id)); invalidateIncoming(); renderIncoming(); });
+  $('#incoming-clear').addEventListener('click', () => { state.incomingSelected.clear(); invalidateIncoming(); renderIncoming(); });
+  $$('[data-source-filter]').forEach(button => button.addEventListener('click', () => { $$('[data-source-filter]').forEach(item => item.setAttribute('aria-pressed', item === button)); state.incomingFilter = button.dataset.sourceFilter; renderIncoming(); }));
+  $('#suggest-folders').addEventListener('click', () => { state.incomingLayout = 'shot'; $('#incoming-layout').value = 'shot'; $('#assistant-feedback').textContent = 'Suggested Shot / task / version. Review the changed destinations.'; invalidateIncoming(); renderIncoming(); });
+  $('#apply-rules').addEventListener('click', () => { $('#rules-dialog').close(); invalidateIncoming(); $('#incoming-state').textContent = 'Draft · filename rules changed; validate again'; });
+  $('#scan-incoming').addEventListener('click', () => {
+    const button = $('#scan-incoming'); button.disabled = true; $('#incoming-scan-note').textContent = 'Scanning source folders… 0 / 202 files'; let count = 0;
+    const timer = setInterval(() => { count = Math.min(202, count + 34); $('#incoming-scan-note').textContent = count === 202 ? 'Scan complete · 202 files available' : `Scanning source folders… ${count} / 202 files`; if (count === 202) { clearInterval(timer); button.disabled = false; invalidateIncoming(); } }, 110);
+  });
+  $('#validate-incoming').addEventListener('click', () => {
+    const count = incomingItems.filter(item => state.incomingSelected.has(item.id)).reduce((sum,item) => sum + item.count, 0);
+    if (!count) { $('#incoming-state').textContent = 'Select at least one file before validating.'; $('#incoming-state').dataset.tone = 'error'; return; }
+    state.incomingStatus = 'ready'; $('#execute-incoming').disabled = false;
+    const conflict = state.incomingSelected.has('beauty') ? 1 : 0, policy = state.incomingConflict;
+    const actionable = policy === 'skip' ? count - conflict : count;
+    $('#incoming-state').textContent = `Ready · ${actionable} to ${state.incomingAction}${conflict && policy === 'skip' ? ' · 1 will be skipped' : ''}`; $('#incoming-state').dataset.tone = 'ready';
+  });
+  function setIncomingRunningLocks(locked) {
+    $('#incoming-fields').disabled = locked; $('#validate-incoming').disabled = locked; $('#execute-incoming').disabled = locked;
+    $$('input[name="incoming-action"]').forEach(input => input.disabled = locked);
+    $('#pause-incoming').hidden = !locked; $('#cancel-incoming').hidden = !locked; if (locked) { $('#cancel-incoming').disabled = false; $('#pause-incoming').textContent = 'Pause'; }
+  }
+  function incomingMembers() { return incomingItems.filter(item => state.incomingSelected.has(item.id)).flatMap(item => item.members); }
+  $('#execute-incoming').addEventListener('click', () => {
+    if (state.incomingStatus !== 'ready') return;
+    const members = incomingMembers(), total = members.length, policy = state.incomingConflict;
+    let index = 0, copied = 0, skipped = 0;
+    state.incomingStatus = 'running'; setIncomingRunningLocks(true); $('#incoming-results').hidden = true; $('#incoming-progress').hidden = false;
+    $('#incoming-state').textContent = `${state.incomingAction === 'copy' ? 'Copying' : 'Moving'} ${total} exact files`; $('#incoming-state').dataset.tone = '';
+    function tick() {
+      if (state.incomingStatus === 'paused') { timers.incoming = setTimeout(tick, 150); return; }
+      if (state.incomingStatus === 'cancelling') {
+        const cancelled = total - index; state.incomingStatus = 'cancelled'; setIncomingRunningLocks(false);
+        $('#incoming-progress-label').textContent = 'Cancelled'; $('#incoming-state').textContent = `Cancelled · ${copied} completed · ${skipped} skipped · ${cancelled} not started`; $('#incoming-state').dataset.tone = 'warning';
+        $('#incoming-results').hidden = false; $('#incoming-results').open = true; $('#incoming-result-content').innerHTML = `<p>Stopped before all files were ${state.incomingAction === 'copy' ? 'copied' : 'moved'}. Completed files remain at the destination; no rollback was attempted.</p>`;
+        $('#execute-incoming').disabled = true; $('#incoming-current-file').textContent = 'No success was recorded for unfinished files.'; return;
+      }
+      if (index >= total) {
+        state.incomingStatus = 'complete'; setIncomingRunningLocks(false); $('#execute-incoming').disabled = true;
+        $('#incoming-progress-label').textContent = 'Complete'; $('#incoming-state').textContent = `${state.incomingAction === 'copy' ? 'Copied' : 'Moved'} ${copied} · ${skipped} skipped`; $('#incoming-state').dataset.tone = 'ready';
+        $('#incoming-results').hidden = false; $('#incoming-results').open = false; $('#incoming-result-content').innerHTML = `<ul class="result-list"><li>${copied} files ${state.incomingAction === 'copy' ? 'copied' : 'moved'} successfully</li>${skipped ? `<li>${skipped} existing file skipped: ${conflictName}</li>` : ''}</ul>`;
+        $('#incoming-current-file').textContent = 'Finished at the last reviewed file.'; return;
+      }
+      const current = members[index]; index += 1;
+      if (current === conflictName && policy === 'skip') skipped += 1; else copied += 1;
+      const percent = Math.round(index / total * 100);
+      $('#incoming-progress-count').textContent = `${index} / ${total} files`; $('#incoming-progress-fill').style.width = `${percent}%`; $('#incoming-progressbar').setAttribute('aria-valuenow', percent);
+      $('#incoming-current-file').textContent = current; timers.incoming = setTimeout(tick, 45);
+    }
+    tick();
+  });
+  $('#pause-incoming').addEventListener('click', () => { if (state.incomingStatus === 'running') { state.incomingStatus = 'paused'; $('#pause-incoming').textContent = 'Resume'; $('#incoming-state').textContent = 'Paused at the current file boundary'; } else if (state.incomingStatus === 'paused') { state.incomingStatus = 'running'; $('#pause-incoming').textContent = 'Pause'; $('#incoming-state').textContent = 'Transfer resumed'; } });
+  $('#cancel-incoming').addEventListener('click', () => { if (['running','paused'].includes(state.incomingStatus)) { state.incomingStatus = 'cancelling'; $('#cancel-incoming').disabled = true; $('#incoming-state').textContent = 'Cancelling after the current file'; } });
+  renderIncoming();
+
+  function visibleCopyItems() {
+    const extensions = new Set($$('.copy-extension:checked').map(input => input.value));
+    const custom = $('#copy-custom-extension').value.trim().replace(/^\./, '').toLowerCase(); if (custom) extensions.add(custom);
+    return copyItems.filter(item => extensions.has(item.extension));
+  }
+  function renderCopyFiles() {
+    const items = visibleCopyItems();
+    $('#copy-file-rows').innerHTML = items.length ? items.map(item => `<tr><td class="select-cell"><input type="checkbox" class="copy-check" data-copy-id="${item.id}" ${state.copySelected.has(item.id) ? 'checked' : ''} aria-label="Select ${escapeHTML(item.name)}"></td><td><span class="cell-title">${escapeHTML(item.name)}</span><span class="cell-sub">${escapeHTML(item.folder)}</span></td><td class="mono">${escapeHTML(item.folder)}/${escapeHTML(item.name)}</td><td>${item.size}</td><td class="${item.conflict ? 'warning' : ''}" data-copy-state="${item.id}">${item.conflict ? 'Already exists' : 'New file'}</td></tr>`).join('') : '<tr><td colspan="5" class="empty">No files match the selected types</td></tr>';
+    const selected = items.filter(item => state.copySelected.has(item.id)), conflicts = selected.filter(item => item.conflict).length, skip = $('#copy-conflict').value === 'skip' ? conflicts : 0;
+    $('#copy-list-summary').textContent = `${selected.length} selected · ${selected.length - skip} will copy · ${skip} will be skipped`;
+  }
+  function invalidateCopy() {
+    if (state.copyStatus === 'running' || state.copyStatus === 'cancelling') return;
+    state.copyStatus = 'draft'; $('#execute-copy').disabled = true; $('#copy-state').textContent = 'Draft · validate the current file list before copying'; $('#copy-state').dataset.tone = ''; $('#copy-results').hidden = true;
+  }
+  $$('.copy-draft-input, .copy-extension').forEach(input => input.addEventListener('change', () => { invalidateCopy(); renderCopyFiles(); }));
+  $('#copy-custom-extension').addEventListener('input', () => { invalidateCopy(); renderCopyFiles(); });
+  $('#copy-file-rows').addEventListener('change', event => { if (event.target.matches('.copy-check')) { if (event.target.checked) state.copySelected.add(event.target.dataset.copyId); else state.copySelected.delete(event.target.dataset.copyId); invalidateCopy(); renderCopyFiles(); } });
+  $('#copy-select-all').addEventListener('click', () => { visibleCopyItems().forEach(item => state.copySelected.add(item.id)); invalidateCopy(); renderCopyFiles(); });
+  $('#copy-clear').addEventListener('click', () => { state.copySelected.clear(); invalidateCopy(); renderCopyFiles(); });
+  $('#copy-conflict').addEventListener('change', () => { invalidateCopy(); renderCopyFiles(); });
+  $('#find-copy-files').addEventListener('click', () => {
+    clearTimeout(timers.copyFind); $('#find-copy-files').disabled = true; $('#copy-find-progress').hidden = false; let count = 0;
+    function tick() { count = Math.min(38, count + 5); const percent = Math.round(count / 38 * 100); $('#copy-find-count').textContent = `${count} / 38 files checked`; $('#copy-find-fill').style.width = `${percent}%`; $('#copy-find-progressbar').setAttribute('aria-valuenow', percent); $('#copy-find-current').textContent = count < 20 ? 'Projects/Nuke/Timeline_01/SH010' : '04_vfx/SH010/beauty/v003'; if (count < 38) timers.copyFind = setTimeout(tick, 90); else { $('#find-copy-files').disabled = false; $('#copy-discovery-state').textContent = `Scan complete · ${visibleCopyItems().length} matching files`; invalidateCopy(); renderCopyFiles(); } }
+    tick();
+  });
+  $('#validate-copy').addEventListener('click', () => {
+    const count = visibleCopyItems().filter(item => state.copySelected.has(item.id)).length;
+    if (!count) { $('#copy-state').textContent = 'Select at least one matching file before validating.'; $('#copy-state').dataset.tone = 'error'; return; }
+    state.copyStatus = 'ready'; $('#execute-copy').disabled = false; $('#copy-state').textContent = `Ready · ${count} selected files and conflict choices checked`; $('#copy-state').dataset.tone = 'ready';
+  });
+  function setCopyLocks(locked) { $('#copy-fields').disabled = locked; $('#copy-conflict').disabled = locked; $('#validate-copy').disabled = locked; $('#execute-copy').disabled = locked; $('#cancel-copy').hidden = !locked; }
+  $('#execute-copy').addEventListener('click', () => {
+    if (state.copyStatus !== 'ready') return;
+    const items = visibleCopyItems().filter(item => state.copySelected.has(item.id)), policy = $('#copy-conflict').value;
+    let index = 0, copied = 0, skipped = 0;
+    state.copyStatus = 'running'; setCopyLocks(true); $('#copy-results').hidden = true; $('#copy-state').textContent = `Copying ${items.length} selected files`; $('#copy-state').dataset.tone = '';
+    $('#copy-progress-label').textContent = 'Copy files'; $('#copy-progress-count').textContent = `0 / ${items.length} files`; $('#copy-progress-fill').style.width = '0%'; $('#copy-progressbar').setAttribute('aria-valuenow','0'); $('#copy-current-file').textContent = 'Starting';
+    function tick() {
+      if (state.copyStatus === 'cancelling') {
+        const cancelled = items.length - index; state.copyStatus = 'cancelled'; setCopyLocks(false); $('#execute-copy').disabled = true; $('#cancel-copy').disabled = false;
+        $('#copy-progress-label').textContent = 'Cancelled'; $('#copy-state').textContent = `Cancelled · ${copied} copied · ${skipped} skipped · ${cancelled} not started`; $('#copy-state').dataset.tone = 'warning';
+        $('#copy-results').hidden = false; $('#copy-results').open = true; $('#copy-result-content').innerHTML = '<p>Completed copies remain at the destination. Unfinished files were not reported as copied.</p>'; return;
+      }
+      if (index >= items.length) {
+        state.copyStatus = 'complete'; setCopyLocks(false); $('#execute-copy').disabled = true; $('#copy-progress-label').textContent = 'Complete';
+        $('#copy-state').textContent = `Complete · ${copied} copied · ${skipped} skipped`; $('#copy-state').dataset.tone = 'ready';
+        $('#copy-results').hidden = false; $('#copy-results').open = false; $('#copy-result-content').innerHTML = `<ul class="result-list"><li>${copied} copied with folders and filenames preserved</li>${skipped ? `<li>${skipped} existing file skipped: ${conflictName}</li>` : ''}</ul>`; return;
+      }
+      const item = items[index]; index += 1;
+      if (item.conflict && policy === 'skip') { skipped += 1; $(`[data-copy-state="${item.id}"]`).textContent = 'Skipped'; }
+      else { copied += 1; $(`[data-copy-state="${item.id}"]`).textContent = 'Copied'; }
+      const percent = Math.round(index / items.length * 100); $('#copy-progress-count').textContent = `${index} / ${items.length} files`; $('#copy-progress-fill').style.width = `${percent}%`; $('#copy-progressbar').setAttribute('aria-valuenow', percent); $('#copy-current-file').textContent = `${item.folder}/${item.name}`;
+      timers.copy = setTimeout(tick, 500);
+    }
+    tick();
+  });
+  $('#cancel-copy').addEventListener('click', () => { if (state.copyStatus === 'running') { state.copyStatus = 'cancelling'; $('#cancel-copy').disabled = true; $('#copy-state').textContent = 'Cancelling after the current file'; } });
+  renderCopyFiles();
+
+  function renderBackupFiles() {
+    $('#backup-file-rows').innerHTML = backupItems.map(item => `<tr><td><span class="cell-title">${escapeHTML(item.name)}</span><span class="cell-sub">${escapeHTML(item.folder)}</span></td><td>${item.modified}</td><td class="${item.status === 'blocked' ? 'danger' : ''}">${escapeHTML(item.comparison)}</td><td data-backup-state="${escapeHTML(item.name)}" class="${item.status === 'blocked' ? 'danger' : ''}">${escapeHTML(item.action)}${item.status === 'blocked' ? `<details class="small"><summary>Why?</summary><span class="mono">The source modification time could not be read. This file was not copied.</span></details>` : ''}</td></tr>`).join('');
+  }
+  function setProgress(name, value, maximum) { const percent = Math.round(value / maximum * 100); $(`#backup-${name}-fill`).style.width = `${percent}%`; $(`#backup-${name}-bar`).setAttribute('aria-valuenow', percent); }
+  function setBackupLocks(locked) { $('#backup-fields').disabled = locked; $('#run-backup').disabled = locked; $('#pause-backup').hidden = !locked; $('#cancel-backup').hidden = !locked; if (locked) $('#cancel-backup').disabled = false; }
+  function finishBackup(cancelled, completed, skipped, failed, total) {
+    state.backupStatus = cancelled ? 'cancelled' : failed ? 'partial' : 'complete'; setBackupLocks(false); $('#pause-backup').textContent = 'Pause'; $('#cancel-backup').disabled = false;
+    const remaining = Math.max(0, total - completed - skipped - failed);
+    $('#backup-state').textContent = cancelled ? `Cancelled · ${completed} copied · ${remaining} not finished` : failed ? `Partial · ${completed} copied · ${skipped} already up to date · ${failed} needs attention` : `Complete · ${completed} copied · ${skipped} already up to date`;
+    $('#backup-state').dataset.tone = cancelled || failed ? 'warning' : 'ready'; $('#backup-results').hidden = false; $('#backup-results').open = failed || cancelled;
+    $('#backup-result-content').innerHTML = cancelled ? `<p>Backup cancelled. ${completed} completed copies remain at the destination; no unfinished file was counted as copied.</p>` : `<ul class="result-list"><li>${completed} files copied</li><li>${skipped} files already up to date</li>${failed ? `<li class="danger">SH090_comp_v002.nk was not copied because its file information could not be read.</li>` : ''}</ul>${failed ? '<details><summary>Technical details</summary><p class="mono small" style="margin-top:7px">stat failed for Projects/Nuke/Timeline_02/SH090/SH090_comp_v002.nk. Check access, then run the backup again.</p></details>' : ''}`;
+  }
+  $('#run-backup').addEventListener('click', () => {
+    state.backupStatus = 'running'; setBackupLocks(true); $('#backup-progress').hidden = false; $('#backup-results').hidden = true; $('#backup-state').textContent = 'Scanning project folders'; $('#backup-state').dataset.tone = '';
+    backupItems.forEach(item => { if (item.status !== 'blocked') item.status = 'pending'; }); renderBackupFiles();
+    let scan = 0, find = 0, copy = 0, phase = 'scan';
+    function tick() {
+      if (state.backupStatus === 'paused') { timers.backup = setTimeout(tick, 150); return; }
+      if (state.backupStatus === 'cancelling') { finishBackup(true, copy, phase === 'copy' ? 26 : 0, 0, 31); $('#backup-current-file').textContent = 'Cancelled at a safe file boundary.'; return; }
+      if (phase === 'scan') {
+        scan = Math.min(31, scan + 4); $('#backup-scan-count').textContent = `${scan} / 31`; setProgress('scan', scan, 31); $('#backup-current-file').textContent = scan < 16 ? 'Projects/Nuke/Timeline_01' : 'Projects/After Effects';
+        if (scan === 31) { phase = 'find'; $('#backup-state').textContent = 'Finding missing and newer files'; }
+      } else if (phase === 'find') {
+        find = Math.min(31, find + 4); $('#backup-find-count').textContent = `${find} / 31`; setProgress('find', find, 31); $('#backup-current-file').textContent = 'Comparing source and destination modification times';
+        if (find === 31) { phase = 'copy'; $('#backup-state').textContent = 'Copying 4 changed files'; }
+      } else {
+        if (copy < 4) { const item = backupItems[copy]; copy += 1; item.status = 'copied'; $(`[data-backup-state="${item.name}"]`).textContent = 'Copied'; $('#backup-current-file').textContent = `${item.folder}/${item.name}`; }
+        $('#backup-copy-count').textContent = `${copy} / 4`; setProgress('copy', copy, 4);
+        if (copy === 4) { finishBackup(false, 4, 26, 1, 31); $('#backup-current-file').textContent = '4 files copied; 1 file needs attention.'; return; }
+      }
+      timers.backup = setTimeout(tick, 110);
+    }
+    tick();
+  });
+  $('#pause-backup').addEventListener('click', () => { if (state.backupStatus === 'running') { state.backupStatus = 'paused'; $('#pause-backup').textContent = 'Resume'; $('#backup-state').textContent = 'Paused at a file boundary'; } else if (state.backupStatus === 'paused') { state.backupStatus = 'running'; $('#pause-backup').textContent = 'Pause'; $('#backup-state').textContent = 'Backup resumed'; } });
+  $('#cancel-backup').addEventListener('click', () => { if (['running','paused'].includes(state.backupStatus)) { state.backupStatus = 'cancelling'; $('#cancel-backup').disabled = true; $('#backup-state').textContent = 'Cancelling after the current file'; } });
+  $('#import-backup').addEventListener('click', () => { $('#backup-state').textContent = 'Import review opened in the native app; this demo kept the current settings.'; });
+  $('#export-backup').addEventListener('click', () => { $('#backup-state').textContent = 'Backup settings prepared for export (simulated); no file was written.'; });
+  renderBackupFiles();
+
+  function renderUsers() {
+    $('#current-user').textContent = (state.users.find(user => user.selected) || state.users[0]).name;
+    $('#user-rows').innerHTML = state.users.map((user,index) => `<tr><td>${escapeHTML(user.name)}</td><td>${user.selected ? 'Current name for history' : '—'}</td><td><div class="toolbar-group"><button type="button" class="btn btn-small" data-user-select="${index}" ${user.selected ? 'disabled' : ''}>Use for history</button><button type="button" class="btn btn-small" data-user-rename="${index}">Rename</button><button type="button" class="btn btn-small" data-user-delete="${index}" ${user.selected || state.users.length === 1 ? 'disabled' : ''}>Delete</button></div></td></tr>`).join('');
+  }
+  $('#add-user').addEventListener('click', () => { state.users.push({name:`artist_${state.users.length + 1}`,selected:false}); renderUsers(); });
+  $('#user-rows').addEventListener('click', event => {
+    const select = event.target.closest('[data-user-select]'), rename = event.target.closest('[data-user-rename]'), remove = event.target.closest('[data-user-delete]');
+    if (select) { state.users.forEach(user => user.selected = false); state.users[Number(select.dataset.userSelect)].selected = true; renderUsers(); }
+    if (rename) { const user = state.users[Number(rename.dataset.userRename)]; user.name = `${user.name}_updated`; renderUsers(); }
+    if (remove) { const index = Number(remove.dataset.userDelete); if (state.users.length > 1 && !state.users[index].selected) { state.pendingUserDelete = index; $('#delete-user-message').textContent = `Delete ${state.users[index].name} from the user list?`; showDialog('delete-user-dialog'); } }
+  });
+  $('#confirm-delete-user').addEventListener('click', () => { if (state.pendingUserDelete !== null) state.users.splice(state.pendingUserDelete, 1); state.pendingUserDelete = null; $('#delete-user-dialog').close(); renderUsers(); });
+  $('#save-settings').addEventListener('click', () => { $('#settings-feedback').textContent = 'Settings saved in this prototype.'; });
+  $('#choose-import').addEventListener('click', () => { $('#setting-project-root').value = '/mnt/Imported/Projects'; });
+  $('#clear-log-view').addEventListener('click', () => { $('#log-lines').innerHTML = '<span class="muted">No log lines in this view. Saved run results are unchanged.</span>'; });
+  $('#log-level').addEventListener('change', event => { $$('#log-lines > span').forEach(line => { line.hidden = event.target.value !== 'Information and above' && !line.classList.contains('warning'); }); });
+  $('#demo-stale').addEventListener('click', () => { switchView('incoming'); state.incomingStatus = 'stale'; $('#execute-incoming').disabled = true; $('#incoming-state').textContent = 'Changed since review · scan or edit, then validate again'; $('#incoming-state').dataset.tone = 'warning'; });
+  $('#demo-partial').addEventListener('click', () => { switchView('backup'); $('#backup-progress').hidden = false; $('#backup-results').hidden = false; $('#backup-results').open = true; finishBackup(false, 2, 26, 1, 31); $('#backup-copy-count').textContent = '2 / 4'; setProgress('copy',2,4); $('#backup-current-file').textContent = 'Stopped after 2 copies; create a fresh run after checking the error.'; });
+  $('#reset-prototype').addEventListener('click', () => window.location.reload());
+  renderUsers();
+
+  const syntheticFolders = {
+    '/mnt':['Ingest','Projects','Transfer','NAS'],
+    '/mnt/Ingest':['Northwind'], '/mnt/Ingest/Northwind':['day_02','day_03'], '/mnt/Ingest/Northwind/day_03':['camera_a','renders'],
+    '/mnt/Projects':['00142_Northwind_Tidal_2026-11-05','00199_Drifting_Plates'],
+    '/mnt/Projects/00142_Northwind_Tidal_2026-11-05':['01_plates','04_vfx','Video'],
+    '/mnt/Projects/00142_Northwind_Tidal_2026-11-05/04_vfx':['SEQ010','SEQ020'],
+    '/mnt/Projects/00142_Northwind_Tidal_2026-11-05/Video':['Footage'],
+    '/mnt/Projects/00199_Drifting_Plates':['04_vfx','05_delivery'],
+    '/mnt/Transfer':['Northwind_review'], '/mnt/NAS':['Backups']
+  };
+  let folderBrowserTarget = null, folderBrowserPath = '/mnt';
+  function renderFolderBrowser(path) {
+    folderBrowserPath = path; $('#folder-browser-path').value = path;
+    const parts = path.split('/').filter(Boolean);
+    $('#folder-breadcrumb').innerHTML = parts.map((part,index) => `<button type="button" class="btn btn-quiet btn-small" data-breadcrumb="/${parts.slice(0,index+1).join('/')}">${escapeHTML(part)}</button>${index < parts.length - 1 ? '<span>/</span>' : ''}`).join('');
+    const children = syntheticFolders[path] || [];
+    $('#folder-browser-list').innerHTML = children.length ? children.map(name => `<button type="button" class="folder-open" data-open-folder="${escapeHTML(`${path}/${name}`)}"><span aria-hidden="true">▸</span>${escapeHTML(name)}/</button>`).join('') : '<span class="inline-note" style="padding:8px">No subfolders in this sample</span>';
+    $('#folder-browser-up').disabled = path === '/mnt';
+    $('#folder-browser-feedback').textContent = `${children.length} folders`;
+  }
+  $$('[data-folder-browser]').forEach(button => button.addEventListener('click', () => {
+    folderBrowserTarget = button.dataset.folderBrowser;
+    const current = document.getElementById(folderBrowserTarget).value;
+    renderFolderBrowser(syntheticFolders[current] ? current : '/mnt');
+    showDialog('folder-browser-dialog');
+  }));
+  $('#folder-browser-up').addEventListener('click', () => renderFolderBrowser(folderBrowserPath.split('/').slice(0,-1).join('/') || '/mnt'));
+  $('#folder-breadcrumb').addEventListener('click', event => { const button = event.target.closest('[data-breadcrumb]'); if (button) renderFolderBrowser(button.dataset.breadcrumb); });
+  $('#folder-browser-list').addEventListener('click', event => { const button = event.target.closest('[data-open-folder]'); if (button) renderFolderBrowser(button.dataset.openFolder); });
+  $('#folder-browser-path').addEventListener('change', event => { const path = event.target.value.replace(/\/$/, '') || '/mnt'; if (syntheticFolders[path]) renderFolderBrowser(path); else { event.target.value = folderBrowserPath; $('#folder-browser-feedback').textContent = 'Choose a folder in the sample tree'; } });
+  $('#folder-browser-select').addEventListener('click', () => { const input = document.getElementById(folderBrowserTarget); input.value = folderBrowserPath; input.dispatchEvent(new Event('change',{bubbles:true})); $('#folder-browser-dialog').close(); });
+  $$('.browse-button').forEach(button => button.addEventListener('click', () => { const input = document.getElementById(button.dataset.target); input.focus(); input.select(); }));
+  document.addEventListener('keydown', event => {
+    const treeButton = event.target.closest('.tree-button');
+    if (treeButton && ['ArrowUp','ArrowDown','Home','End'].includes(event.key)) {
+      event.preventDefault(); const buttons = $$('.tree-button', treeButton.closest('.tree')).filter(button => button.offsetParent !== null);
+      let index = buttons.indexOf(treeButton); if (event.key === 'ArrowUp') index = Math.max(0, index - 1); if (event.key === 'ArrowDown') index = Math.min(buttons.length - 1, index + 1);
+      if (event.key === 'Home') index = 0; if (event.key === 'End') index = buttons.length - 1; buttons[index]?.focus(); return;
+    }
+    const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+    if (event.altKey && /^[1-6]$/.test(event.key)) { event.preventDefault(); switchView(viewNames[Number(event.key) - 1]); return; }
+    if (event.ctrlKey && event.key.toLowerCase() === 'k') { event.preventDefault(); const search = $(`#view-${state.view} input[type="search"]`); if (search) search.focus(); return; }
+    if (event.key === 'F6') { event.preventDefault(); const regions = [$('.nav-button[aria-current="page"]'), $('#current-project'), $(`#view-${state.view}`)]; const index = regions.indexOf(document.activeElement); const next = (index + (event.shiftKey ? -1 : 1) + regions.length) % regions.length; regions[next].focus(); return; }
+    if (event.key === 'Escape' && contextMenu.hidden && !$$('dialog[open]').length && document.activeElement.matches('input[type="search"]')) { document.activeElement.value = ''; document.activeElement.dispatchEvent(new Event('input')); }
+    if (event.key === '?' && !typing) { event.preventDefault(); showDialog('shortcuts-dialog'); }
+  });
+})();
+</script>
+</body>
+</html>
