@@ -1,5 +1,23 @@
 # Implementation status
 
+## Native Copy by File Type and Incoming analysis integration
+
+Copy by File Type now scans, selects, validates and executes through tracked jobs,
+with progress, resizable file list, destination preview and per-item results in
+the approved desktop shell. Catalog shutdown waits for admitted job workers.
+The first disposable native operation copied two nested files, skipped one
+existing file and preserved all sources. Content readback confirmed the result;
+screenshots and exact verification limits are in NATIVE-COPY-EVIDENCE.md.
+Parent corrected compressed path fields, enlarged the progress dock and refused
+lossy picker paths. Independent UI/state review remains required.
+
+Incoming's pure analysis module is integrated: exact scanned frame files and
+stamps, deterministic sequence grouping by directory/name/extension/padding,
+typed gaps and duplicates, single-file categories and reconciled counts. Parent
+corrected the dot-frame-with-suffix delimiter against the original Python regex.
+No Incoming routing, UI or runtime verification is claimed; source review is next.
+No test suites were created or run.
+
 ## U3 source-review corrections
 
 Coordinator fixed Kimi's three Settings findings: an older identity acknowledgement

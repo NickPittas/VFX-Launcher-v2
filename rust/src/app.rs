@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
+use crate::copy_workspace::CopyByFileTypeState;
 use crate::jobs::{JobId, JobStatus, Jobs, LIVE_POLL_INTERVAL};
 use crate::launch::Tool;
 use crate::project_workspace::{ProjectWorkspace, RegistrationStatus, SettingsPath};
@@ -119,12 +120,14 @@ impl View {
     }
 
     /// Execution control pinned in the bottom strip. `None` for views whose
-    /// execution lives on a row (Project file launch) or that execute nothing.
+    /// execution lives on a row (Project file launch), that execute nothing, or
+    /// that draw their own control from the reviewed plan state (Copy by File
+    /// Type).
     fn primary_action(self) -> Option<&'static str> {
         match self {
             Self::ShotsAndSequences => Some("Add to project"),
             Self::OrganizeIncoming => Some("Copy selected"),
-            Self::CopyByFileType => Some("Copy selected"),
+            Self::CopyByFileType => None,
             Self::BackUpProjects => Some("Back up now"),
             Self::Projects | Self::Settings => None,
         }
@@ -165,9 +168,7 @@ pub struct VfxLauncherApp {
     incoming_source: String,
     incoming_destination: String,
     incoming_move: bool,
-    copy_source: String,
-    copy_destination: String,
-    copy_types: String,
+    copy_by_type: CopyByFileTypeState,
     backup_source: String,
     backup_destination: String,
     backup_exclusions: String,
@@ -195,9 +196,7 @@ impl VfxLauncherApp {
             incoming_source: String::new(),
             incoming_destination: String::new(),
             incoming_move: false,
-            copy_source: String::new(),
-            copy_destination: String::new(),
-            copy_types: String::new(),
+            copy_by_type: CopyByFileTypeState::new(&cc.egui_ctx),
             backup_source: String::new(),
             backup_destination: String::new(),
             backup_exclusions: String::new(),
@@ -215,8 +214,15 @@ impl eframe::App for VfxLauncherApp {
     /// close coordination never depend on a painted frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.workspace.poll(&mut self.jobs);
+        self.copy_by_type.poll(
+            self.workspace.catalog_client().as_ref(),
+            self.workspace.user().map(|user| user.id),
+        );
         if self.closing {
             self.jobs.begin_shutdown();
+            // An admitted execution run keeps the request queue open until its
+            // own journal writes are answered.
+            self.workspace.set_workers_busy(self.jobs.is_busy());
             let catalog_pending = self.workspace.shutdown_pending();
             if !self.jobs.is_busy() && !catalog_pending {
                 self.closing = false;
@@ -242,6 +248,7 @@ impl eframe::App for VfxLauncherApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = true;
             self.jobs.begin_shutdown();
+            self.workspace.set_workers_busy(self.jobs.is_busy());
             self.workspace.begin_shutdown();
             ctx.request_repaint_after(LIVE_POLL_INTERVAL);
         }
@@ -363,9 +370,10 @@ impl VfxLauncherApp {
                     ui.radio_value(&mut self.incoming_move, false, "Copy");
                     ui.radio_value(&mut self.incoming_move, true, "Move");
                     ui.separator();
-                }
-                if matches!(self.view, View::OrganizeIncoming | View::CopyByFileType) {
                     let _ = pending_button(ui, "Validate selection");
+                }
+                if self.view == View::CopyByFileType {
+                    self.copy_by_type.validate_control(ui, &mut self.jobs);
                 }
                 ui.label(
                     egui::RichText::new(status_text(job.as_ref(), closing, live_jobs)).small(),
@@ -388,6 +396,9 @@ impl VfxLauncherApp {
                     self.view.primary_action()
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.view == View::CopyByFileType {
+                        self.copy_by_type.execution_control(ui, &mut self.jobs);
+                    }
                     if let Some(action) = action {
                         explain(&primary_button(ui, action, false), UNAVAILABLE);
                     }
@@ -895,60 +906,7 @@ impl VfxLauncherApp {
     }
 
     fn copy_by_file_type_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            explain(&primary_button(ui, "Scan folders", false), UNAVAILABLE);
-            ui.separator();
-            folder_field(
-                ui,
-                "Source",
-                &mut self.copy_source,
-                "No source folder chosen",
-            );
-            ui.separator();
-            folder_field(
-                ui,
-                "Destination",
-                &mut self.copy_destination,
-                "No destination folder chosen",
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("File types").small().weak());
-            ui.add_enabled(
-                false,
-                egui::TextEdit::singleline(&mut self.copy_types)
-                    .hint_text("Scan a source folder to list its file types")
-                    .desired_width(360.0),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Copies matching file types and keeps their folder structure and filenames.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
-        });
-        ui.separator();
-
-        ui.horizontal(|ui| {
-            for phase in ["Scanning", "Copying"] {
-                ui.label(egui::RichText::new(phase).small().weak());
-                ui.add(
-                    egui::ProgressBar::new(0.0)
-                        .desired_width(170.0)
-                        .desired_height(8.0),
-                );
-            }
-        });
-        ui.separator();
-
-        empty_state(
-            ui,
-            "No files to copy yet.",
-            "Scan a source folder to preview the matching files.",
-        );
+        self.copy_by_type.view(ui, &mut self.jobs);
     }
 
     fn backup_view(&mut self, ui: &mut egui::Ui) {

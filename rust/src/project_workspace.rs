@@ -46,8 +46,8 @@ use crate::projects::{
     RegistrationSummary,
 };
 use crate::storage::{
-    Catalog, CatalogInfo, CatalogShutdown, FileId, Pending, ProjectId, ReplyState, StorageError,
-    UserId, UserRecord,
+    Catalog, CatalogClient, CatalogInfo, CatalogShutdown, FileId, Pending, ProjectId, ReplyState,
+    StorageError, UserId, UserRecord,
 };
 
 /// How long the project filter waits after the last keystroke before it is
@@ -456,6 +456,7 @@ pub struct ProjectWorkspace {
     favorites: Vec<FavoriteWrite>,
     /// A coordinated stop started: no new request is accepted any more.
     closing: bool,
+    workers_busy: bool,
     notices: Vec<Notice>,
 }
 
@@ -506,6 +507,7 @@ impl ProjectWorkspace {
             access: Vec::new(),
             favorites: Vec::new(),
             closing: false,
+            workers_busy: false,
             notices: Vec::new(),
         };
         workspace.start_settings();
@@ -1817,7 +1819,7 @@ impl ProjectWorkspace {
     /// from `poll`, so the drain continues during closing while the catalog still
     /// accepts the access records those launches produced.
     fn try_close_catalog(&mut self) {
-        if !self.closing || self.shutdown.is_some() || self.actions_pending() {
+        if !self.closing || self.shutdown.is_some() || self.actions_pending() || self.workers_busy {
             return;
         }
         if let Some(catalog) = self.catalog.take() {
@@ -1864,6 +1866,14 @@ impl ProjectWorkspace {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    pub fn catalog_client(&self) -> Option<CatalogClient> {
+        self.catalog.as_ref().map(Catalog::client)
+    }
+
+    pub fn set_workers_busy(&mut self, busy: bool) {
+        self.workers_busy = busy;
     }
 
     pub fn user(&self) -> Option<&UserRecord> {

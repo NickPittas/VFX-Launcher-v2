@@ -14,7 +14,9 @@
 
 pub mod app;
 pub mod config;
+pub mod copy_workspace;
 pub mod discovery;
+pub mod incoming;
 pub mod jobs;
 pub mod launch;
 pub mod nuke;
