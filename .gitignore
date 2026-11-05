@@ -72,3 +72,7 @@ htmlcov/
 # Pix Agent
 .pi/
 .pi-lens/
+
+# Local source references and Rust build output
+/gitclones/
+/target/
