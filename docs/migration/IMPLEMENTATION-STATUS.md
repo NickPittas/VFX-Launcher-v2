@@ -1,5 +1,16 @@
 # Implementation status
 
+## S2 review input corrections
+
+Coordinator fixed all five Nuke review findings: sequence/shot whitespace is
+normalized as in legacy creation, Root.name is quoted with literal Tcl escaping,
+comp roots reject absolute/traversing/nonportable components, the assembled
+filename is checked against the portable component policy/255-byte limit, and
+FPS values that serialize to zero at Root's two-decimal precision are refused.
+Portable path validation is separate from script quoting, allowing spaces and
+safe Tcl metacharacters in names. Compilation passes without warnings; no tests
+or Nuke launches occurred. Quoted-name parsing in Nuke remains unverified.
+
 ## S2 Nuke content generator integrated
 
 `nuke.rs` ports the FolderStructurer template as pure script text/bytes generation,

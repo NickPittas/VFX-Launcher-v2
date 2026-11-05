@@ -13,7 +13,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Legacy default FPS (`StructureTab.combo_fps` selection).
 pub const DEFAULT_FPS: f64 = 24.0;
@@ -235,7 +235,9 @@ impl<'a> ScriptTarget<'a> {
     }
 
     fn sequence_name(&self) -> Option<&'a str> {
-        self.sequence.filter(|sequence| !sequence.is_empty())
+        self.sequence
+            .map(str::trim)
+            .filter(|sequence| !sequence.is_empty())
     }
 
     /// Legacy file name: `<seq>_<shot>_comp_v001.nk`, or `<shot>_comp_v001.nk`
@@ -245,23 +247,39 @@ impl<'a> ScriptTarget<'a> {
         if let Some(sequence) = self.sequence_name() {
             validate_name(NameField::Sequence, sequence)?;
         }
-        validate_name(NameField::Shot, self.shot)?;
-        Ok(match self.sequence_name() {
+        let shot = self.shot.trim();
+        validate_name(NameField::Shot, shot)?;
+        let name = match self.sequence_name() {
             Some(sequence) => {
-                format!("{sequence}_{}_comp_v{:03}.nk", self.shot, self.version)
+                format!("{sequence}_{shot}_comp_v{:03}.nk", self.version)
             }
-            None => format!("{}_comp_v{:03}.nk", self.shot, self.version),
-        })
+            None => format!("{shot}_comp_v{:03}.nk", self.version),
+        };
+        validate_name(NameField::FileName, &name)?;
+        Ok(name)
     }
 
     /// Legacy path: `[seq/]<shot>/project/<file name>` below the comp root.
     pub fn relative_path(&self) -> Result<PathBuf, NukeError> {
+        for component in self.comp_root.components() {
+            let Component::Normal(name) = component else {
+                return Err(NukeError::InvalidCompRoot {
+                    path: self.comp_root.to_owned(),
+                });
+            };
+            let Some(name) = name.to_str() else {
+                return Err(NukeError::InvalidCompRoot {
+                    path: self.comp_root.to_owned(),
+                });
+            };
+            validate_name(NameField::CompFolder, name)?;
+        }
         let file_name = self.file_name()?;
         let mut path = PathBuf::from(self.comp_root);
         if let Some(sequence) = self.sequence_name() {
             path.push(sequence);
         }
-        path.push(self.shot);
+        path.push(self.shot.trim());
         path.push("project");
         path.push(file_name);
         Ok(path)
@@ -292,6 +310,7 @@ pub fn script_bytes(
 }
 
 fn root_block(file_name: &str, options: &NukeScriptOptions) -> String {
+    let file_name = quote_scalar(file_name);
     let width = options.width;
     let height = options.height;
     let fps = options.fps;
@@ -312,6 +331,19 @@ fn root_block(file_name: &str, options: &NukeScriptOptions) -> String {
     )
 }
 
+/// Serialize one literal Tcl scalar without substitutions or token splitting.
+fn quote_scalar(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        if matches!(character, '\\' | '"' | '$' | '[' | ']') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn viewer_block(fps: f64) -> String {
     format!(
         "Viewer {{\n inputs 0\n frame 1\n frame_range 1-100\n fps {fps:.8}\n name Viewer1\n xpos -40\n ypos -9\n}}"
@@ -319,7 +351,7 @@ fn viewer_block(fps: f64) -> String {
 }
 
 fn validate_options(options: &NukeScriptOptions) -> Result<(), NukeError> {
-    if !options.fps.is_finite() || options.fps <= 0.0 {
+    if !options.fps.is_finite() || options.fps <= 0.0 || format!("{:.2}", options.fps) == "0.00" {
         return Err(NukeError::InvalidFps { fps: options.fps });
     }
     if !(1..=MAX_DIMENSION).contains(&options.width)
@@ -340,8 +372,7 @@ fn validate_version(version: u32) -> Result<(), NukeError> {
     Ok(())
 }
 
-/// Names are emitted as unquoted `.nk` tokens and used as path components, so
-/// only characters that need no escaping and stay inside one path segment pass.
+/// Conservative portable path-component policy; script quoting is separate.
 fn validate_name(field: NameField, value: &str) -> Result<(), NukeError> {
     let reason = if value.is_empty() {
         Some("is empty")
@@ -355,13 +386,15 @@ fn validate_name(field: NameField, value: &str) -> Result<(), NukeError> {
         Some("contains a path separator or NUL")
     } else if value.chars().any(char::is_control) {
         Some("contains a control character")
-    } else if value.chars().any(|c| c.is_whitespace()) {
-        Some("contains whitespace, which the unquoted Nuke name token cannot hold")
     } else if value
         .chars()
-        .any(|c| matches!(c, '"' | '{' | '}' | '#' | ';' | '[' | ']' | '$'))
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
     {
-        Some("contains a character the unquoted Nuke name token cannot represent")
+        Some("contains a character forbidden in a portable file name")
+    } else if value.ends_with('.') {
+        Some("ends with a dot")
+    } else if reserved_component(value) {
+        Some("is a reserved Windows device name")
     } else {
         None
     };
@@ -375,11 +408,26 @@ fn validate_name(field: NameField, value: &str) -> Result<(), NukeError> {
     }
 }
 
+fn reserved_component(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or("").to_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            stem.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        })
+}
+
 /// Input that carries a name into the script text and the script path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameField {
     Sequence,
     Shot,
+    FileName,
+    CompFolder,
 }
 
 impl fmt::Display for NameField {
@@ -387,6 +435,8 @@ impl fmt::Display for NameField {
         match self {
             Self::Sequence => f.write_str("sequence"),
             Self::Shot => f.write_str("shot"),
+            Self::FileName => f.write_str("assembled file"),
+            Self::CompFolder => f.write_str("comp folder"),
         }
     }
 }
@@ -394,6 +444,9 @@ impl fmt::Display for NameField {
 /// A value that cannot be represented safely in a `.nk` script or path.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NukeError {
+    InvalidCompRoot {
+        path: PathBuf,
+    },
     UnrepresentableName {
         field: NameField,
         value: String,
@@ -414,6 +467,9 @@ pub enum NukeError {
 impl fmt::Display for NukeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidCompRoot { path } => {
+                write!(f, "comp folder {path:?} must be a plain relative path")
+            }
             Self::UnrepresentableName {
                 field,
                 value,
@@ -425,7 +481,10 @@ impl fmt::Display for NukeError {
                 )
             }
             Self::InvalidFps { fps } => {
-                write!(f, "Nuke script fps {fps} is not a positive finite number")
+                write!(
+                    f,
+                    "Nuke script fps {fps} must remain positive at two-decimal precision"
+                )
             }
             Self::InvalidResolution { width, height } => write!(
                 f,
