@@ -174,13 +174,13 @@ pub fn execute(
                 let bytes = item.bytes.unwrap_or(0);
                 executor.record(item, state, bytes, note, recovery)?;
             }
-            Ok(Done::SourceRetained { message, source }) => {
+            Ok(Done::SourceRetained { message, recovery }) => {
                 executor.record(
                     item,
                     ItemState::CopiedSourceRetained,
                     item.bytes.unwrap_or(0),
                     Some(message),
-                    vec![source],
+                    recovery,
                 )?;
             }
             Err(Flow::Problem(message, recovery)) => {
@@ -351,7 +351,7 @@ enum Done {
     },
     SourceRetained {
         message: String,
-        source: PathBuf,
+        recovery: Vec<PathBuf>,
     },
 }
 
@@ -827,17 +827,20 @@ impl Executor<'_> {
         match item.expectation.as_ref() {
             Some(DestinationExpectation::Absent) => match self.root.mkdir(&parent, &name) {
                 Ok(created) => {
-                    let identity = identity_of_handle(&created).map_err(|error| {
-                        io_problem("the new destination folder", &destination, error)
-                    })?;
+                    let created_error = |error: io::Error| {
+                        Flow::Problem(
+                            format!(
+                                "folder {} was created but could not be verified or synced: {error}",
+                                destination.display()
+                            ),
+                            vec![destination.clone()],
+                        )
+                    };
+                    let identity = identity_of_handle(&created).map_err(&created_error)?;
                     // The new folder's own entry set becomes durable only when it is
                     // synced, so its children cannot outlive it after a crash.
-                    self.root.sync_dir(&created).map_err(|error| {
-                        io_problem("the new destination folder", &destination, error)
-                    })?;
-                    self.root.sync_dir(&parent).map_err(|error| {
-                        io_problem("the destination folder", &destination, error)
-                    })?;
+                    self.root.sync_dir(&created).map_err(&created_error)?;
+                    self.root.sync_dir(&parent).map_err(created_error)?;
                     self.verified_folders.insert(relative, identity);
                     Ok(Done::Succeeded {
                         note: None,
@@ -983,7 +986,22 @@ impl Executor<'_> {
         let recovery = installed.recovery;
 
         if item.effect == ItemEffect::Move {
-            self.checkpoint(item, ItemCheckpoint::RemovingSource, None, &[])?;
+            let mut move_recovery = recovery.clone();
+            for path in [&source, &destination] {
+                if !move_recovery.contains(path) {
+                    move_recovery.push(path.clone());
+                }
+            }
+            let with_note = |message: String| match &note {
+                Some(note) => format!("{note}; {message}"),
+                None => message,
+            };
+            self.checkpoint(
+                item,
+                ItemCheckpoint::RemovingSource,
+                note.clone(),
+                &move_recovery,
+            )?;
             let current = match self.recheck_source(
                 &source_parent,
                 &source_name,
@@ -995,20 +1013,20 @@ impl Executor<'_> {
                 SourceCheck::Unchanged(identity) => identity,
                 SourceCheck::Changed(message) => {
                     return Ok(Done::SourceRetained {
-                        message: format!(
+                        message: with_note(format!(
                             "{message}; the copy is installed and the source was kept instead of deleted"
-                        ),
-                        source,
+                        )),
+                        recovery: move_recovery,
                     });
                 }
                 SourceCheck::Unknown(message) => {
                     return Err(Flow::PostInstall {
-                        message: format!(
+                        message: with_note(format!(
                             "{message}; the installed copy at {} was kept and the source {} was left in place",
                             destination.display(),
                             source.display()
-                        ),
-                        recovery: vec![source, destination],
+                        )),
+                        recovery: move_recovery,
                     });
                 }
             };
@@ -1017,19 +1035,19 @@ impl Executor<'_> {
                 .remove_owned(&source_parent, &source_name, current)
             {
                 return Ok(Done::SourceRetained {
-                    message: format!(
+                    message: with_note(format!(
                         "the copy is installed, but the source {} could not be removed: {error}",
                         source.display()
-                    ),
-                    source,
+                    )),
+                    recovery: move_recovery,
                 });
             }
             if let Err(message) = self.sync_move_directories(&source_parent, &parent) {
                 return Err(Flow::PostInstall {
-                    message: format!(
+                    message: with_note(format!(
                         "the destination is installed and the source was removed, but {message}"
-                    ),
-                    recovery: vec![source, destination],
+                    )),
+                    recovery: move_recovery,
                 });
             }
         }

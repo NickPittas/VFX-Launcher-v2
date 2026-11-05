@@ -1,5 +1,15 @@
 # Implementation status
 
+## Executor fresh review and reporting corrections
+
+Kimi's fresh review found no remaining original data-safety blocker under the
+cooperative-writer model and judged the executor ready for its first disposable
+manual feature operation, not production. Coordinator fixed the two remaining
+reporting gaps: post-install Move outcomes retain earlier backup paths and notes,
+and created directories left after verification/sync failure appear in recovery.
+Compilation passes without warnings. No runtime operations or tests ran. Next is
+Copy by File Type UI wiring and a disposable manual workflow with screenshots.
+
 ## S1 structure integration and executor replacement completion
 
 Integrated structure.rs: named sequence/shot tree editing, independent shots,
