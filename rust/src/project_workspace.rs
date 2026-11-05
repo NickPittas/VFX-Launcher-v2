@@ -43,11 +43,11 @@ use crate::launch::{self, LaunchError, Tool};
 use crate::paths::PathError;
 use crate::projects::{
     FileGroup, Project, ProjectFile, ProjectList, ReconcileSummary, RegistrationPlan,
-    RegistrationSummary,
+    RegistrationSummary, RemovalSummary,
 };
 use crate::storage::{
     Catalog, CatalogClient, CatalogInfo, CatalogShutdown, FileId, Pending, ProjectId, ReplyState,
-    StorageError, UserId, UserRecord,
+    StorageError, UserChange, UserId, UserRecord,
 };
 
 /// How long the project filter waits after the last keystroke before it is
@@ -433,6 +433,8 @@ pub struct ProjectWorkspace {
     users: Option<Pending<Vec<UserRecord>>>,
     creating_admin: Option<Pending<UserRecord>>,
     users_list: Vec<UserRecord>,
+    user_write: Option<Pending<UserRecord>>,
+    user_delete: Option<(UserId, Pending<()>)>,
     user: Option<UserRecord>,
     tab: ProjectList,
     filter_edit: String,
@@ -454,6 +456,7 @@ pub struct ProjectWorkspace {
     reveals: Vec<RevealRequest>,
     access: Vec<Pending<()>>,
     favorites: Vec<FavoriteWrite>,
+    removals: Vec<Pending<RemovalSummary>>,
     /// A coordinated stop started: no new request is accepted any more.
     closing: bool,
     workers_busy: bool,
@@ -485,6 +488,8 @@ impl ProjectWorkspace {
             users: None,
             creating_admin: None,
             users_list: Vec::new(),
+            user_write: None,
+            user_delete: None,
             user: None,
             tab: ProjectList::All,
             filter_edit: String::new(),
@@ -506,6 +511,7 @@ impl ProjectWorkspace {
             reveals: Vec::new(),
             access: Vec::new(),
             favorites: Vec::new(),
+            removals: Vec::new(),
             closing: false,
             workers_busy: false,
             notices: Vec::new(),
@@ -521,6 +527,13 @@ impl ProjectWorkspace {
         self.poll_settings();
         self.poll_settings_browse();
         self.poll_catalog();
+        self.poll_user_changes();
+        if self.closing && !self.users_busy() {
+            self.flush_settings_before_close();
+            if let Some(worker) = &mut self.settings_worker {
+                worker.begin_shutdown();
+            }
+        }
         self.poll_filter(now);
         self.poll_projects();
         self.poll_files();
@@ -530,6 +543,7 @@ impl ProjectWorkspace {
         self.poll_reveal();
         self.poll_access();
         self.poll_favorites();
+        self.poll_removals();
         self.poll_recent();
         // Only after the accepted launch, reveal and access replies drained is the
         // catalog queue closed; until then its queued writes must stay accepted.
@@ -927,7 +941,10 @@ impl ProjectWorkspace {
                 ReplyState::Waiting => {}
                 ReplyState::Ready(users) => {
                     self.users = None;
-                    self.users_list = users;
+                    self.users_list = users
+                        .into_iter()
+                        .filter(|user| user.deleted_at.is_none())
+                        .collect();
                     self.after_users();
                 }
                 ReplyState::Failed(error) => {
@@ -1027,7 +1044,7 @@ impl ProjectWorkspace {
 
     /// Chooses who the recorded actions are attributed to.
     pub fn choose_user(&mut self, id: UserId) {
-        if self.closing {
+        if self.closing || self.users_busy() {
             return;
         }
         let Some(user) = self.users_list.iter().find(|user| user.id == id) else {
@@ -1042,6 +1059,97 @@ impl ProjectWorkspace {
             self.save_settings();
         }
         self.select_user(user);
+    }
+
+    pub fn users_busy(&self) -> bool {
+        self.user_write.is_some() || self.user_delete.is_some()
+    }
+
+    pub fn save_user(&mut self, id: Option<UserId>, username: String, is_admin: bool) {
+        if !self.actions_enabled() || self.users_busy() {
+            return;
+        }
+        let Some(catalog) = &self.catalog else {
+            return;
+        };
+        let pending = match id {
+            Some(id) => catalog.update_user(
+                id,
+                UserChange {
+                    username: Some(username),
+                    is_admin: Some(is_admin),
+                },
+            ),
+            None => catalog.create_user(username, is_admin),
+        };
+        match pending {
+            Ok(pending) => self.user_write = Some(pending),
+            Err(error) => self.push_notice(notice_from_error("User", &error)),
+        }
+    }
+
+    pub fn remove_user(&mut self, id: UserId) {
+        if !self.actions_enabled() || self.users_busy() {
+            return;
+        }
+        if self.users_list.len() <= 1 || self.user.as_ref().is_some_and(|user| user.id == id) {
+            self.push_notice(Notice {
+                title: "Choose another user before removing this name.".into(),
+                detail: Some(
+                    "The last user cannot be removed. Earlier history is retained.".into(),
+                ),
+                error: true,
+            });
+            return;
+        }
+        let Some(catalog) = &self.catalog else {
+            return;
+        };
+        match catalog.delete_user(id) {
+            Ok(pending) => self.user_delete = Some((id, pending)),
+            Err(error) => self.push_notice(notice_from_error("User", &error)),
+        }
+    }
+
+    fn poll_user_changes(&mut self) {
+        if let Some(mut pending) = self.user_write.take() {
+            match pending.try_poll() {
+                ReplyState::Waiting => self.user_write = Some(pending),
+                ReplyState::Ready(user) => {
+                    if self
+                        .user
+                        .as_ref()
+                        .is_some_and(|current| current.id == user.id)
+                    {
+                        self.user = Some(user.clone());
+                        self.settings.selected_username = Some(user.username.clone());
+                        self.save_settings();
+                    }
+                    self.users_list.retain(|existing| existing.id != user.id);
+                    self.users_list.push(user);
+                    self.users_list
+                        .sort_by_key(|user| (user.username.to_lowercase(), user.id));
+                    if let Some(selected) = self.selected {
+                        self.request_files(selected);
+                    }
+                    self.push_notice(Notice {
+                        title: "User saved.".into(),
+                        detail: None,
+                        error: false,
+                    });
+                }
+                ReplyState::Failed(error) => self.push_notice(notice_from_error("User", &error)),
+                ReplyState::Finished => {}
+            }
+        }
+        if let Some((id, mut pending)) = self.user_delete.take() {
+            match pending.try_poll() {
+                ReplyState::Waiting => self.user_delete = Some((id, pending)),
+                ReplyState::Ready(()) => self.users_list.retain(|user| user.id != id),
+                ReplyState::Failed(error) => self.push_notice(notice_from_error("User", &error)),
+                ReplyState::Finished => {}
+            }
+        }
     }
 
     // ---------------------------------------------------------------- projects
@@ -1230,6 +1338,48 @@ impl ProjectWorkspace {
                 pending,
             }),
             Err(error) => self.push_notice(notice_from_error("Favorites", &error)),
+        }
+    }
+
+    pub fn unregister_project(&mut self, id: ProjectId) {
+        if !self.actions_enabled() {
+            return;
+        }
+        let (Some(catalog), Some(user)) = (&self.catalog, &self.user) else {
+            return;
+        };
+        match crate::projects::remove_project(catalog, user.id, id) {
+            Ok(pending) => self.removals.push(pending),
+            Err(error) => self.push_notice(notice_from_error("Project", &error)),
+        }
+    }
+
+    fn poll_removals(&mut self) {
+        let mut index = 0;
+        while index < self.removals.len() {
+            match self.removals[index].try_poll() {
+                ReplyState::Waiting => index += 1,
+                ReplyState::Ready(summary) => {
+                    self.removals.remove(index);
+                    if self.selected == Some(summary.project) {
+                        self.selected = None;
+                        self.files.clear();
+                    }
+                    self.refresh_projects();
+                    self.push_notice(Notice {
+                        title: "Project removed from the catalog. Its files were kept.".into(),
+                        detail: None,
+                        error: false,
+                    });
+                }
+                ReplyState::Failed(error) => {
+                    self.removals.remove(index);
+                    self.push_notice(notice_from_error("Project", &error));
+                }
+                ReplyState::Finished => {
+                    self.removals.remove(index);
+                }
+            }
         }
     }
 
@@ -1689,6 +1839,9 @@ impl ProjectWorkspace {
                 ReplyState::Waiting => index += 1,
                 ReplyState::Ready(()) => {
                     self.access.remove(index);
+                    if let Some(selected) = self.selected {
+                        self.request_files(selected);
+                    }
                 }
                 ReplyState::Failed(error) => {
                     self.access.remove(index);
@@ -1780,8 +1933,10 @@ impl ProjectWorkspace {
         if let Some(control) = &self.scan.control {
             control.cancel();
         }
-        if let Some(worker) = &mut self.settings_worker {
-            worker.begin_shutdown();
+        if !self.users_busy() {
+            if let Some(worker) = &mut self.settings_worker {
+                worker.begin_shutdown();
+            }
         }
         self.try_close_catalog();
     }
@@ -1790,7 +1945,7 @@ impl ProjectWorkspace {
     /// change would otherwise be dropped or overwritten by the write already in the
     /// worker. Runs while the worker still accepts commands.
     fn flush_settings_before_close(&mut self) {
-        if self.closing || !self.settings_loaded {
+        if !self.settings_loaded {
             return;
         }
         let draft_committed = matches!(self.settings_in_flight, Some(SettingsWrite::Draft(_)))
@@ -1825,6 +1980,8 @@ impl ProjectWorkspace {
             || !self.reveals.is_empty()
             || !self.access.is_empty()
             || self.settings_browse.is_some()
+            || self.users_busy()
+            || !self.removals.is_empty()
     }
 
     /// Closes the catalog request queue once the accepted actions drained. Called

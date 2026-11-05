@@ -140,6 +140,7 @@ enum Action {
     SelectProject(ProjectId),
     ToggleFavorite(ProjectId),
     ProjectInfo(ProjectId),
+    UnregisterProject(ProjectId),
     Launch(ProjectFile),
     Reveal(ProjectFile),
     FileInfo(ProjectFile),
@@ -174,6 +175,10 @@ pub struct VfxLauncherApp {
     backup_exclusions: String,
     about_open: bool,
     info_dialog: Option<(String, Vec<String>)>,
+    user_edit: Option<crate::storage::UserId>,
+    user_name: String,
+    user_is_admin: bool,
+    user_delete_confirmation: Option<crate::storage::UserId>,
     new_project: Option<NewProjectDraft>,
     /// A close request is pending until the workers and the catalog have stopped.
     closing: bool,
@@ -202,6 +207,10 @@ impl VfxLauncherApp {
             backup_exclusions: String::new(),
             about_open: false,
             info_dialog: None,
+            user_edit: None,
+            user_name: String::new(),
+            user_is_admin: false,
+            user_delete_confirmation: None,
             new_project: None,
             closing: false,
             close_sent: false,
@@ -726,6 +735,7 @@ impl VfxLauncherApp {
             Action::Reveal(file) => self.workspace.reveal(&file),
             Action::CopyText(text) => self.ctx.copy_text(text),
             Action::ChooseUser(id) => self.workspace.choose_user(id),
+            Action::UnregisterProject(id) => self.workspace.unregister_project(id),
             Action::ProjectInfo(id) => {
                 if let Some(project) = self
                     .workspace
@@ -798,8 +808,14 @@ impl VfxLauncherApp {
                         ))
                         .unwrap_or_else(|| UNKNOWN.to_string())
                 ));
-                // The catalog records when a scan last saw the file; opening
-                // history is a later backend, so it is not invented here.
+                lines.push(format!(
+                    "Last opened: {}",
+                    file.last_opened_at.as_deref().unwrap_or(UNKNOWN)
+                ));
+                lines.push(format!(
+                    "Opened by: {}",
+                    file.opened_by.as_deref().unwrap_or(UNKNOWN)
+                ));
                 lines.push(format!(
                     "Last scanned: {}",
                     file.last_seen_at
@@ -1183,23 +1199,113 @@ impl VfxLauncherApp {
 
     fn settings_users_section(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
+        let mut save = None;
+        let mut remove = None;
         ui.collapsing("Users", |ui| {
             if self.workspace.users().is_empty() {
                 ui.label(egui::RichText::new("No users yet.").small().weak());
             }
+            let editable = self.workspace.actions_enabled() && !self.workspace.users_busy();
             for user in self.workspace.users() {
-                let selected = self.workspace.user().map(|current| current.id) == Some(user.id);
+                let current = self.workspace.user().map(|current| current.id) == Some(user.id);
                 let mut label = user.username.clone();
                 if user.is_admin {
                     label.push_str(" (admin)");
                 }
-                if ui.selectable_label(selected, label).clicked() {
-                    actions.push(Action::ChooseUser(user.id));
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.user_edit == Some(user.id), label)
+                        .clicked()
+                    {
+                        self.user_edit = Some(user.id);
+                        self.user_name = user.username.clone();
+                        self.user_is_admin = user.is_admin;
+                        self.user_delete_confirmation = None;
+                    }
+                    if current {
+                        ui.label("Current user");
+                    } else if ui
+                        .add_enabled(editable, egui::Button::new("Use for history"))
+                        .clicked()
+                    {
+                        actions.push(Action::ChooseUser(user.id));
+                    }
+                    if !current && self.workspace.users().len() > 1 {
+                        if self.user_delete_confirmation == Some(user.id) {
+                            if ui
+                                .add_enabled(editable, egui::Button::new("Confirm remove"))
+                                .clicked()
+                            {
+                                remove = Some(user.id);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.user_delete_confirmation = None;
+                            }
+                        } else if ui
+                            .add_enabled(editable, egui::Button::new("Remove"))
+                            .clicked()
+                        {
+                            self.user_delete_confirmation = Some(user.id);
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.add_enabled(
+                    editable,
+                    egui::TextEdit::singleline(&mut self.user_name).desired_width(240.0),
+                );
+                ui.add_enabled(
+                    editable,
+                    egui::Checkbox::new(&mut self.user_is_admin, "Admin"),
+                );
+                if ui
+                    .add_enabled(
+                        editable && !self.user_name.trim().is_empty(),
+                        egui::Button::new("Add user"),
+                    )
+                    .clicked()
+                {
+                    save = Some(None);
                 }
+                if ui
+                    .add_enabled(
+                        editable && self.user_edit.is_some() && !self.user_name.trim().is_empty(),
+                        egui::Button::new("Save name / role"),
+                    )
+                    .clicked()
+                {
+                    save = Some(self.user_edit);
+                }
+            });
+            ui.label("Removing a name keeps its earlier file history.");
+            if let Some(notice) = self
+                .workspace
+                .notices()
+                .last()
+                .filter(|notice| notice.error && notice.title.starts_with("User"))
+            {
+                ui.label(egui::RichText::new(&notice.title).color(PROBLEM));
+                if let Some(detail) = &notice.detail {
+                    ui.label(egui::RichText::new(detail).color(PROBLEM));
+                }
+            }
+            if self.workspace.users_busy() {
+                ui.label("Saving user…");
             }
         });
         for action in actions {
             self.apply(action);
+        }
+        if let Some(id) = save {
+            self.workspace
+                .save_user(id, self.user_name.clone(), self.user_is_admin);
+        }
+        if let Some(id) = remove {
+            self.workspace.remove_user(id);
+            self.user_delete_confirmation = None;
         }
     }
 
@@ -1349,6 +1455,10 @@ fn project_list_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: &
                 }
                 if ui.button("Project information").clicked() {
                     actions.push(Action::ProjectInfo(project.id));
+                    ui.close();
+                }
+                if ui.button("Unregister project (keep files)").clicked() {
+                    actions.push(Action::UnregisterProject(project.id));
                     ui.close();
                 }
             });
@@ -1536,12 +1646,10 @@ fn project_files_pane(
                         ui.label(modified_text(file));
                     });
                     row.col(|ui| {
-                        ui.label(UNKNOWN)
-                            .on_hover_text("Opening history is not recorded in this build.");
+                        ui.label(file.last_opened_at.as_deref().unwrap_or(UNKNOWN));
                     });
                     row.col(|ui| {
-                        ui.label(UNKNOWN)
-                            .on_hover_text("Attribution is not recorded in this build.");
+                        ui.label(file.opened_by.as_deref().unwrap_or(UNKNOWN));
                     });
                     row.col(|_ui| {});
                 });

@@ -282,6 +282,8 @@ pub struct ProjectFile {
     pub size_bytes: Option<u64>,
     pub modified_unix_ns: Option<i64>,
     pub last_seen_at: Option<String>,
+    pub last_opened_at: Option<String>,
+    pub opened_by: Option<String>,
 }
 
 /// Files of one project that share a timeline, a shot and a version-group base
@@ -1249,7 +1251,7 @@ fn read_project_files(
 ) -> StorageResult<Vec<ProjectFile>> {
     let mut statement = connection
         .prepare(
-            "SELECT f.id, f.storage, f.platform, f.spelling, f.display, f.filename, f.version, f.version_number, f.filetype, f.size_bytes, f.modified_unix_ns, f.last_seen_at FROM project_files pf JOIN files f ON f.id = pf.file_id WHERE pf.project_id = ?1 ORDER BY f.id",
+            "SELECT f.id, f.storage, f.platform, f.spelling, f.display, f.filename, f.version, f.version_number, f.filetype, f.size_bytes, f.modified_unix_ns, f.last_seen_at, (SELECT a.accessed_at FROM file_access_log a WHERE a.file_id=f.id ORDER BY a.id DESC LIMIT 1), (SELECT u.username FROM file_access_log a LEFT JOIN users u ON u.id=a.user_id WHERE a.file_id=f.id ORDER BY a.id DESC LIMIT 1) FROM project_files pf JOIN files f ON f.id = pf.file_id WHERE pf.project_id = ?1 ORDER BY f.id",
         )
         .map_err(|error| sql_error("could not read the project files", error))?;
     let rows = statement
@@ -1267,6 +1269,8 @@ fn read_project_files(
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<i64>>(10)?,
                 row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })
         .map_err(|error| sql_error("could not read the project files", error))?;
@@ -1285,6 +1289,8 @@ fn read_project_files(
             size_bytes,
             modified_unix_ns,
             last_seen_at,
+            last_opened_at,
+            opened_by,
         ) = row.map_err(|error| sql_error("could not read a project file", error))?;
         let columns = PathColumns {
             storage,
@@ -1302,6 +1308,8 @@ fn read_project_files(
             size_bytes: size_bytes.and_then(|value| u64::try_from(value).ok()),
             modified_unix_ns,
             last_seen_at,
+            last_opened_at,
+            opened_by,
         });
     }
     Ok(files)
