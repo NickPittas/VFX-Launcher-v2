@@ -1,5 +1,27 @@
 # Implementation status
 
+## S1 structure integration and executor replacement completion
+
+Integrated structure.rs: named sequence/shot tree editing, independent shots,
+legacy naming/numbering presets, client values, template snapshot/rename, marker
+expansion, new-project and add-to-existing operation plans. Nuke content is an
+explicit provider hook; no structure UI or execution caller exists yet. Source
+readback completed; independent parity review remains required.
+
+Integrated Replace/PreserveExisting held-original identity, exact displacement
+recovery intent, post-checkpoint stamp revalidation, synced displacement, verified
+publication, parent sync while backup exists, Installed acknowledgement, explicit
+RemovingBackup intent, held-identity cleanup and verified no-clobber restoration.
+Post-install sync errors carry full bytes/recovery. Coordinator also fixed two
+remaining omissions: source-removal sync failure is a post-install failure, and
+failed post-publish identity inspection records installation before its full-byte
+failure. Native cleanup identity uses device/inode/type, so chmod does not
+invalidate a held staging identity. No destination is rolled back on uncertainty.
+
+All original executor findings have implementation changes pending fresh review;
+this is not a safety or runtime sign-off. Compilation passes without warnings,
+and no tests, transfers or production data access ran. The executor stays unwired.
+
 ## Executor staging integration and destination ancestor checks
 
 Integrated held staging identity and publication tracking; exact staging path is

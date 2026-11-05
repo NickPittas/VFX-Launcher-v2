@@ -1,5 +1,11 @@
 # Current implementation queue
 
+**Current state supersedes the historical entries below:** source/staging/Replace
+corrections are integrated and compile; a fresh full executor review is next,
+followed by disposable localized verification before any UI execution wiring.
+Structure and Nuke pure planners are integrated; structure parity review and
+connecting the Nuke content provider/UI remain outstanding. No runtime pass yet.
+
 **Latest integration:** original executor findings 2 and 4 are implemented from
 the isolated source-safety packet: declared source root retained and identity
 checked, descendant parents resolved beneath its handle, full source entry and

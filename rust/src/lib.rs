@@ -22,6 +22,7 @@ pub mod paths;
 pub mod project_workspace;
 pub mod projects;
 pub mod storage;
+pub mod structure;
 pub mod transfers;
 
 pub use app::{VfxLauncherApp, run_gui};

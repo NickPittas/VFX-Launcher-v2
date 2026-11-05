@@ -9,11 +9,15 @@
 //! under its reviewed name.
 //!
 //! The only window that mutates an existing reviewed destination is the
-//! displacement/restore critical section used by Replace and PreserveExisting:
-//! the old file is renamed to a reserved sibling, the staged file is committed,
-//! and a failed commit renames the old file back. Nothing else moves, replaces
-//! or deletes a destination, and no-clobber rename is the commit primitive on
-//! both sides of that window.
+//! displacement/install/cleanup sequence used by Replace and PreserveExisting.
+//! Its exact intent - staged file, destination and displaced name - is journaled
+//! before the first rename; the old file is then moved to that reserved sibling
+//! without clobbering and proved to still be the entry this item read. Install
+//! evidence follows the folder sync while that file is still present. Replace
+//! journals a separate cleanup step and deletes only an entry that still matches
+//! the held identity; PreserveExisting keeps the file and reports it as a
+//! recovery path. A failed commit restores the old file only while the held
+//! identity proves it, with a no-clobber rename that is synced afterwards.
 //!
 //! Deliberate limits of this packet:
 //! - Linux only; other platforms keep the unsupported-operation boundary.
@@ -165,10 +169,10 @@ pub fn execute(
             break;
         }
         match executor.run(item) {
-            Ok(Done::Succeeded(message)) => {
+            Ok(Done::Succeeded { note, recovery }) => {
                 let state = success_state(item.effect);
                 let bytes = item.bytes.unwrap_or(0);
-                executor.record(item, state, bytes, message, Vec::new())?;
+                executor.record(item, state, bytes, note, recovery)?;
             }
             Ok(Done::SourceRetained { message, source }) => {
                 executor.record(
@@ -337,10 +341,18 @@ fn awaited<T>(
         .map_err(storage_refused)
 }
 
-/// How one item finished before its terminal state is chosen.
+/// How one item finished before its terminal state is chosen. A success carries
+/// the exact paths it deliberately retained, so a kept original is reportable
+/// recovery evidence rather than a silent leftover.
 enum Done {
-    Succeeded(Option<String>),
-    SourceRetained { message: String, source: PathBuf },
+    Succeeded {
+        note: Option<String>,
+        recovery: Vec<PathBuf>,
+    },
+    SourceRetained {
+        message: String,
+        source: PathBuf,
+    },
 }
 
 /// Per-item flow. A `Problem` or `Cancelled` becomes that item's terminal
@@ -375,11 +387,12 @@ enum SourceCheck {
     Unknown(String),
 }
 
-/// What one commit established: the note to report and whether the destination
-/// folder's namespace sync succeeded. A move keeps its source without it.
+/// What one commit established: the note to report and the exact paths it kept.
+/// Durability is not a flag here: a refused folder sync is a post-install
+/// failure, never a successful note.
 struct InstallOutcome {
     note: Option<String>,
-    durable: bool,
+    recovery: Vec<PathBuf>,
 }
 
 /// The single staging file one item created, with the identity read from the
@@ -402,6 +415,13 @@ fn io_problem(what: &str, path: &Path, error: io::Error) -> Flow {
         format!("{what} {} could not be used: {error}", path.display()),
         Vec::new(),
     )
+}
+
+/// Identity without the permission bits, matching the device/inode identity the
+/// review and every later proof use. Staged files are chmodded after creation, so
+/// their held identity's mode no longer describes the installed entry.
+fn same_entry(left: EntryIdentity, right: EntryIdentity) -> bool {
+    left.device == right.device && left.inode == right.inode
 }
 
 struct Executor<'a> {
@@ -568,7 +588,10 @@ impl Executor<'_> {
             return Err(problem(message));
         }
         match item.effect {
-            ItemEffect::Skip => Ok(Done::Succeeded(None)),
+            ItemEffect::Skip => Ok(Done::Succeeded {
+                note: None,
+                recovery: Vec::new(),
+            }),
             ItemEffect::CreateDirectory => self.create_directory(item),
             ItemEffect::CreateFile => self.create_file(item),
             ItemEffect::Copy | ItemEffect::Move => self.transfer_file(item),
@@ -816,7 +839,10 @@ impl Executor<'_> {
                         io_problem("the destination folder", &destination, error)
                     })?;
                     self.verified_folders.insert(relative, identity);
-                    Ok(Done::Succeeded(None))
+                    Ok(Done::Succeeded {
+                        note: None,
+                        recovery: Vec::new(),
+                    })
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(problem(format!(
                     "folder {} appeared after review; it was left untouched",
@@ -840,7 +866,10 @@ impl Executor<'_> {
                 )
                 .map_err(|message| Flow::Problem(message, Vec::new()))?;
                 self.verified_folders.insert(relative, fresh);
-                Ok(Done::Succeeded(None))
+                Ok(Done::Succeeded {
+                    note: None,
+                    recovery: Vec::new(),
+                })
             }
             _ => Err(problem(format!(
                 "reviewed folder expectation for {} is unusable",
@@ -884,7 +913,10 @@ impl Executor<'_> {
         }
 
         match self.install(item, &parent, &name, &mut stage, &destination) {
-            Ok(installed) => Ok(Done::Succeeded(installed.note)),
+            Ok(installed) => Ok(Done::Succeeded {
+                note: installed.note,
+                recovery: installed.recovery,
+            }),
             Err(flow) => Err(self.abandon_stage(&parent, stage, flow)),
         }
     }
@@ -947,24 +979,10 @@ impl Executor<'_> {
                 return Err(self.abandon_stage(&parent, stage, flow));
             }
         };
-        let mut note = combine_notes(metadata_note, installed.note);
+        let note = combine_notes(metadata_note, installed.note);
+        let recovery = installed.recovery;
 
         if item.effect == ItemEffect::Move {
-            if !installed.durable {
-                return Ok(Done::SourceRetained {
-                    message: match note {
-                        Some(note) => format!(
-                            "the source {} was kept because the copy is not confirmed durable ({note})",
-                            source.display()
-                        ),
-                        None => format!(
-                            "the source {} was kept because the copy is not confirmed durable",
-                            source.display()
-                        ),
-                    },
-                    source,
-                });
-            }
             self.checkpoint(item, ItemCheckpoint::RemovingSource, None, &[])?;
             let current = match self.recheck_source(
                 &source_parent,
@@ -1006,11 +1024,16 @@ impl Executor<'_> {
                     source,
                 });
             }
-            // The removal's own durability is a note, not a rollback: the copy is
-            // already committed and the source is gone.
-            note = combine_notes(note, self.sync_move_directories(&source_parent, &parent));
+            if let Err(message) = self.sync_move_directories(&source_parent, &parent) {
+                return Err(Flow::PostInstall {
+                    message: format!(
+                        "the destination is installed and the source was removed, but {message}"
+                    ),
+                    recovery: vec![source, destination],
+                });
+            }
         }
-        Ok(Done::Succeeded(note))
+        Ok(Done::Succeeded { note, recovery })
     }
 
     /// Re-proves the source between the acknowledged `RemovingSource` checkpoint
@@ -1161,11 +1184,49 @@ impl Executor<'_> {
                 match self.root.publish_noreplace(parent, &stage.name, name) {
                     Ok(()) => {
                         stage.published = true;
+                        if let Err(message) =
+                            self.verify_installed(parent, name, stage, destination)
+                        {
+                            self.checkpoint(
+                                item,
+                                ItemCheckpoint::Installed,
+                                Some(message.clone()),
+                                &[destination.to_path_buf()],
+                            )?;
+                            return Err(Flow::PostInstall {
+                                message,
+                                recovery: vec![destination.to_path_buf()],
+                            });
+                        }
                         // Journal evidence follows the namespace sync, so the record
                         // never claims a durability the filesystem refused.
-                        let (note, durable) = self.namespace_sync(parent);
-                        self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?;
-                        Ok(InstallOutcome { note, durable })
+                        match self.namespace_sync(parent) {
+                            Ok(()) => {
+                                self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?;
+                                Ok(InstallOutcome {
+                                    note: None,
+                                    recovery: Vec::new(),
+                                })
+                            }
+                            Err(reason) => {
+                                self.checkpoint(
+                                    item,
+                                    ItemCheckpoint::Installed,
+                                    Some(format!(
+                                        "the reviewed bytes are installed at {}, but {reason}",
+                                        destination.display()
+                                    )),
+                                    &[destination.to_path_buf()],
+                                )?;
+                                Err(Flow::PostInstall {
+                                    message: format!(
+                                        "the reviewed bytes were installed at {}, but {reason}, so the install is not confirmed durable",
+                                        destination.display()
+                                    ),
+                                    recovery: vec![destination.to_path_buf()],
+                                })
+                            }
+                        }
                     }
                     Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                         Err(problem(format!(
@@ -1187,6 +1248,9 @@ impl Executor<'_> {
                     .map_err(|error| io_problem("the existing destination", destination, error))?;
                 verify_existing_destination(&current, stamp, destination)
                     .map_err(|message| Flow::Problem(message, Vec::new()))?;
+                // Held for every later proof: only the entry this item read is ever
+                // restored or deleted, never whatever the name means afterwards.
+                let old_identity = EntryIdentity::from(current);
 
                 let (backup, keep) = match item.displaced.as_ref() {
                     Some(displaced) => {
@@ -1206,10 +1270,41 @@ impl Executor<'_> {
                     None => (self.unique_backup_name(parent, name)?, false),
                 };
 
-                // Displacement/restore critical section: the reviewed destination
-                // is renamed aside without clobbering, the staged file is committed
-                // without clobbering, and a failed commit renames it straight back.
-                self.checkpoint(item, ItemCheckpoint::Displacing, None, &[])?;
+                let backup_path = destination.with_file_name(&backup);
+                let retained =
+                    |backup: &Path| vec![destination.to_path_buf(), backup.to_path_buf()];
+
+                // The exact displacement window is journaled before the first
+                // rename: the staged file, the destination and the name the
+                // reviewed original will occupy.
+                self.checkpoint(
+                    item,
+                    ItemCheckpoint::Displacing,
+                    None,
+                    &[
+                        stage.path.clone(),
+                        destination.to_path_buf(),
+                        backup_path.clone(),
+                    ],
+                )?;
+
+                // The checkpoint is awaited, so the old file is proved again in
+                // full - kind, size, mtime and identity - before it is moved. A
+                // change after review or since the intent was recorded refuses the
+                // item with both names untouched.
+                let fresh = self
+                    .root
+                    .entry_stat(parent, name)
+                    .map_err(|error| io_problem("the existing destination", destination, error))?;
+                verify_existing_destination(&fresh, stamp, destination)
+                    .map_err(|message| Flow::Problem(message, Vec::new()))?;
+                if !same_entry(EntryIdentity::from(fresh), old_identity) {
+                    return Err(problem(format!(
+                        "destination {} is no longer the file this item journaled its displacement for; it was left untouched",
+                        destination.display()
+                    )));
+                }
+
                 if let Err(error) = self.root.rename_between(parent, name, parent, &backup) {
                     return Err(if error.kind() == ErrorKind::AlreadyExists {
                         problem(format!(
@@ -1220,45 +1315,163 @@ impl Executor<'_> {
                         io_problem("the existing destination", destination, error)
                     });
                 }
+                // Displacement succeeded. From here the original is handled only
+                // through the held identity, so a name that stopped meaning it is
+                // reported instead of being restored or deleted.
+                match self.root.entry_stat(parent, &backup) {
+                    Ok(entry) if same_entry(EntryIdentity::from(entry), old_identity) => {}
+                    Ok(_) => {
+                        return Err(Flow::Problem(
+                            format!(
+                                "the reviewed destination was moved to {}, but that name no longer holds the file this item displaced; nothing was restored or deleted",
+                                backup_path.display()
+                            ),
+                            retained(&backup_path),
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(Flow::Problem(
+                            format!(
+                                "the reviewed destination was moved to {}, but it cannot be inspected: {error}; nothing was restored or deleted",
+                                backup_path.display()
+                            ),
+                            retained(&backup_path),
+                        ));
+                    }
+                }
+                // A displacement that is not durable could lose both names in a
+                // power loss, so the install waits for this sync.
+                if let Err(reason) = self.namespace_sync(parent) {
+                    return Err(Flow::Problem(
+                        format!(
+                            "the reviewed destination was moved to {}, but {reason}; nothing was restored or deleted",
+                            backup_path.display()
+                        ),
+                        retained(&backup_path),
+                    ));
+                }
                 match self.root.publish_noreplace(parent, &stage.name, name) {
                     Ok(()) => {
                         stage.published = true;
-                        // The displaced original is deleted only once the install is
-                        // both durable and journaled, so an interrupted or unsynced
-                        // window keeps a copy of the file instead of losing it.
-                        let (mut note, durable) = self.namespace_sync(parent);
-                        self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?;
-                        if !keep {
-                            let backup_path = destination.with_file_name(&backup);
-                            if durable {
-                                if let Err(error) = self.remove_owned(parent, &backup) {
-                                    note = combine_notes(
-                                        note,
-                                        Some(format!(
-                                            "installed, but the replaced file {} could not be removed: {error}",
-                                            backup_path.display()
-                                        )),
-                                    );
-                                }
-                            } else {
-                                note = combine_notes(
-                                    note,
+                        if let Err(message) =
+                            self.verify_installed(parent, name, stage, destination)
+                        {
+                            self.checkpoint(
+                                item,
+                                ItemCheckpoint::Installed,
+                                Some(message.clone()),
+                                &retained(&backup_path),
+                            )?;
+                            return Err(Flow::PostInstall {
+                                message,
+                                recovery: retained(&backup_path),
+                            });
+                        }
+                        // Evidence follows the folder sync while the displaced
+                        // original is still beside the destination. A refused sync
+                        // is recorded as content installed, not as durability.
+                        match self.namespace_sync(parent) {
+                            Ok(()) => {
+                                self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?
+                            }
+                            Err(reason) => {
+                                self.checkpoint(
+                                    item,
+                                    ItemCheckpoint::Installed,
                                     Some(format!(
-                                        "the previous destination was kept at {}",
-                                        backup_path.display()
+                                        "the reviewed bytes are installed at {}, but {reason}",
+                                        destination.display()
                                     )),
-                                );
+                                    &retained(&backup_path),
+                                )?;
+                                return Err(Flow::PostInstall {
+                                    message: format!(
+                                        "the reviewed bytes were installed at {}, but {reason}, so the install is not confirmed durable; the previous destination is retained at {}",
+                                        destination.display(),
+                                        backup_path.display()
+                                    ),
+                                    recovery: retained(&backup_path),
+                                });
                             }
                         }
-                        Ok(InstallOutcome { note, durable })
+                        if keep {
+                            // PreserveExisting keeps the reviewed original at its
+                            // numbered name and reports exactly where it stayed.
+                            return Ok(InstallOutcome {
+                                note: Some(format!(
+                                    "installed; the previous destination was kept at {}",
+                                    backup_path.display()
+                                )),
+                                recovery: vec![backup_path.clone()],
+                            });
+                        }
+                        // Cleanup is an additive journaled step naming the exact
+                        // file, appended after the install evidence and before the
+                        // deletion.
+                        self.checkpoint(
+                            item,
+                            ItemCheckpoint::RemovingBackup,
+                            None,
+                            &[backup_path.clone()],
+                        )?;
+                        if let Err(error) = self.root.remove_owned(parent, &backup, old_identity) {
+                            if error.kind() != ErrorKind::NotFound {
+                                return Err(Flow::PostInstall {
+                                    message: format!(
+                                        "the reviewed bytes were installed at {}, but the replaced file {} could not be removed or shown to be the file this item displaced: {error}",
+                                        destination.display(),
+                                        backup_path.display()
+                                    ),
+                                    recovery: retained(&backup_path),
+                                });
+                            }
+                        }
+                        if let Err(reason) = self.namespace_sync(parent) {
+                            return Err(Flow::PostInstall {
+                                message: format!(
+                                    "the reviewed bytes were installed at {}, and the replaced file {} was removed, but {reason}",
+                                    destination.display(),
+                                    backup_path.display()
+                                ),
+                                recovery: retained(&backup_path),
+                            });
+                        }
+                        Ok(InstallOutcome {
+                            note: None,
+                            recovery: Vec::new(),
+                        })
                     }
                     Err(error) => {
-                        let backup_path = destination.with_file_name(&backup);
+                        // A failed commit restores the original only while the held
+                        // identity still proves the backup name means it; the
+                        // restore is itself a no-clobber rename, synced afterwards.
+                        let proven = self.root.entry_stat(parent, &backup).is_ok_and(|entry| {
+                            same_entry(EntryIdentity::from(entry), old_identity)
+                        });
+                        if !proven {
+                            return Err(Flow::Problem(
+                                format!(
+                                    "the staged file could not be installed at {} ({error}), and {} cannot be shown to be the file this item displaced, so nothing was restored or deleted",
+                                    destination.display(),
+                                    backup_path.display()
+                                ),
+                                retained(&backup_path),
+                            ));
+                        }
                         match self.root.rename_between(parent, &backup, parent, name) {
-                            Ok(()) => Err(problem(format!(
-                                "the staged file could not be installed at {} ({error}); the previous destination was restored",
-                                destination.display()
-                            ))),
+                            Ok(()) => match self.namespace_sync(parent) {
+                                Ok(()) => Err(problem(format!(
+                                    "the staged file could not be installed at {} ({error}); the previous destination was restored",
+                                    destination.display()
+                                ))),
+                                Err(reason) => Err(Flow::Problem(
+                                    format!(
+                                        "the staged file could not be installed at {} ({error}); the previous destination was restored to that name, but {reason}",
+                                        destination.display()
+                                    ),
+                                    retained(&backup_path),
+                                )),
+                            },
                             Err(restore_error) => Err(Flow::Problem(
                                 format!(
                                     "the staged file could not be installed at {} ({error}), and the previous destination could not be restored ({restore_error}); it remains at {}",
@@ -1276,11 +1489,6 @@ impl Executor<'_> {
                 destination.display()
             ))),
         }
-    }
-
-    fn remove_owned(&self, parent: &OwnedFd, name: &OsStr) -> io::Result<()> {
-        let identity = self.root.entry_identity(parent, name)?;
-        self.root.remove_owned(parent, name, identity)
     }
 
     /// Smallest unused `<stem>.vfxlauncher-replace-<n>` beside the destination.
@@ -1309,32 +1517,49 @@ impl Executor<'_> {
         suffixed_name(name, STAGING_SUFFIX, self.staging_counter)
     }
 
-    /// Syncs the folder that now holds a committed file. Some network and FUSE
-    /// filesystems refuse a directory fsync; that is reported, never assumed, and
-    /// a move keeps its source while the install is not confirmed durable.
-    fn namespace_sync(&self, parent: &OwnedFd) -> (Option<String>, bool) {
-        match self.root.sync_dir(parent) {
-            Ok(()) => (None, true),
-            Err(error) => (
-                Some(format!(
-                    "the destination folder could not be synced, so the install is not confirmed durable: {error}"
-                )),
-                false,
-            ),
+    /// Proof that the destination name now means the staged file this item
+    /// created, using the identity held from the creating handle.
+    fn verify_installed(
+        &self,
+        parent: &OwnedFd,
+        name: &OsStr,
+        stage: &Stage,
+        destination: &Path,
+    ) -> Result<(), String> {
+        let entry = self.root.entry_stat(parent, name).map_err(|error| {
+            format!(
+                "the installed destination {} could not be inspected after the commit: {error}",
+                destination.display()
+            )
+        })?;
+        if !same_entry(EntryIdentity::from(entry), stage.identity) {
+            return Err(format!(
+                "the destination {} no longer holds the staged file this item created; nothing was restored or deleted",
+                destination.display()
+            ));
         }
+        Ok(())
+    }
+
+    /// Syncs the folder that now holds a committed file. Some network and FUSE
+    /// filesystems refuse a directory fsync; that is reported, never assumed.
+    fn namespace_sync(&self, parent: &OwnedFd) -> Result<(), String> {
+        self.root
+            .sync_dir(parent)
+            .map_err(|error| format!("the destination folder could not be synced: {error}"))
     }
 
     fn sync_move_directories(
         &self,
         source_parent: &OwnedFd,
         destination_parent: &OwnedFd,
-    ) -> Option<String> {
+    ) -> Result<(), String> {
         match (
             self.root.sync_dir(source_parent),
             self.root.sync_dir(destination_parent),
         ) {
-            (Ok(()), Ok(())) => None,
-            (Err(error), _) | (_, Err(error)) => Some(format!(
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (_, Err(error)) => Err(format!(
                 "moved, but the affected folders could not be synced: {error}"
             )),
         }

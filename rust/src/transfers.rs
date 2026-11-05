@@ -2402,6 +2402,10 @@ pub enum ItemCheckpoint {
     Displacing,
     /// Destination installed by the no-clobber commit.
     Installed,
+    /// About to remove the displaced original a Replace retained beside the
+    /// destination. Optional: PreserveExisting keeps it, and histories written
+    /// before this step existed move straight to `RemovingSource`.
+    RemovingBackup,
     /// About to remove the source of a Move.
     RemovingSource,
 }
@@ -2413,6 +2417,7 @@ impl ItemCheckpoint {
             Self::Staged => "staged",
             Self::Displacing => "displacing",
             Self::Installed => "installed",
+            Self::RemovingBackup => "removing_backup",
             Self::RemovingSource => "removing_source",
         }
     }
@@ -2882,7 +2887,11 @@ fn check_install_evidence(
         && event.committed_bytes.is_some_and(|bytes| bytes > 0)
         && !matches!(
             previous,
-            Some(ItemCheckpoint::Installed | ItemCheckpoint::RemovingSource)
+            Some(
+                ItemCheckpoint::Installed
+                    | ItemCheckpoint::RemovingBackup
+                    | ItemCheckpoint::RemovingSource
+            )
         )
     {
         return Err("committed bytes require an earlier installation checkpoint".into());
@@ -3214,7 +3223,11 @@ fn cancel_unfinished_items(tx: &Transaction<'_>, run_id: i64) -> StorageResult<(
         if history.events.iter().any(|event| {
             matches!(
                 event.checkpoint,
-                Some(ItemCheckpoint::Installed | ItemCheckpoint::RemovingSource)
+                Some(
+                    ItemCheckpoint::Installed
+                        | ItemCheckpoint::RemovingBackup
+                        | ItemCheckpoint::RemovingSource
+                )
             )
         }) {
             return Err(invalid(

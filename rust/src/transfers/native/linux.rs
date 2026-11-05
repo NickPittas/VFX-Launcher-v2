@@ -185,7 +185,11 @@ impl Root {
         name: &OsStr,
         id: EntryIdentity,
     ) -> io::Result<()> {
-        if self.entry_identity(parent, name)? != id {
+        let fresh = self.entry_identity(parent, name)?;
+        if fresh.device != id.device
+            || fresh.inode != id.inode
+            || FileType::from_raw_mode(fresh.mode) != FileType::from_raw_mode(id.mode)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "entry identity changed",
