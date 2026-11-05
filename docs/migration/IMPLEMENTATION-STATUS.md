@@ -1,5 +1,27 @@
 # Implementation status
 
+## Coordinator F1/F4 integration corrections
+
+After the initial packet report, source inspection corrected missing imports,
+cross-module metadata visibility, an unstable anonymous lifetime, Windows
+optional metadata field conversion, reversed lexical containment labels,
+root-level exclusions and suffix matching that had stripped the leading dot.
+Wildcard exclusions now refuse the scan rather than ignoring the user's rule.
+Repeated directory identities are skipped with Partial coverage to stop mount
+cycles. Matching before/after root stat identities no longer promotes continuity
+to Proven: discovery has no trusted continuous mount observation, so catalog
+pruning remains disabled without additional evidence.
+
+The paths module passed a standalone rustc metadata compilation. The new Rust
+library passed `cargo check --offline --locked --manifest-path rust/Cargo.toml
+--lib` after those fixes, on Linux. Cargo generated Cargo.lock; dependency cache,
+temporary compiler files and target outputs were kept inside this project.
+The first offline attempt lacked egui_extras; bounded dependency resolution and
+the first compilation exposed the lifetime error, which was corrected before
+the passing repeat. No tests, test suites, launches or screenshots were run.
+This supersedes contradictory original packet descriptions below; Windows and
+filesystem runtime behavior remain unverified.
+
 ## Packet F0 — foundation (2026-11-05)
 
 Branch: `migration/rust-egui-suite`. Sole writer for this packet.
@@ -127,3 +149,229 @@ Worker plumbing (`jobs.rs`, implements `CONTRACTS.md` §6 for this packet):
 3. Then F2 storage/config and P1/P2 (catalog + launch), which replace the placeholder rows and enable `New project`/per-row `Launch`.
 
 Ownership note: this packet wrote only the five files listed at the top plus this status document; the review-correction pass touched only `rust/src/jobs.rs`, `rust/src/app.rs` and this document. The Python application, migration documents and `gitclones/` references were read but not modified.
+
+## Packet F1 + F4 — paths and read-only discovery (2026-11-05)
+
+Branch: `migration/rust-egui-suite`. Sole writer for this packet; no other
+writer was active. Files written by this packet (nothing else was modified):
+
+| File | Contents |
+|---|---|
+| `rust/src/paths.rs` | F1: module-owned `PathError`/`PathCategory`/`PathIssue`, private comparable `PathKey`, `path_key`, `normalize_lexical`, `relation`/`PathRelation`, `evidence_same_file`, `RootIdentity`/`FileIdentity`, `validate_destination`, `inspect_root`, `utf8_spelling`, `retain_imported`/`ImportedPath`/`PlatformTag`. |
+| `rust/src/discovery.rs` | F4: `ScanPurpose`, `SuffixMode`, `ScanFilters`, `default_filters`, `ScanRequest`, `FileStamp`, `FileEntry`, `Coverage`, `RootContinuity`, `ScanSnapshot`, `ChildDirectories`, read-only `walk` and `child_directories`. |
+| `rust/src/lib.rs` | Added `pub mod discovery;` and `pub mod paths;` with updated crate doc (integration seam only). |
+
+## Implemented behavior — F1 paths
+
+- `path_key(path, base)` computes an opaque, comparable lexical key. Relative
+  inputs resolve against the explicit absolute `base` (never the process CWD);
+  absolute inputs ignore `base`. POSIX keeps case, backslashes (a legal name
+  byte) and non-UTF-8 bytes verbatim; `.` is dropped and `..` pops lexically
+  with the root as its own parent (`normpath` semantics). Windows keys are the
+  encoded bytes ASCII-case-folded, with the drive/UNC prefix preserved. No
+  `canonicalize` anywhere: offline identity is purely lexical.
+- `normalize_lexical(path, base)` returns the normalized native spelling as a
+  `PathBuf` rebuilt without `push` separator heuristics (prefix `C:` + root
+  `\`, UNC prefix + root, and POSIX roots are joined explicitly), preserving
+  original case and non-UTF-8 bytes.
+- Drive-relative Windows inputs (`C:foo`) are rejected (`InvalidInput`): their
+  meaning depends on per-drive CWD state, which is never invented here. A
+  non-absolute base is likewise rejected.
+- `relation(a, b)` classifies `Same` / `FirstInsideSecond` /
+  `SecondInsideFirst` / `Disjoint` on normalized spellings only; the doc
+  states explicitly that lexical disjointness is not proof of distinct files.
+- `evidence_same_file(a, b)` returns `Some` only from definite stat identity
+  (POSIX dev+ino, Windows volume serial + file index) and `None` when either
+  stat fails or evidence is missing. Identity comparison requires shared
+  evidence: two identities carrying no common evidence kind never compare
+  equal. Hardlinks are not universally detected.
+- `validate_destination(root, relative)` rejects, in order: non-absolute root,
+  empty `relative`, absolute `relative`, NUL, `.`/`..` components, drive/UNC
+  prefixes (`ForeignPlatform`), and per-platform invalid names — on Windows
+  reserved characters, control bytes, trailing dot/space and reserved device
+  stems (CON/PRN/AUX/NUL/COM1-9/LPT1-9); on POSIX only a first component that
+  parses as a Windows drive/UNC spelling is rejected as foreign (later
+  components named like `C:\x` are legal POSIX names and preserved). It then
+  stats the root (followed deliberately as the user's anchor; missing →
+  `MissingRoot`), and walks every *existing* ancestor of the target with
+  no-follow metadata: any symlink, or on Windows any reparse point
+  (`FILE_ATTRIBUTE_REPARSE_POINT`), is `Escape`; any non-`NotFound` stat error
+  refuses the operation — confinement that cannot be proven is an escape.
+  Absent components pass; this is snapshot validation only and execution must
+  re-check with no-follow facilities. The returned value is
+  `root.join(relative)`.
+- `inspect_root(path)` maps `NotFound` → `MissingRoot`, `PermissionDenied` →
+  `Permission`, everything else → `Unavailable`, and never reads a failed stat
+  as "the files are gone".
+- `retain_imported(raw)` classifies spellings by distinctive markers only
+  (leading `\\` → Windows, `X:`/`X:\`/`X:/` → Windows, leading `/` → POSIX,
+  everything else `Unknown`) and sets `native: Some` only when the tag matches
+  the current platform. Foreign/unknown spellings stay unresolved; no
+  mount/drive mapping is invented. A mounted Linux share and a Windows UNC
+  path are equal only via an explicit later mapping.
+- `utf8_spelling(path)` is `Option<&str>`; there is no lossy path→String
+  helper in the public API. The only lossy rendering is `Path::Display` inside
+  diagnostic messages, which are never round-tripped.
+
+## Implemented behavior — F4 discovery
+
+- `walk(request, control, events) -> PathResult<ScanSnapshot>`: `Err` only for
+  a non-absolute root. Every filesystem outcome is an `Ok` snapshot with
+  explicit coverage. Iterative explicit-stack walker; per-directory entries
+  are sorted by native name bytes so traversal and diagnostics are
+  deterministic regardless of readdir order.
+- Coverage: `RootUnavailable` when the pre-scan root stat fails (entries
+  empty, identity `None`); `Cancelled` when any checkpoint reports
+  cancellation (entries so far retained; the post-scan identity check is then
+  skipped); `Partial` when any directory read, entry stat, broken symlink or
+  unrepresentable mtime occurred, or when the post-scan identity check cannot
+  re-prove the same root; `Complete` otherwise. Post-scan `inspect_root`
+  compared against the pre-scan `RootIdentity` (dev+ino / volume+file index)
+  sets `RootContinuity::Proven` or `Uncertain`; `Uncertain` is the default and
+  the catalog packet must treat "not seen" as unverified, never deleted. A
+  failed subtree never produces an empty successful result.
+- Entry classification: `readdir` file type first; symlinks are resolved once
+  (followed stat) so directory links become `DirectoryLink` — reported as an
+  `Unsupported` `PathIssue` and never descended — and file links are stamped
+  through their target (legacy `os.walk`+`getsize` parity; broken links
+  degrade to `Partial`). Windows adds a reparse-attribute check (junctions and
+  mount points are not descended) via `DirEntryExt`/`MetadataExt::file_attributes`.
+  Unknown readdir types (POSIX `DT_UNKNOWN`) resolve through no-follow
+  `DirEntry::metadata`. Non-directory special files (FIFOs etc.) are treated
+  as files, matching legacy `os.walk`.
+- Skipped directory links are recorded as issues but are policy, not failure:
+  they do not by themselves turn `Complete` into `Partial`.
+- Filters: `SuffixMode::LastExtension` mirrors the legacy project scan
+  (`splitext(f)[1].lower() in {'.nk', '.aep'}`, so a file literally named
+  `.nk` does not match), with explicit case-insensitive exclusion of names
+  ending `.nk~`/`.nk.autosave`. `SuffixMode::NameSuffix` mirrors extension
+  copy (`file.lower().endswith(ext.lower())`, defaults `.nk`/`.autosave`) and
+  backup (`find -iname '*.nk' -o -iname '*.aep'`). All matching is
+  ASCII-case-insensitive on native bytes (documented approximation of the
+  legacy Unicode `lower()`). `default_filters(Incoming|StructureExport)` is
+  `None` — their pattern/sequence discovery belongs to I1/I2 and is not
+  approximated here.
+- `excludes`: literal patterns match any single root-relative component or the
+  full root-relative path, case-insensitively (legacy finder parity, minus
+  wildcards). Patterns containing `*`/`?`/`[` are announced through a
+  diagnostic and *ignored* rather than misapplied as literals; fnmatch
+  semantics arrive with the backup packet. The root itself is never excluded,
+  and excluded directories are pruned without descent.
+- Progress/diagnostics/pause/cancel: `events.progress(JobPhase::Scanning, …)`
+  per directory with the current path; every issue is both collected into
+  `snapshot.errors` and emitted as a bounded diagnostic;
+  `control.checkpoint()` runs between directories and every 128 entries
+  (64 for child listings). The terminal `finish` mapping is deliberately left
+  to the caller.
+- `child_directories(root, control, events)`: immediate children only, no
+  descent, directory symlinks included (legacy `scandir`+`is_dir` followed
+  links when proposing registration candidates), sorted by case-folded name
+  then full native path; same coverage vocabulary; no root identity is taken
+  (registration is non-destructive by contract).
+- Final ordering of `ScanSnapshot.entries` and `ChildDirectories.directories`
+  is (case-folded display name, exact native path bytes): the fold is only an
+  ordering aid, so no two distinct paths can compare equal and non-UTF-8
+  names keep byte identity.
+
+## Contract adaptations (deliberate, minimal)
+
+- `EventSink` became `&JobEvents` and `walk` takes `&ScanRequest`; the F0
+  seam is used as built (`progress`/`diagnostic`/`checkpoint`), and the
+  terminal report stays with the worker body, matching this packet's scope.
+- CONTRACTS' inline `suffixes`/`excludes` on `ScanRequest` became a
+  `ScanFilters` value plus `SuffixMode`, because the three legacy tools use
+  two genuinely different match styles.
+- `ScanSnapshot` gained `purpose` and `RootContinuity`; both are consumed by
+  later packets (P1 dispatch and prune gating) and are additive fields.
+- `ScanPurpose::Incoming`/`StructureExport` exist but have no preset here.
+
+## Deliberate limits of this packet
+
+- `cfg(windows)` code paths (drive/UNC keys, reparse detection, reserved
+  names, volume/file-index identity) were hand-traced only; they are not
+  compiled on this Linux machine and no Windows behavior claim is made.
+- ASCII-only case folding on Windows keys and suffix matching; legacy
+  `normcase`/`lower()` folded full Unicode. Non-UTF-8 bytes keep exact byte
+  identity everywhere.
+- Verbatim `\\?\` spellings are anchored as std parses them; no Win32
+  normalization equivalence is claimed for them.
+- Wildcard excludes are announced and ignored, not applied.
+- Bind-mount cycles could loop (legacy parity); cancellation remains the
+  escape. No visited-identity cache.
+- `walk` on `recursive == false` lists files in the root directory only;
+  immediate-child *directories* are exclusively `child_directories`.
+- Discovery is strictly read-only: the only fs calls in the module are
+  `read_dir`, `metadata`, `symlink_metadata` and `DirEntry::{file_type,
+  metadata}`. It never deletes or mutates files or catalog rows, and provides
+  evidence (coverage + continuity + per-file identity) for later pruning
+  decisions rather than making them.
+
+## Verification actually performed
+
+- `rustfmt --edition 2024` write + `--check` over all three files: clean, so
+  all three files parse as valid Rust (this also syntax-checks the
+  `cfg(windows)` blocks, which the Linux compiler would otherwise skip).
+- Source hand-traces (paths): `"/mnt/nas/Projects/./foo/../bar"` over base
+  `/mnt/nas` → key `[/ mnt nas Projects bar]`, spelling
+  `/mnt/nas/Projects/bar`; `"/data/a\\b"` keeps `a\b` as one POSIX component,
+  distinct from `/data/a/b`; `"Projects/foo"` over `/mnt/nas` anchors without
+  CWD; `b"caf\xe9"` survives as raw bytes (`utf8_spelling` → `None`);
+  POSIX `/data/Shot` ≠ `/data/shot` keys; Windows `D:\Shot` ≡ `d:/shot`
+  (prefix folded, root normalized); `\\NAS\share\x` ≡ `//NAS/share/x`;
+  `../../etc` over `/a/b` → `/etc`, and `..` at a root is ignored; relative
+  `sub/../x` resolves against base only; drive-relative `C:foo` rejected.
+- Source hand-traces (validation): `../x` and `/etc` rejected; `a\0b` rejected
+  (NUL); `C:\x` / `C:x`(with separator or bare drive) rejected as foreign on
+  POSIX; `shots/v01/file.nk` walks existing ancestors and passes with absent
+  tails; a symlink (or Windows reparse point) anywhere in the existing chain
+  → `Escape`; a permission error on an ancestor → refusal (fail closed);
+  Windows `CON`, `COM1.bak`, trailing `shots ` and `a<b` rejected.
+- Source hand-traces (filters): `Shot_v03.nk`, `SHOT_V03.NK`, `movie.aep`
+  match the project preset; `shot.nk~` and `scene.nk.autosave` fail the
+  `.nk`/`.aep` extension and hit the explicit exclusions; `.nk` (hidden file)
+  does not match `LastExtension` (splitext parity); `auto.nk.autosave`
+  matches ExtensionCopy's `.autosave` name suffix; `shot.nk~` does not match
+  `.nk` name-suffix; backup preset equals `-iname '*.nk'`/`'*.aep'` for the
+  shipped defaults.
+- Source hand-traces (discovery): directory symlink → issue, no descent, no
+  entry, coverage stays `Complete`; broken file symlink → `Unavailable` issue
+  + `Partial`; unreadable subtree → `Partial` with siblings still collected;
+  cancel mid-walk → entries-so-far + `Cancelled`; root missing at start →
+  `RootUnavailable`; root replaced mid-scan → post-identity mismatch →
+  `Uncertain` + `Partial`; FIFO included when the suffix matches; excluded
+  `scratch` prunes descent; wildcard exclude emits a visible diagnostic and is
+  ignored; sort `_z.nk` < `a.nk` < `b.nk` under ASCII-lowercase ordering with
+  byte tie-break.
+- Every command ran under `timeout 20s`/`timeout 30s`.
+- **No build, `cargo check`, test, launch, screenshot, install, commit or
+  push was run**, per this packet's limits. No compile-pass, runtime-pass or
+  cross-platform claim is made; `Cargo.lock` still does not exist.
+
+## Next integration (exact)
+
+1. **P1 catalog** consumes this packet directly: `child_directories(root,
+   control, events)` for Add/Multi-add (sort order matches the contract),
+   `walk(&ScanRequest { root, purpose: ScanPurpose::Projects, recursive: true,
+   filters: default_filters(Projects).expect("Projects preset") }, …)` for
+   scans; prune-gating requires `coverage == Complete` **and** `continuity ==
+   RootContinuity::Proven` **and** no cancellation; `FileStamp.identity`
+   supports the multi-membership (no ownership stealing) design; `Paths`
+   parent-of-`Projects` rule stays a P1 concern.
+2. **UI wiring packet** enables the disabled `Scan folders` controls via the
+   existing `Jobs::start(ctx, title, |job| …)` seam: call `walk` with
+   `job.control`/`job.events`, then map coverage to the terminal report —
+   `Complete` → `JobOutcome::Succeeded`, `Partial` → `Partial`, `Cancelled` →
+   `Cancelled`, `RootUnavailable` → `Failed` with the snapshot's issues shown.
+   No UI was touched in this packet and no placeholder was added.
+3. **X1 transfers** must re-run `validate_destination` immediately before
+   writes with no-follow facilities and treat `Escape`/`Permission`/
+   `Unavailable` as refusals; `relation` + `evidence_same_file` are the
+   intended source=destination/alias/nesting guards.
+4. **B1 backup** replaces this packet's literal-exclude limitation with the
+   fnmatch port and should keep the wildcard diagnostic as the unsupported-
+   pattern path required by I1 parity.
+
+Ownership note: this packet wrote only `rust/src/paths.rs`,
+`rust/src/discovery.rs`, `rust/src/lib.rs` and this appended section. The
+Python application, `gitclones/` references (read-only) and all other
+documents were not modified.
