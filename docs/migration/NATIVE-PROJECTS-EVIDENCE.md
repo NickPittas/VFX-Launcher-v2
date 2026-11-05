@@ -1,5 +1,10 @@
 # Native Projects evidence — initial launch
 
+Update: the input blocker described below was diagnosed and corrected. See
+DESKTOP-AUTOMATION.md for successful movement across all three screens and live
+Launcher mouse/keyboard interaction. Registration/scanning still await the
+separate folder-picker issue.
+
 2026-11-05. Linux, native egui/eframe window. This is a limited launch/appearance
 check, not workflow verification or approval of the Rust UI.
 

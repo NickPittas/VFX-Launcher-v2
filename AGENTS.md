@@ -62,3 +62,15 @@
 read-only inputs, not part of the product or its Git history. Preserve their
 upstream identity and consult source in addition to README claims. Do not edit,
 commit, or push from these clones.
+
+## Live desktop automation
+
+Read the computer-use skill, then use this checkout's `tools/computer-use/`
+helpers for movement, clicks, keys and screenshots. The external skill helpers
+assume 1:1 mouse gain and symbolic ydotool keys; this machine has flat
+acceleration with sensitivity 0.35 (1.35 gain), and ydotool requires numeric
+keycodes. The project helpers compensate without changing desktop settings,
+verify pointer landing before clicking, and keep screenshots inside the project.
+Use global desktop coordinates; screenshot captures force scale 1. Leave the
+enabled ydotool user service running for automation. See
+`docs/migration/DESKTOP-AUTOMATION.md` for the verified three-monitor results.
