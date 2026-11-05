@@ -121,10 +121,12 @@ impl SettingsWorker {
         }
     }
 
-    fn save(&self, settings: Settings, token: Option<u64>) {
-        if let Some(commands) = &self.commands {
-            let _ = commands.send(SettingsCommand::Save { settings, token });
-        }
+    fn save(&self, settings: Settings, token: Option<u64>) -> Result<(), String> {
+        self.commands
+            .as_ref()
+            .ok_or_else(|| "The settings worker is closed; changes were not saved.".to_string())?
+            .send(SettingsCommand::Save { settings, token })
+            .map_err(|_| "The settings worker stopped; changes were not saved.".to_string())
     }
 
     fn begin_shutdown(&mut self) {
@@ -586,6 +588,13 @@ impl ProjectWorkspace {
             self.apply_settings_saved(result, settings, token);
         }
 
+        if stopped && self.settings_loaded && !self.closing {
+            self.settings_in_flight = None;
+            self.settings_save_error = Some(
+                "The settings worker stopped. Unacknowledged changes remain unsaved; restart to retry.".to_string(),
+            );
+        }
+
         if let Some(result) = loaded {
             match result {
                 Ok(settings) => {
@@ -639,7 +648,10 @@ impl ProjectWorkspace {
                         self.settings.applications = settings.applications;
                         self.settings.project_discovery = settings.project_discovery;
                     }
-                    None => self.settings.selected_username = settings.selected_username,
+                    None if !self.settings_identity_queued => {
+                        self.settings.selected_username = settings.selected_username
+                    }
+                    None => {}
                 }
                 self.settings_save_error = None;
                 if token.is_some() && draft_was_clean {
@@ -715,6 +727,8 @@ impl ProjectWorkspace {
 
     fn issue_settings_write(&mut self, write: SettingsWrite, settings: Settings) {
         let Some(worker) = &self.settings_worker else {
+            self.settings_save_error =
+                Some("The settings worker is unavailable; changes were not saved.".to_string());
             return;
         };
         let token = match write {
@@ -722,8 +736,13 @@ impl ProjectWorkspace {
             SettingsWrite::Identity => None,
         };
         self.settings_save_error = None;
-        worker.save(settings, token);
-        self.settings_in_flight = Some(write);
+        match worker.save(settings, token) {
+            Ok(()) => self.settings_in_flight = Some(write),
+            Err(error) => {
+                self.settings_in_flight = None;
+                self.settings_save_error = Some(error);
+            }
+        }
     }
 
     /// Clears a validation message once the user edits the draft it described.
@@ -803,8 +822,9 @@ impl ProjectWorkspace {
         let (Some(path), Some(draft)) = (picked, self.settings_draft.as_mut()) else {
             return;
         };
-        if let Err(error) = draft.set_application(field, &path) {
-            self.settings_edit_error = Some(error);
+        match draft.set_application(field, &path) {
+            Ok(()) => self.settings_edit_error = None,
+            Err(error) => self.settings_edit_error = Some(error),
         }
     }
 
@@ -1779,7 +1799,9 @@ impl ProjectWorkspace {
         self.settings_identity_queued = false;
         self.settings_draft_queued = false;
         if let Some(worker) = &self.settings_worker {
-            worker.save(settings, None);
+            if let Err(error) = worker.save(settings, None) {
+                self.settings_save_error = Some(error);
+            }
         }
     }
 

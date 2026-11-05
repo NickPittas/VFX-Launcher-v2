@@ -27,3 +27,7 @@ paths instead of saving replacement characters. No desktop settings changed.
 Not exercised: picker selection/close, save I/O failures, user switches during
 saves, active-write shutdown, restart reload, Windows/macOS, or DCC launches.
 No tests or test suites ran. Those lifecycle cases remain source-review claims.
+
+Source-review follow-up: fixed stale identity acknowledgement, worker-disconnect
+saving lock, and stale picker error. These fixes compile; no concurrency runtime
+pass is claimed.

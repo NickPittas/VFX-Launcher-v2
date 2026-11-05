@@ -1,5 +1,15 @@
 # Implementation status
 
+## U3 source-review corrections
+
+Coordinator fixed Kimi's three Settings findings: an older identity acknowledgement
+cannot replace a newer queued username; worker send/disconnect failures report an
+error and clear the saving lock while retaining the draft; a valid picker result
+clears an earlier picker-validation error. Both normal and close-time save callers
+handle enqueue failure. Compile/format/diff checks pass without warnings under
+the 30s ceiling. No concurrency runtime exercise or tests ran; the earlier manual
+Save/Cancel evidence remains limited to the cases recorded there.
+
 ## U3 native Settings integration and live evidence
 
 Integrated editable supported application paths, Linux Nuke command and project
