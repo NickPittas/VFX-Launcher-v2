@@ -16,7 +16,7 @@ use eframe::egui;
 
 use crate::jobs::{JobId, JobStatus, Jobs, LIVE_POLL_INTERVAL};
 use crate::launch::Tool;
-use crate::project_workspace::{ProjectWorkspace, RegistrationStatus};
+use crate::project_workspace::{ProjectWorkspace, RegistrationStatus, SettingsPath};
 use crate::projects::{FileGroup, FileKind, ProjectFile, ProjectList};
 use crate::storage::{FileId, ProjectId};
 
@@ -1011,78 +1011,204 @@ impl VfxLauncherApp {
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
-        let mut actions = Vec::new();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.collapsing("Data location", |ui| {
-                ui.label(
-                    egui::RichText::new(self.workspace.data_dir().display().to_string())
-                        .monospace()
-                        .small(),
+        self.settings_action_strip(ui);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.settings_form(ui);
+                ui.add_space(6.0);
+                self.settings_users_section(ui);
+                ui.collapsing("Logs", |ui| {
+                    empty_state(ui, "No log entries yet.", "Diagnostics appear here.");
+                });
+                ui.collapsing("Data location", |ui| {
+                    ui.label(
+                        egui::RichText::new(self.workspace.data_dir().display().to_string())
+                            .monospace()
+                            .small(),
+                    );
+                    if let Some(error) = self.workspace.settings_error() {
+                        ui.label(egui::RichText::new(error).small());
+                    }
+                });
+            });
+    }
+
+    /// Save and Cancel stay visible under the form. Both act only on the draft: the
+    /// acknowledged settings change when the worker reports the atomic write, never
+    /// when a button is pressed.
+    fn settings_action_strip(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("settings_actions").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let loaded = self.workspace.settings_loaded();
+                let dirty = self.workspace.settings_dirty();
+                let saving = self.workspace.settings_saving();
+
+                let save = primary_button(
+                    ui,
+                    if saving { "Saving…" } else { "Save" },
+                    loaded && dirty && !saving,
                 );
-                if let Some(error) = self.workspace.settings_error() {
-                    ui.label(egui::RichText::new(error).small());
+                if save.clicked() {
+                    self.workspace.save_settings_draft();
+                }
+                if !loaded {
+                    explain(
+                        &save,
+                        "The settings file could not be read; it is left untouched.",
+                    );
+                } else if !dirty {
+                    explain(&save, "No unsaved changes.");
+                }
+
+                let cancel = ui.add_enabled(dirty && !saving, egui::Button::new("Cancel"));
+                if cancel.clicked() {
+                    self.workspace.cancel_settings_draft();
+                }
+                explain(&cancel, "Discard the edits and keep the saved settings.");
+
+                if dirty && !saving {
+                    ui.label(egui::RichText::new("Unsaved changes").small());
+                }
+                if let Some(error) = self.workspace.settings_edit_error() {
+                    ui.label(egui::RichText::new(error).small().color(PROBLEM));
+                }
+                if let Some(error) = self.workspace.settings_save_error() {
+                    ui.label(egui::RichText::new(error).small().color(PROBLEM));
                 }
             });
+            ui.add_space(4.0);
+        });
+    }
 
-            ui.collapsing("Applications", |ui| {
-                let applications = &self.workspace.settings().applications;
-                for (label, value) in [
-                    (
+    fn settings_form(&mut self, ui: &mut egui::Ui) {
+        let loaded = self.workspace.settings_loaded();
+        let saving = self.workspace.settings_saving();
+        let browse_open = self.workspace.settings_browse_pending();
+        let mut browse: Option<SettingsPath> = None;
+        let mut edited = false;
+
+        // Locked while a write is in flight: the draft then always holds exactly the
+        // values that write carries, so a close-time flush cannot persist an edit
+        // the user has not saved.
+        ui.add_enabled_ui(loaded && !saving, |ui| {
+            section_label(ui, "Applications");
+            egui::Grid::new("settings_applications")
+                .num_columns(2)
+                .spacing(egui::vec2(14.0, 6.0))
+                .show(ui, |ui| {
+                    let Some(draft) = self.workspace.settings_draft_mut() else {
+                        return;
+                    };
+                    let (nuke_browse, nuke_edited) = settings_path_row(
+                        ui,
                         "Nuke application",
-                        applications
-                            .nuke_path
-                            .as_ref()
-                            .map(|path| path.as_path().display().to_string()),
-                    ),
-                    (
+                        &mut draft.nuke_application,
+                        "/opt/Nuke17.0v1/Nuke17.0 or nuke",
+                        !browse_open && !saving,
+                    );
+                    if nuke_browse {
+                        browse = Some(SettingsPath::Nuke);
+                    }
+                    edited |= nuke_edited;
+                    ui.end_row();
+                    let (effects_browse, effects_edited) = settings_path_row(
+                        ui,
                         "After Effects application",
-                        applications
-                            .after_effects_path
-                            .as_ref()
-                            .map(|path| path.as_path().display().to_string()),
-                    ),
-                    (
-                        "Nuke launch command (Linux)",
-                        applications.nuke_launch_cmd_linux.clone(),
-                    ),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(label).small().weak());
-                        ui.label(
-                            egui::RichText::new(value.unwrap_or_else(|| "Not configured".into()))
-                                .small()
-                                .monospace(),
-                        );
-                    });
-                }
-                ui.label(
-                    egui::RichText::new(
-                        "Editing these values arrives with the Settings packet; Launch uses them read-only.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
-
-            ui.collapsing("Users", |ui| {
-                if self.workspace.users().is_empty() {
-                    ui.label(egui::RichText::new("No users yet.").small().weak());
-                }
-                for user in self.workspace.users() {
-                    let selected = self.workspace.user().map(|current| current.id) == Some(user.id);
-                    let mut label = user.username.clone();
-                    if user.is_admin {
-                        label.push_str(" (admin)");
+                        &mut draft.after_effects_application,
+                        "/opt/AfterFX or AfterFX",
+                        !browse_open && !saving,
+                    );
+                    if effects_browse {
+                        browse = Some(SettingsPath::AfterEffects);
                     }
-                    if ui.selectable_label(selected, label).clicked() {
-                        actions.push(Action::ChooseUser(user.id));
-                    }
-                }
-            });
+                    edited |= effects_edited;
+                    ui.end_row();
+                    ui.label("Nuke launch command (Linux)");
+                    edited |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut draft.nuke_launch_command)
+                                .hint_text(
+                                    "ghostty -e env LC_NUMERIC=C /opt/Nuke17.0v1/Nuke17.0 --nukex",
+                                )
+                                .desired_width(SETTINGS_FIELD_WIDTH)
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .changed();
+                    ui.end_row();
+                    ui.label("");
+                    ui.label(
+                        egui::RichText::new("Optional command used to start Nuke on Linux.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.end_row();
+                });
 
-            ui.collapsing("Logs", |ui| {
-                empty_state(ui, "No log entries yet.", "Diagnostics appear here.");
-            });
+            ui.add_space(8.0);
+            section_label(ui, "Project folders");
+            egui::Grid::new("settings_projects")
+                .num_columns(2)
+                .spacing(egui::vec2(14.0, 6.0))
+                .show(ui, |ui| {
+                    let Some(draft) = self.workspace.settings_draft_mut() else {
+                        return;
+                    };
+                    ui.label("Folder names");
+                    edited |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut draft.project_folder_names)
+                                .hint_text("project, projects")
+                                .desired_width(SETTINGS_FIELD_WIDTH),
+                        )
+                        .changed();
+                    ui.end_row();
+                    ui.label("");
+                    ui.label(
+                        egui::RichText::new(
+                            "Separate folder names with commas, for example: project, projects.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.end_row();
+                });
+        });
+
+        if let Some(field) = browse {
+            self.workspace.begin_settings_browse(field);
+        }
+        if edited {
+            self.workspace.clear_settings_edit_error();
+        }
+        if !loaded {
+            ui.label(
+                egui::RichText::new(
+                    "Editing is disabled because the settings file could not be read; it is never overwritten.",
+                )
+                .small()
+                .color(PROBLEM),
+            );
+        }
+    }
+
+    fn settings_users_section(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
+        ui.collapsing("Users", |ui| {
+            if self.workspace.users().is_empty() {
+                ui.label(egui::RichText::new("No users yet.").small().weak());
+            }
+            for user in self.workspace.users() {
+                let selected = self.workspace.user().map(|current| current.id) == Some(user.id);
+                let mut label = user.username.clone();
+                if user.is_admin {
+                    label.push_str(" (admin)");
+                }
+                if ui.selectable_label(selected, label).clicked() {
+                    actions.push(Action::ChooseUser(user.id));
+                }
+            }
         });
         for action in actions {
             self.apply(action);
@@ -1606,6 +1732,44 @@ fn notice_row(ui: &mut egui::Ui, title: &str, detail: Option<&str>, error: bool)
             });
         }
     }
+}
+
+/// Width shared by the editable Settings fields.
+const SETTINGS_FIELD_WIDTH: f32 = 360.0;
+/// Error copy colour used by the settings strip.
+const PROBLEM: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x6a);
+
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new(text).small().weak());
+    ui.add_space(2.0);
+}
+
+/// One application path with its native browse button. Returns `(browse_clicked,
+/// edited)`; `browse_enabled` is false while a chooser is already open.
+fn settings_path_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    browse_enabled: bool,
+) -> (bool, bool) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        let edited = ui
+            .add(
+                egui::TextEdit::singleline(value)
+                    .hint_text(hint)
+                    .desired_width(SETTINGS_FIELD_WIDTH)
+                    .font(egui::TextStyle::Monospace),
+            )
+            .changed();
+        let browse = ui
+            .add_enabled(browse_enabled, egui::Button::new("Browse…"))
+            .clicked();
+        (browse, edited)
+    })
+    .inner
 }
 
 fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {

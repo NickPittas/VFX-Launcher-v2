@@ -1,5 +1,16 @@
 # Implementation status
 
+## U3 native Settings integration and live evidence
+
+Integrated editable supported application paths, Linux Nuke command and project
+folder names with draft Save/Cancel and existing atomic settings worker. Parent
+added tracked picker lifecycle and lossless-path refusal. Native build passes;
+manual disposable-data verification covered Save, Cancel, invalid-relative-path
+refusal and normal exit. Settings were restored to their initial application
+values. See NATIVE-SETTINGS-EVIDENCE.md for screenshots and unverified lifecycle
+cases. No tests, DCC launches or production data were used. Fresh source review
+of write ordering/shutdown remains pending.
+
 ## Structure review corrections and Nuke provider
 
 Coordinator corrected the nine structure review findings: checked-tree comp

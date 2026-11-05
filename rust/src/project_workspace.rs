@@ -7,6 +7,10 @@
 //! and cancellation, and every catalog call returns a [`Pending`] the frame only
 //! polls. No SQL, `stat`, dialog, spawn or walk runs inside a frame.
 //!
+//! The Settings page follows the same rule: its draft is text the user edits, and
+//! the persisted settings change only after the worker acknowledges the atomic
+//! write, so the values a launch reads are always values that reached the disk.
+//!
 //! Stale-async safety: a reply is applied only while the request id it was issued
 //! under is still current, so switching tab, filter, user or selected project can
 //! never show another selection's projects or files.
@@ -22,7 +26,7 @@
 //! they produce, and only then consumes the catalog: no queued write is lost and
 //! no frame waits on a thread.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
@@ -30,7 +34,9 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::config::{ConfigError, Settings, SettingsStore};
+use crate::config::{
+    Applications, ConfigError, JsonPath, ProjectDiscovery, Settings, SettingsStore,
+};
 use crate::discovery::{self, Coverage, ScanPurpose, ScanRequest, ScanSnapshot};
 use crate::jobs::{JobContext, JobControl, JobId, JobOutcome, JobPhase, JobProgress, Jobs};
 use crate::launch::{self, LaunchError, Tool};
@@ -59,12 +65,20 @@ struct SettingsWorker {
 
 enum SettingsCommand {
     Load,
-    Save(Settings),
+    Save {
+        settings: Settings,
+        /// Identifies a Settings-page save; `None` for an internal identity write.
+        token: Option<u64>,
+    },
 }
 
 enum SettingsEvent {
     Loaded(Result<Settings, ConfigError>),
-    Saved(Result<(), ConfigError>, Settings),
+    Saved {
+        result: Result<(), ConfigError>,
+        settings: Settings,
+        token: Option<u64>,
+    },
 }
 
 impl SettingsWorker {
@@ -78,9 +92,13 @@ impl SettingsWorker {
                 while let Ok(command) = command_rx.recv() {
                     let event = match command {
                         SettingsCommand::Load => SettingsEvent::Loaded(store.load()),
-                        SettingsCommand::Save(settings) => {
+                        SettingsCommand::Save { settings, token } => {
                             let result = store.save(&settings);
-                            SettingsEvent::Saved(result, settings)
+                            SettingsEvent::Saved {
+                                result,
+                                settings,
+                                token,
+                            }
                         }
                     };
                     if event_tx.send(event).is_err() {
@@ -103,9 +121,9 @@ impl SettingsWorker {
         }
     }
 
-    fn save(&self, settings: Settings) {
+    fn save(&self, settings: Settings, token: Option<u64>) {
         if let Some(commands) = &self.commands {
-            let _ = commands.send(SettingsCommand::Save(settings));
+            let _ = commands.send(SettingsCommand::Save { settings, token });
         }
     }
 
@@ -125,6 +143,180 @@ impl SettingsWorker {
         }
         self.thread.is_some()
     }
+}
+
+/// One editable application path on the Settings page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsPath {
+    Nuke,
+    AfterEffects,
+}
+
+/// A settings write the worker is executing. Identity writes and the Settings page
+/// share one queue: a request made while a write is in flight is deferred to its
+/// acknowledgement, so a later write always contains the change the earlier
+/// acknowledgement made active instead of replacing it with a stale snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsWrite {
+    Draft(u64),
+    Identity,
+}
+
+/// The Settings page's editable values, kept as text so a half-typed path or
+/// command never has to parse into a settings value before it is saved.
+///
+/// Only fields this build actually supports are editable; `selected_username` and
+/// `log_level` are carried over unchanged from the acknowledged settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SettingsDraft {
+    pub nuke_application: String,
+    pub after_effects_application: String,
+    pub nuke_launch_command: String,
+    pub project_folder_names: String,
+}
+
+impl SettingsDraft {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            nuke_application: settings
+                .applications
+                .nuke_path
+                .as_ref()
+                .map(|path| path.as_path().display().to_string())
+                .unwrap_or_default(),
+            after_effects_application: settings
+                .applications
+                .after_effects_path
+                .as_ref()
+                .map(|path| path.as_path().display().to_string())
+                .unwrap_or_default(),
+            nuke_launch_command: settings
+                .applications
+                .nuke_launch_cmd_linux
+                .clone()
+                .unwrap_or_default(),
+            project_folder_names: settings
+                .project_discovery
+                .project_directory_names
+                .join(", "),
+        }
+    }
+
+    /// True when the text differs from what the acknowledged settings hold, so a
+    /// rejected draft still counts as unsaved work and is never silently dropped.
+    pub fn is_dirty(&self, settings: &Settings) -> bool {
+        self.comparable() != Self::from_settings(settings).comparable()
+    }
+
+    /// The settings this draft would store. Validation matches what the launch
+    /// path accepts, so a stored value is never unusable for the reason Settings
+    /// could have caught first. Whether the program exists and is executable is
+    /// checked by the launch worker, not in a frame.
+    fn to_settings(&self, base: &Settings) -> Result<Settings, String> {
+        Ok(Settings {
+            schema_version: base.schema_version,
+            applications: Applications {
+                nuke_path: application_path(&self.nuke_application, "Nuke")?,
+                after_effects_path: application_path(
+                    &self.after_effects_application,
+                    "After Effects",
+                )?,
+                nuke_launch_cmd_linux: launch_command(&self.nuke_launch_command)?,
+            },
+            project_discovery: ProjectDiscovery {
+                project_directory_names: project_folder_names(&self.project_folder_names)?,
+            },
+            selected_username: base.selected_username.clone(),
+            log_level: base.log_level,
+        })
+    }
+
+    /// Text compared without rejecting anything: an invalid entry still counts as
+    /// an edit instead of comparing equal to an empty field.
+    fn comparable(&self) -> (String, String, String, Vec<String>) {
+        (
+            self.nuke_application.trim().to_string(),
+            self.after_effects_application.trim().to_string(),
+            self.nuke_launch_command.trim().to_string(),
+            folder_names(&self.project_folder_names),
+        )
+    }
+
+    fn set_application(&mut self, field: SettingsPath, path: &Path) -> Result<(), String> {
+        let text = path
+            .to_str()
+            .ok_or_else(|| {
+                "This application path cannot be represented in the settings file.".to_string()
+            })?
+            .to_owned();
+        match field {
+            SettingsPath::Nuke => self.nuke_application = text,
+            SettingsPath::AfterEffects => self.after_effects_application = text,
+        }
+        Ok(())
+    }
+}
+
+/// comma- or semicolon-separated names, trimmed and without empty entries.
+fn folder_names(text: &str) -> Vec<String> {
+    text.split([',', ';'])
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// An empty field means "not configured". A value that contains separators must be
+/// absolute; a bare program name stays allowed because the launch path resolves it
+/// through `PATH` (`launch::plan`'s `path_search`).
+fn application_path(text: &str, tool: &str) -> Result<Option<JsonPath>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if text.chars().any(char::is_control) {
+        return Err(format!(
+            "The {tool} application path contains a control character."
+        ));
+    }
+    let path = PathBuf::from(text);
+    let mut components = path.components();
+    let program_search = !path.is_absolute()
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none();
+    if !path.is_absolute() && !program_search {
+        return Err(format!(
+            "Use an absolute path for the {tool} application, or its program name alone so it is found on PATH."
+        ));
+    }
+    Ok(Some(JsonPath::new(path)))
+}
+
+/// The Linux launch command is tokenized exactly as `launch::plan` tokenizes it, so
+/// a command that saves here always produces the same argv a launch would.
+fn launch_command(text: &str) -> Result<Option<String>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let words = shlex::split(text)
+        .ok_or_else(|| "The Linux Nuke launch command has unbalanced quotes.".to_string())?;
+    match words.first() {
+        Some(word) if !word.is_empty() => Ok(Some(text.to_string())),
+        _ => Err("The Linux Nuke launch command must start with a program name.".to_string()),
+    }
+}
+
+fn project_folder_names(text: &str) -> Result<Vec<String>, String> {
+    let names = folder_names(text);
+    for name in &names {
+        if name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+            return Err(format!(
+                "{name:?} must be one folder name; list names separated by commas, not paths."
+            ));
+        }
+    }
+    Ok(names)
 }
 
 /// Catalog startup, one non-blocking step at a time.
@@ -221,6 +413,16 @@ pub struct ProjectWorkspace {
     settings_loaded: bool,
     settings_error: Option<String>,
     settings_save_error: Option<String>,
+    /// The Settings page draft; `None` until the file was read successfully, so a
+    /// file this build cannot read is never offered for editing or overwritten.
+    settings_draft: Option<SettingsDraft>,
+    settings_edit_error: Option<String>,
+    /// Token of the Settings-page save awaiting its acknowledgement.
+    settings_in_flight: Option<SettingsWrite>,
+    settings_draft_queued: bool,
+    settings_identity_queued: bool,
+    settings_next_token: u64,
+    settings_browse: Option<(SettingsPath, Receiver<Option<PathBuf>>, JoinHandle<()>)>,
     catalog: Option<Catalog>,
     shutdown: Option<CatalogShutdown>,
     catalog_stage: CatalogStage,
@@ -265,6 +467,13 @@ impl ProjectWorkspace {
             settings_loaded: false,
             settings_error: None,
             settings_save_error: None,
+            settings_draft: None,
+            settings_edit_error: None,
+            settings_in_flight: None,
+            settings_draft_queued: false,
+            settings_identity_queued: false,
+            settings_next_token: 0,
+            settings_browse: None,
             catalog: None,
             shutdown: None,
             catalog_stage: CatalogStage::Settings,
@@ -306,6 +515,7 @@ impl ProjectWorkspace {
     pub fn poll(&mut self, jobs: &mut Jobs) {
         let now = self.ctx.input(|input| input.time);
         self.poll_settings();
+        self.poll_settings_browse();
         self.poll_catalog();
         self.poll_filter(now);
         self.poll_projects();
@@ -344,12 +554,16 @@ impl ProjectWorkspace {
             return;
         };
         let mut loaded = None;
-        let mut saved = None;
+        let mut saved = Vec::new();
         let mut stopped = false;
         loop {
             match worker.events.try_recv() {
                 Ok(SettingsEvent::Loaded(result)) => loaded = Some(result),
-                Ok(SettingsEvent::Saved(result, settings)) => saved = Some((result, settings)),
+                Ok(SettingsEvent::Saved {
+                    result,
+                    settings,
+                    token,
+                }) => saved.push((result, settings, token)),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     stopped = true;
@@ -368,19 +582,8 @@ impl ProjectWorkspace {
             }
         }
 
-        if let Some((result, settings)) = saved {
-            match result {
-                Ok(()) => {
-                    self.settings = settings;
-                    self.settings_save_error = None;
-                }
-                Err(error) => {
-                    self.settings_save_error = Some(format!(
-                        "The settings could not be saved: {}",
-                        error.message()
-                    ));
-                }
-            }
+        for (result, settings, token) in saved {
+            self.apply_settings_saved(result, settings, token);
         }
 
         if let Some(result) = loaded {
@@ -388,6 +591,7 @@ impl ProjectWorkspace {
                 Ok(settings) => {
                     self.settings = settings;
                     self.settings_loaded = true;
+                    self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
                 }
                 Err(error) => {
                     // The in-memory defaults keep the app readable; the file stays
@@ -408,13 +612,238 @@ impl ProjectWorkspace {
         }
     }
 
-    fn save_settings(&mut self) {
+    /// Applies one acknowledged write. An acknowledged save is the only point at
+    /// which the settings a launch reads change; a failed one leaves the previous
+    /// values active and the draft on screen for correction.
+    fn apply_settings_saved(
+        &mut self,
+        result: Result<(), ConfigError>,
+        settings: Settings,
+        token: Option<u64>,
+    ) {
+        match result {
+            Ok(()) => {
+                // A draft that still matches the old acknowledged settings carries
+                // no separate intent (the user cancelled while saving), so it
+                // follows the values that are now on disk.
+                let draft_was_clean = self
+                    .settings_draft
+                    .as_ref()
+                    .is_some_and(|draft| !draft.is_dirty(&self.settings));
+                // Only the fields this write owned are installed. An identity
+                // change can arrive while the draft write is in flight, and it is
+                // persisted by the identity write queued behind it, so installing
+                // the whole snapshot would silently undo the newer choice.
+                match token {
+                    Some(_) => {
+                        self.settings.applications = settings.applications;
+                        self.settings.project_discovery = settings.project_discovery;
+                    }
+                    None => self.settings.selected_username = settings.selected_username,
+                }
+                self.settings_save_error = None;
+                if token.is_some() && draft_was_clean {
+                    if let Some(draft) = &mut self.settings_draft {
+                        *draft = SettingsDraft::from_settings(&self.settings);
+                    }
+                }
+            }
+            Err(error) => {
+                self.settings_save_error = Some(format!(
+                    "The settings could not be saved: {}",
+                    error.message()
+                ));
+            }
+        }
+        if matches!(
+            (self.settings_in_flight, token),
+            (Some(SettingsWrite::Draft(_)), Some(_)) | (Some(SettingsWrite::Identity), None)
+        ) {
+            self.settings_in_flight = None;
+        }
+        self.issue_queued_settings();
+    }
+
+    /// Sends the Settings-page draft for persistence, or queues it when another
+    /// write is in flight. Nothing becomes active until the worker acknowledges the
+    /// write, and a refused draft keeps the last good settings and the text the user
+    /// must correct.
+    pub fn save_settings_draft(&mut self) {
+        if self.closing {
+            return;
+        }
+        self.settings_edit_error = None;
+        if !self.settings_loaded {
+            self.settings_edit_error = Some(
+                "The settings file could not be read, so it is left untouched. Fix the file, then restart."
+                    .to_string(),
+            );
+            return;
+        }
+        self.settings_draft_queued = true;
+        self.issue_queued_settings();
+    }
+
+    /// Issues the queued writes once the worker is free. The draft write is built
+    /// from the acknowledged settings, so an identity change made while it waited is
+    /// carried into the same file rather than overwritten by a stale snapshot.
+    fn issue_queued_settings(&mut self) {
+        if self.settings_in_flight.is_some() || !self.settings_loaded || self.closing {
+            return;
+        }
+        if self.settings_draft_queued {
+            self.settings_draft_queued = false;
+            if let Some(draft) = &self.settings_draft {
+                match draft.to_settings(&self.settings) {
+                    Ok(settings) => {
+                        self.settings_next_token += 1;
+                        let token = self.settings_next_token;
+                        self.settings_identity_queued = false;
+                        self.issue_settings_write(SettingsWrite::Draft(token), settings);
+                        return;
+                    }
+                    Err(message) => self.settings_edit_error = Some(message),
+                }
+            }
+        }
+        if self.settings_identity_queued {
+            self.settings_identity_queued = false;
+            let settings = self.settings.clone();
+            self.issue_settings_write(SettingsWrite::Identity, settings);
+        }
+    }
+
+    fn issue_settings_write(&mut self, write: SettingsWrite, settings: Settings) {
+        let Some(worker) = &self.settings_worker else {
+            return;
+        };
+        let token = match write {
+            SettingsWrite::Draft(token) => Some(token),
+            SettingsWrite::Identity => None,
+        };
+        self.settings_save_error = None;
+        worker.save(settings, token);
+        self.settings_in_flight = Some(write);
+    }
+
+    /// Clears a validation message once the user edits the draft it described.
+    pub fn clear_settings_edit_error(&mut self) {
+        self.settings_edit_error = None;
+    }
+
+    /// Drops the edits and restores the acknowledged settings; the file is not
+    /// touched, so cancelling can never leave the application on a bad value.
+    pub fn cancel_settings_draft(&mut self) {
         if !self.settings_loaded {
             return;
         }
-        if let Some(worker) = &self.settings_worker {
-            worker.save(self.settings.clone());
+        self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
+        self.settings_edit_error = None;
+    }
+
+    /// Opens the native file chooser on its own thread; the frame never waits for
+    /// it, and only one chooser is ever open.
+    pub fn begin_settings_browse(&mut self, field: SettingsPath) {
+        if self.settings_browse.is_some() || !self.settings_loaded || self.closing {
+            return;
         }
+        let (sender, replies) = channel();
+        let ctx = self.ctx.clone();
+        let title = match field {
+            SettingsPath::Nuke => "Select the Nuke application",
+            SettingsPath::AfterEffects => "Select the After Effects application",
+        };
+        let worker = std::thread::Builder::new()
+            .name("vfx-settings-dialog".to_string())
+            .spawn(move || {
+                let picked = rfd::FileDialog::new().set_title(title).pick_file();
+                let _ = sender.send(picked);
+                ctx.request_repaint();
+            });
+        match worker {
+            Ok(worker) => self.settings_browse = Some((field, replies, worker)),
+            Err(error) => {
+                self.settings_edit_error =
+                    Some(format!("The application picker could not start: {error}"))
+            }
+        }
+    }
+
+    fn poll_settings_browse(&mut self) {
+        if self
+            .settings_browse
+            .as_ref()
+            .is_some_and(|(_, _, worker)| !worker.is_finished())
+        {
+            self.ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+        let reply =
+            self.settings_browse
+                .as_ref()
+                .and_then(|(_, replies, _)| match replies.try_recv() {
+                    Ok(picked) => Some(picked),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => Some(None),
+                });
+        let Some(picked) = reply else {
+            return;
+        };
+        let Some((field, _, worker)) = self.settings_browse.take() else {
+            return;
+        };
+        if worker.join().is_err() {
+            self.settings_edit_error =
+                Some("The application picker stopped unexpectedly.".to_string());
+            return;
+        }
+        if self.closing {
+            return;
+        }
+        let (Some(path), Some(draft)) = (picked, self.settings_draft.as_mut()) else {
+            return;
+        };
+        if let Err(error) = draft.set_application(field, &path) {
+            self.settings_edit_error = Some(error);
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if !self.settings_loaded || self.closing {
+            return;
+        }
+        self.settings_identity_queued = true;
+        self.issue_queued_settings();
+    }
+
+    pub fn settings_dirty(&self) -> bool {
+        self.settings_draft
+            .as_ref()
+            .is_some_and(|draft| draft.is_dirty(&self.settings))
+    }
+
+    pub fn settings_saving(&self) -> bool {
+        self.settings_in_flight.is_some()
+    }
+
+    pub fn settings_loaded(&self) -> bool {
+        self.settings_loaded
+    }
+
+    pub fn settings_draft(&self) -> Option<&SettingsDraft> {
+        self.settings_draft.as_ref()
+    }
+
+    pub fn settings_draft_mut(&mut self) -> Option<&mut SettingsDraft> {
+        self.settings_draft.as_mut()
+    }
+
+    pub fn settings_edit_error(&self) -> Option<&str> {
+        self.settings_edit_error.as_deref()
+    }
+
+    pub fn settings_browse_pending(&self) -> bool {
+        self.settings_browse.is_some()
     }
 
     pub fn settings_save_error(&self) -> Option<&str> {
@@ -1306,6 +1735,10 @@ impl ProjectWorkspace {
     /// drained, so no queued write is lost and no reply is dropped. Nothing here
     /// blocks: a live worker thread is never joined.
     pub fn begin_shutdown(&mut self) {
+        // A settings write the user already committed is flushed before the worker
+        // is told to stop, so the drain persists it instead of the write being
+        // detached. Unsaved draft text is still not written: closing is not a Save.
+        self.flush_settings_before_close();
         self.closing = true;
         self.scan.cancelled = true;
         self.scan.queue.clear();
@@ -1319,9 +1752,43 @@ impl ProjectWorkspace {
         self.try_close_catalog();
     }
 
+    /// Enqueues the last write the committed settings need, when a queued identity
+    /// change would otherwise be dropped or overwritten by the write already in the
+    /// worker. Runs while the worker still accepts commands.
+    fn flush_settings_before_close(&mut self) {
+        if self.closing || !self.settings_loaded {
+            return;
+        }
+        let draft_committed = matches!(self.settings_in_flight, Some(SettingsWrite::Draft(_)))
+            || self.settings_draft_queued;
+        if !(self.settings_identity_queued || self.settings_draft_queued) {
+            return;
+        }
+        let settings = if draft_committed {
+            // The draft cannot change while a write is in flight, so it still holds
+            // exactly the values the user committed.
+            match self.settings_draft.as_ref() {
+                Some(draft) => draft
+                    .to_settings(&self.settings)
+                    .unwrap_or_else(|_| self.settings.clone()),
+                None => self.settings.clone(),
+            }
+        } else {
+            self.settings.clone()
+        };
+        self.settings_identity_queued = false;
+        self.settings_draft_queued = false;
+        if let Some(worker) = &self.settings_worker {
+            worker.save(settings, None);
+        }
+    }
+
     /// True while an accepted launch, reveal or access record is still unanswered.
     fn actions_pending(&self) -> bool {
-        !self.launches.is_empty() || !self.reveals.is_empty() || !self.access.is_empty()
+        !self.launches.is_empty()
+            || !self.reveals.is_empty()
+            || !self.access.is_empty()
+            || self.settings_browse.is_some()
     }
 
     /// Closes the catalog request queue once the accepted actions drained. Called
