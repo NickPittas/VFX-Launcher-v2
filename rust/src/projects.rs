@@ -31,11 +31,13 @@
 //!   so overlapping projects share it instead of stealing it: scanning project
 //!   A never touches project B's membership or its catalog attribution.
 //! - Version text keeps its raw digits; `_v<1-4 digits>` is the Launcher preset
-//!   and AEP keeps the legacy trailing-number fallback
+//!   and AEP keeps the legacy last-number fallback
 //!   (`ui_slick/scanner.py::_parse_version_from_filename`). Unknown versions are
 //!   stored and remain visible rather than being invented as `_v1`.
 //! - Grouping/ordering follows `ui_slick/file_handlers.py::get_base_name`,
-//!   `group_versioned_files` and `core/utils.py::get_latest_version_file`:
+//!   `group_by_timeline`, `group_versioned_files` and
+//!   `core/utils.py::get_latest_version_file`: files are bucketed by the
+//!   timeline and shot folders below the topmost `Nuke`/`After Effects` anchor,
 //!   `_v<digits>` is stripped from the base name, and the newest version is
 //!   chosen by parsed version, then modification time, then a stable spelling.
 //!
@@ -59,6 +61,14 @@
 //! - Pruning deletes membership rows only. Orphan `files` rows are retained for
 //!   historical attribution (`CONTRACTS.md` §2); garbage collection is not part
 //!   of this packet.
+//! - A cancellation is a result, never an I/O error: a cancellation observed at
+//!   any boundary — including after the writes ran — rolls the reconciliation
+//!   transaction back and returns an `applied == false, cancelled == true`
+//!   summary, so the catalog keeps nothing while the caller can still say what
+//!   happened.
+//! - A size or modification time that the catalog columns cannot represent is
+//!   reported against its path and leaves the stored value untouched (`COALESCE`
+//!   in the update); nothing is truncated or wrapped.
 //! - Listing/filtering happens in Rust over the live project rows (catalogs are
 //!   small) so case folding uses [`crate::paths::fold_native_text`] instead of
 //!   SQLite's ASCII-only `lower()`.
@@ -69,9 +79,11 @@
 //!   `JobControl::checkpoint` blocks while paused, which would stall the single
 //!   catalog worker for every other request. Pause belongs to the scan worker.
 //! - Reconciliation's absence checks stat the filesystem on the catalog worker,
-//!   because the prune decision and its evidence must be one transaction. The
-//!   loop is only reachable when discovery reports `Proven` continuity, which it
-//!   currently never does, so no stat of an unreachable share runs today.
+//!   because the prune decision and its evidence must be one transaction. They
+//!   also require the snapshot's root identity and a *fresh* `inspect_root` of the
+//!   scan scope to agree immediately before pruning; `Proven` continuity alone is
+//!   treated as a caller claim, not as evidence. Discovery reports `Uncertain`, so
+//!   no stat of an unreachable share runs today.
 //! - Nothing here creates, renames or deletes project files, opens a launch
 //!   command (P2) or builds a structure (S1). Model selection, execution and UI
 //!   wiring are later packets.
@@ -79,7 +91,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -92,7 +104,7 @@ use crate::paths::{
 };
 use crate::storage::{
     Catalog, FileId, PathColumns, Pending, ProjectId, StorageCategory, StorageError, StorageResult,
-    UserId, utc_timestamp_now,
+    TransactionOutcome, UserId, utc_timestamp_now,
 };
 
 /// Which catalog listing the caller wants. `Favorites` and `Recents` are always
@@ -272,10 +284,17 @@ pub struct ProjectFile {
     pub last_seen_at: Option<String>,
 }
 
-/// Files of one project that share a version-group base name. `files` is ordered
-/// newest-first, so `latest` is the head.
+/// Files of one project that share a timeline, a shot and a version-group base
+/// name. `files` is ordered newest-first, so `latest` is the head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileGroup {
+    /// Timeline folder below the topmost `Nuke` / `After Effects` anchor, empty
+    /// when the files sit in the shot folder directly. `None` when the folder
+    /// name is not valid UTF-8.
+    pub timeline: Option<String>,
+    /// Shot folder immediately below the timeline. `None` when the folder name is
+    /// not valid UTF-8; the group is still separate from every other bucket.
+    pub shot: Option<String>,
     /// Group base spelling; `None` when the base name is not valid UTF-8.
     pub base_name: Option<String>,
     pub filetype: Option<String>,
@@ -688,15 +707,19 @@ pub fn remove_project(
 ///
 /// Then:
 /// - a `Cancelled` coverage or an already-cancelled [`JobControl`] writes nothing
-///   (`applied == false`), matching the legacy scanner, which skipped the
-///   database update on cancellation;
+///   (`applied == false`, transaction rolled back), matching the legacy scanner,
+///   which skipped the database update on cancellation;
 /// - `RootUnavailable` writes nothing;
 /// - otherwise observed files and memberships are upserted in this transaction,
 ///   files lexically outside the scope are reported and skipped, and other
 ///   projects' memberships are never touched;
-/// - pruning runs only with `Complete` coverage, `Proven` continuity, no cancel
-///   at the commit checkpoint, and a definite `NotFound` per file. Any other stat
-///   error retains the membership.
+/// - a cancellation observed *after* those writes also rolls them back: the
+///   summary then reports `cancelled`, `applied == false` and zero mutation
+///   counts, so no caller can mistake discarded work for committed work;
+/// - pruning runs only with `Complete` coverage, `Proven` continuity, the scan
+///   root's identity re-proven against the snapshot immediately before pruning,
+///   and a definite `NotFound` per file. Any other stat error retains the
+///   membership.
 pub fn reconcile_scan(
     catalog: &Catalog,
     project: ProjectId,
@@ -704,18 +727,28 @@ pub fn reconcile_scan(
     snapshot: ScanSnapshot,
     control: JobControl,
 ) -> StorageResult<Pending<ReconcileSummary>> {
-    catalog.transaction(move |transaction| {
-        reconcile_scan_tx(transaction, project, &scope, &snapshot, &control)
+    catalog.transaction_or_rollback(move |transaction| {
+        let (summary, keep) = reconcile_scan_tx(transaction, project, &scope, &snapshot, &control)?;
+        Ok(if keep {
+            TransactionOutcome::Commit(summary)
+        } else {
+            TransactionOutcome::Rollback(summary)
+        })
     })
 }
 
+/// Returns the summary and whether the transaction may commit.
+///
+/// A cancellation observed at any boundary — including after the writes already
+/// ran — returns `false`, so the catalog keeps nothing and the caller still
+/// receives a readable cancellation result rather than a failure.
 fn reconcile_scan_tx(
     transaction: &Transaction<'_>,
     project: ProjectId,
     scope: &Path,
     snapshot: &ScanSnapshot,
     control: &JobControl,
-) -> StorageResult<ReconcileSummary> {
+) -> StorageResult<(ReconcileSummary, bool)> {
     require_live_project(transaction, project)?;
     let (scope_key, _) = native_columns(scope).map_err(issue_to_error)?;
     let registered: Vec<PathKey> = scan_folder_columns(transaction, project)?
@@ -767,58 +800,105 @@ fn reconcile_scan_tx(
     };
 
     if snapshot.coverage == Coverage::Cancelled || control.is_cancelled() {
-        summary.cancelled = true;
-        summary.prune_suppressed =
-            Some("the scan was cancelled; observed files were not written".to_string());
-        return Ok(summary);
+        return Ok((
+            cancelled_summary(
+                summary,
+                "the scan was cancelled; observed files were not written",
+            ),
+            false,
+        ));
     }
     if snapshot.coverage == Coverage::RootUnavailable {
         summary.prune_suppressed =
             Some("the root was unavailable; observed files were not written".to_string());
-        return Ok(summary);
+        return Ok((summary, true));
     }
 
     let observations = collect_observations(snapshot, &scope_key, &mut summary);
     summary.observed = observations.len();
     if control.is_cancelled() {
-        summary.cancelled = true;
-        summary.prune_suppressed =
-            Some("cancelled at the commit checkpoint; observed files were not written".to_string());
-        return Ok(summary);
+        return Ok((
+            cancelled_summary(
+                summary,
+                "cancelled at the commit checkpoint; observed files were not written",
+            ),
+            false,
+        ));
     }
 
     let now = utc_timestamp_now();
-    apply_observations(transaction, project, &observations, &now, &mut summary)?;
+    let write_cancelled = apply_observations(
+        transaction,
+        project,
+        &observations,
+        &now,
+        &mut summary,
+        control,
+    )?;
+    if write_cancelled || control.is_cancelled() {
+        return Ok((cancelled_summary(summary, ROLLED_BACK_REASON), false));
+    }
     summary.applied = true;
 
-    let prune_allowed =
-        snapshot.coverage == Coverage::Complete && snapshot.continuity == RootContinuity::Proven;
+    // `RootContinuity::Proven` is a claim made by the caller; pruning also needs the
+    // continuity to still hold right now, re-proven from the live filesystem.
+    let continuity_verified = snapshot.root_identity.as_ref().is_some_and(|identity| {
+        inspect_root(scope).is_ok_and(|current| current.compare_identity(identity) == Some(true))
+    });
+    let prune_allowed = snapshot.coverage == Coverage::Complete
+        && snapshot.continuity == RootContinuity::Proven
+        && continuity_verified;
     if !prune_allowed {
-        summary.prune_suppressed = Some(match snapshot.coverage {
-            Coverage::Complete => {
-                "root continuity was not proven; unseen files were retained".to_string()
+        summary.prune_suppressed = Some(
+            match (snapshot.coverage, snapshot.continuity, continuity_verified) {
+                (Coverage::Complete, RootContinuity::Proven, false) => {
+                    "the root identity could not be re-proven immediately before pruning; unseen files were retained"
+                }
+                (Coverage::Complete, _, _) => {
+                    "root continuity was not proven; unseen files were retained"
+                }
+                (Coverage::Partial, _, _) => {
+                    "the scan was incomplete; unseen files were retained"
+                }
+                (Coverage::Cancelled | Coverage::RootUnavailable, _, _) => {
+                    "no trusted coverage; unseen files were retained"
+                }
             }
-            Coverage::Partial => "the scan was incomplete; unseen files were retained".to_string(),
-            Coverage::Cancelled | Coverage::RootUnavailable => {
-                "no trusted coverage; unseen files were retained".to_string()
-            }
-        });
-        return Ok(summary);
+            .to_string(),
+        );
+        return Ok((summary, true));
     }
-    if control.is_cancelled() {
-        summary.cancelled = true;
-        summary.prune_suppressed =
-            Some("cancelled at the commit checkpoint; nothing was pruned".to_string());
-        return Ok(summary);
-    }
-    prune_absent_memberships(
+    let prune_cancelled = prune_absent_memberships(
         transaction,
         project,
         &scope_key,
         &observations,
         &mut summary,
+        control,
     )?;
-    Ok(summary)
+    if prune_cancelled || control.is_cancelled() {
+        return Ok((cancelled_summary(summary, ROLLED_BACK_REASON), false));
+    }
+    Ok((summary, true))
+}
+
+const ROLLED_BACK_REASON: &str =
+    "the scan was cancelled during the catalog write; nothing was kept";
+
+/// A cancellation that rolls the transaction back. The mutation counters describe
+/// work the rollback discarded, so they are cleared: `applied == false` must never
+/// be read next to counts that look committed.
+fn cancelled_summary(mut summary: ReconcileSummary, reason: &str) -> ReconcileSummary {
+    summary.cancelled = true;
+    summary.applied = false;
+    summary.files_created = 0;
+    summary.files_updated = 0;
+    summary.memberships_added = 0;
+    summary.memberships_refreshed = 0;
+    summary.memberships_pruned = 0;
+    summary.memberships_retained = 0;
+    summary.prune_suppressed = Some(reason.to_string());
+    summary
 }
 
 /// One file to upsert: its catalog columns and its derived display metadata.
@@ -875,12 +955,53 @@ fn collect_observations(
             columns,
             filename,
             filetype: filetype_of(&entry.path),
-            size_bytes: i64::try_from(entry.stamp.size).ok(),
-            modified_unix_ns: entry.stamp.modified.and_then(unix_nanos),
+            size_bytes: size_column(entry.stamp.size, &entry.path, summary),
+            modified_unix_ns: modified_column(entry.stamp.modified, &entry.path, summary),
             version,
         });
     }
     observations
+}
+
+/// A file size that does not fit the catalog's 64-bit signed column is reported
+/// against its path instead of being wrapped or silently dropped. The observation
+/// keeps no size, so the update's `COALESCE` retains any previously known value.
+fn size_column(size: u64, path: &Path, summary: &mut ReconcileSummary) -> Option<i64> {
+    match i64::try_from(size) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            summary.issues.push(PathIssue::new(
+                path,
+                PathCategory::Unsupported,
+                format!(
+                    "the file size ({size} bytes) is outside the catalog's signed 64-bit range; no size was recorded"
+                ),
+            ));
+            None
+        }
+    }
+}
+
+/// The modification time is optional at the source, and a representable
+/// nanosecond value is required: an unrepresentable one is reported against its
+/// path rather than truncated, and the update keeps the previously known value.
+fn modified_column(
+    modified: Option<SystemTime>,
+    path: &Path,
+    summary: &mut ReconcileSummary,
+) -> Option<i64> {
+    let modified = modified?;
+    match unix_nanos(modified) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            summary.issues.push(PathIssue::new(
+                path,
+                PathCategory::Unsupported,
+                "the modification time is not representable as signed 64-bit nanoseconds; no modification time was recorded",
+            ));
+            None
+        }
+    }
 }
 
 fn apply_observations(
@@ -889,7 +1010,8 @@ fn apply_observations(
     observations: &[Observation],
     now: &str,
     summary: &mut ReconcileSummary,
-) -> StorageResult<()> {
+    control: &JobControl,
+) -> StorageResult<bool> {
     let mut select_file = transaction
         .prepare("SELECT id FROM files WHERE platform = ?1 AND storage = ?2")
         .map_err(|error| sql_error("could not read the file catalog", error))?;
@@ -900,7 +1022,7 @@ fn apply_observations(
         .map_err(|error| sql_error("could not prepare the file insert", error))?;
     let mut update_file = transaction
         .prepare(
-            "UPDATE files SET filename = COALESCE(NULLIF(?2, ''), filename), version = COALESCE(?3, version), version_number = COALESCE(?4, version_number), filetype = COALESCE(?5, filetype), size_bytes = ?6, modified_unix_ns = ?7, last_seen_at = ?8 WHERE id = ?1",
+            "UPDATE files SET filename = COALESCE(NULLIF(?2, ''), filename), version = COALESCE(?3, version), version_number = COALESCE(?4, version_number), filetype = COALESCE(?5, filetype), size_bytes = COALESCE(?6, size_bytes), modified_unix_ns = COALESCE(?7, modified_unix_ns), last_seen_at = ?8 WHERE id = ?1",
         )
         .map_err(|error| sql_error("could not prepare the file update", error))?;
     let mut select_membership = transaction
@@ -913,6 +1035,11 @@ fn apply_observations(
         .map_err(|error| sql_error("could not prepare the membership insert", error))?;
 
     for observation in observations {
+        // Cancellation is checked between items only; `checkpoint()` would block
+        // while paused, which would stall every other catalog request.
+        if control.is_cancelled() {
+            return Ok(true);
+        }
         let storage = observation
             .columns
             .storage
@@ -980,7 +1107,7 @@ fn apply_observations(
             summary.memberships_added += 1;
         }
     }
-    Ok(())
+    Ok(control.is_cancelled())
 }
 
 fn prune_absent_memberships(
@@ -989,7 +1116,8 @@ fn prune_absent_memberships(
     scope_key: &PathKey,
     observations: &[Observation],
     summary: &mut ReconcileSummary,
-) -> StorageResult<()> {
+    control: &JobControl,
+) -> StorageResult<bool> {
     let mut observed: HashSet<FileId> = HashSet::with_capacity(observations.len());
     {
         let mut statement = transaction
@@ -1055,6 +1183,9 @@ fn prune_absent_memberships(
         .prepare("DELETE FROM project_files WHERE project_id = ?1 AND file_id = ?2")
         .map_err(|error| sql_error("could not prepare the membership removal", error))?;
     for (file_id, path) in candidates {
+        if control.is_cancelled() {
+            return Ok(true);
+        }
         match fs::metadata(&path) {
             Ok(_) => {
                 summary.memberships_retained += 1;
@@ -1080,10 +1211,11 @@ fn prune_absent_memberships(
             }
         }
     }
-    Ok(())
+    Ok(control.is_cancelled())
 }
 
-/// Lists one project's files grouped by version base name, newest first.
+/// Lists one project's files grouped by timeline, shot and version base name,
+/// newest first.
 pub fn list_project_files(
     catalog: &Catalog,
     project: ProjectId,
@@ -1165,7 +1297,7 @@ fn read_project_files(
 
 /// Groups files by base name and orders each group newest-first.
 fn group_files(files: Vec<ProjectFile>) -> Vec<FileGroup> {
-    let mut groups: HashMap<Vec<u8>, Vec<ProjectFile>> = HashMap::new();
+    let mut groups: HashMap<(GroupBucket, Vec<u8>), Vec<ProjectFile>> = HashMap::new();
     for file in files {
         let name_bytes: Vec<u8> = match file.path.as_deref().and_then(Path::file_name) {
             Some(name) => name.as_encoded_bytes().to_vec(),
@@ -1175,20 +1307,25 @@ fn group_files(files: Vec<ProjectFile>) -> Vec<FileGroup> {
                 .map(|text| text.as_bytes().to_vec())
                 .unwrap_or_default(),
         };
+        let bucket = match file.path.as_deref() {
+            Some(path) => bucket_of(path),
+            // An unresolved spelling has no folder chain to anchor on; it keeps its
+            // own bucket so it never merges into a scanned timeline/shot group.
+            None => GroupBucket {
+                timeline: Vec::new(),
+                shot: fallback_shot(&[], &name_bytes),
+            },
+        };
         groups
-            .entry(base_name_bytes(&name_bytes))
+            .entry((bucket, base_name_bytes(&name_bytes)))
             .or_default()
             .push(file);
     }
-    let mut ordered: Vec<(Vec<u8>, Vec<ProjectFile>)> = groups.into_iter().collect();
-    ordered.sort_by(|a, b| {
-        fold_native_text(&a.0)
-            .cmp(&fold_native_text(&b.0))
-            .then_with(|| a.0.cmp(&b.0))
-    });
+    let mut ordered: Vec<((GroupBucket, Vec<u8>), Vec<ProjectFile>)> = groups.into_iter().collect();
+    ordered.sort_by(|a, b| group_order(&a.0).cmp(&group_order(&b.0)));
     ordered
         .into_iter()
-        .map(|(base, mut files)| {
+        .map(|((bucket, base), mut files)| {
             files.sort_by(|a, b| {
                 let left = version_order(a);
                 let right = version_order(b);
@@ -1201,6 +1338,8 @@ fn group_files(files: Vec<ProjectFile>) -> Vec<FileGroup> {
             });
             let latest = files.first().map(|file| file.file);
             FileGroup {
+                timeline: String::from_utf8(bucket.timeline).ok(),
+                shot: String::from_utf8(bucket.shot).ok(),
                 base_name: String::from_utf8(base).ok(),
                 filetype: files.first().and_then(|file| file.filetype.clone()),
                 files,
@@ -1208,6 +1347,145 @@ fn group_files(files: Vec<ProjectFile>) -> Vec<FileGroup> {
             }
         })
         .collect()
+}
+
+/// The timeline/shot bucket the legacy tree built for a file. Grouping keys use
+/// the native bytes so two different non-UTF-8 folder names never merge; only the
+/// display spellings in [`FileGroup`] are optional text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GroupBucket {
+    timeline: Vec<u8>,
+    shot: Vec<u8>,
+}
+
+/// Timeline and shot for one path, exactly as
+/// `ui_slick/file_handlers.py::group_by_timeline` derives them:
+/// `<anchor>/<timeline>/<shot>/.../file.nk`, where the anchor is the **topmost**
+/// `Nuke` / `After Effects` folder that still yields a timeline+shot pair. Extra
+/// nesting below the shot (artist folders such as `<shot>/nuke/script`) is
+/// deliberately ignored, so it never becomes a bucket of its own.
+fn bucket_of(path: &Path) -> GroupBucket {
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            parts.push(name.as_encoded_bytes());
+        }
+    }
+    // The last component is the file itself.
+    if !parts.is_empty() {
+        parts.pop();
+    }
+
+    for needed in [2usize, 1] {
+        for anchor in 0..parts.len() {
+            if !is_scan_anchor(parts[anchor]) {
+                continue;
+            }
+            let relative = &parts[anchor + 1..];
+            if relative.len() < needed {
+                continue;
+            }
+            return if relative.len() >= 2 {
+                GroupBucket {
+                    timeline: relative[0].to_vec(),
+                    shot: relative[1].to_vec(),
+                }
+            } else {
+                GroupBucket {
+                    timeline: Vec::new(),
+                    shot: relative[0].to_vec(),
+                }
+            };
+        }
+    }
+
+    let parent = parts.last().copied().unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .map(|name| name.as_encoded_bytes())
+        .unwrap_or_default();
+    GroupBucket {
+        timeline: Vec::new(),
+        shot: fallback_shot(parent, file_name),
+    }
+}
+
+/// Folder names the legacy code treated as a project tool root.
+fn is_scan_anchor(name: &[u8]) -> bool {
+    let folded = fold_native_text(name);
+    folded == b"nuke" || folded == b"after effects" || folded == b"aftereffects"
+}
+
+/// Shot name when no anchor produced one: the immediate parent folder, unless that
+/// folder is a plumbing/tool name — then the filename decides, as in
+/// `group_by_shot`. The deeper artist folder is never consulted.
+fn fallback_shot(parent: &[u8], file_name: &[u8]) -> Vec<u8> {
+    const PLUMBING: [&[u8]; 8] = [
+        b"nk",
+        b"aep",
+        b"shots",
+        b"assets",
+        b"nuke",
+        b"after effects",
+        b"script",
+        b"scripts",
+    ];
+    let folder = fold_native_text(parent);
+    let mut shot = if folder.is_empty() || PLUMBING.contains(&folder.as_slice()) {
+        let base = match file_name.windows(2).position(|window| window == b"_v") {
+            Some(index) => &file_name[..index],
+            None => file_name,
+        };
+        shot_code(base).unwrap_or_else(|| {
+            base.split(|byte| *byte == b'_')
+                .next()
+                .unwrap_or_default()
+                .to_vec()
+        })
+    } else {
+        parent.to_vec()
+    };
+    if shot.is_empty() {
+        shot = b"Main".to_vec();
+    }
+    shot
+}
+
+/// The legacy `((?:SH|sh)[_-]?\d{2,3})` shot-code search: the first `SH`/`sh`
+/// followed by an optional separator and two or three digits.
+fn shot_code(base: &[u8]) -> Option<Vec<u8>> {
+    let mut index = 0;
+    while index + 2 < base.len() {
+        if matches!(&base[index..index + 2], b"SH" | b"sh") {
+            let mut cursor = index + 2;
+            if matches!(base.get(cursor), Some(b'_') | Some(b'-')) {
+                cursor += 1;
+            }
+            let mut digits = 0;
+            while digits < 3 && base.get(cursor + digits).is_some_and(u8::is_ascii_digit) {
+                digits += 1;
+            }
+            if digits >= 2 {
+                return Some(base[index..cursor + digits].to_vec());
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Timeline, then shot, then base name — each case-folded first and then compared
+/// byte-exactly, so the order is stable and never case-dependent.
+fn group_order(key: &(GroupBucket, Vec<u8>)) -> [Vec<u8>; 6] {
+    let (bucket, base) = key;
+    [
+        fold_native_text(&bucket.timeline),
+        bucket.timeline.clone(),
+        fold_native_text(&bucket.shot),
+        bucket.shot.clone(),
+        fold_native_text(base),
+        base.clone(),
+    ]
 }
 
 fn version_order(file: &ProjectFile) -> (i64, i64) {
@@ -1640,12 +1918,16 @@ fn filetype_of(path: &Path) -> Option<String> {
         .map(str::to_lowercase)
 }
 
-fn unix_nanos(time: SystemTime) -> Option<i64> {
+/// Nanoseconds since the Unix epoch, or the reason the value cannot be stored.
+/// Nothing is truncated, wrapped or clamped: an unrepresentable time is reported
+/// by the caller and keeps the previously known catalog value.
+fn unix_nanos(time: SystemTime) -> Result<i64, ()> {
     match time.duration_since(UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_nanos()).ok(),
+        Ok(elapsed) => i64::try_from(elapsed.as_nanos()).map_err(|_| ()),
         Err(error) => i64::try_from(error.duration().as_nanos())
             .ok()
-            .and_then(i64::checked_neg),
+            .and_then(i64::checked_neg)
+            .ok_or(()),
     }
 }
 
@@ -1698,15 +1980,22 @@ fn parse_version(name: &str) -> Option<ParsedVersion> {
     if !ends_with_aep(bytes) {
         return None;
     }
+    // Legacy `extract_version` searches the whole stem for the *last* digit run
+    // (`(\d{1,5})(?!.*\d)`) and keeps at most its last five digits, so
+    // `comp_12_final.aep` has version 12 — not only a trailing number.
     let stem = &bytes[..bytes.len() - 4];
-    let mut start = stem.len();
+    let mut end = stem.len();
+    while end > 0 && !stem[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut start = end;
     while start > 0 && stem[start - 1].is_ascii_digit() {
         start -= 1;
     }
-    if start == stem.len() {
-        return None;
-    }
-    let run = &stem[start..];
+    let run = &stem[start..end];
     let take = run.len().min(5);
     Some(version_from_digits(&run[run.len() - take..]))
 }

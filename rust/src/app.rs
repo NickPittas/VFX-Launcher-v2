@@ -3,21 +3,32 @@
 //!
 //! The layout follows `DESIGN-APPROVAL.md` and `USER-UI-REQUIREMENTS.md`: menu
 //! bar, workspace strip, docked resizable panes with internal scrolling, and a
-//! persistent bottom status/execution strip. No view holds data yet, so every
-//! list renders its explicit empty state instead of sample content.
+//! persistent bottom status/execution strip.
+//!
+//! Projects and Settings are wired to the real backend through
+//! [`crate::project_workspace`]. The remaining views keep their explicit
+//! placeholders until their packets land; nothing here invents data.
+
+use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::jobs::{JobId, JobStatus, Jobs};
+use crate::jobs::{JobId, JobStatus, Jobs, LIVE_POLL_INTERVAL};
+use crate::launch::Tool;
+use crate::project_workspace::{ProjectWorkspace, RegistrationStatus};
+use crate::projects::{ProjectFile, ProjectList};
+use crate::storage::ProjectId;
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
 const PANEL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x24, 0x25, 0x28);
 const EDITOR_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x1a, 0x1b, 0x1d);
 const CONTROL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x2d, 0x2f, 0x33);
 const UNAVAILABLE: &str = "Not available in this build.";
+/// Honest placeholder for columns whose backend is not built yet.
+const UNKNOWN: &str = "—";
 
-/// Starts the native desktop application.
-pub fn run_gui() -> eframe::Result {
+/// Starts the native desktop application against one local data area.
+pub fn run_gui(data_dir: PathBuf) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 880.0])
@@ -28,7 +39,7 @@ pub fn run_gui() -> eframe::Result {
     eframe::run_native(
         "vfx-launcher",
         options,
-        Box::new(|cc| Ok(Box::new(VfxLauncherApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(VfxLauncherApp::new(cc, data_dir)))),
     )
 }
 
@@ -119,20 +130,17 @@ impl View {
     }
 }
 
-// Presentation rows for the empty catalog state. P1 replaces these with catalog types.
-#[derive(Clone, Debug, Default)]
-struct ProjectRow {
-    name: String,
-    files: u64,
-}
-
-#[derive(Clone, Debug, Default)]
-struct FileRow {
-    file: String,
-    version: String,
-    modified: String,
-    last_opened: String,
-    by: String,
+/// What a pane asks the shell to do once the frame's borrows are released.
+enum Action {
+    SetTab(ProjectList),
+    SelectProject(ProjectId),
+    ToggleFavorite(ProjectId),
+    ProjectInfo(ProjectId),
+    Launch(ProjectFile),
+    Reveal(ProjectFile),
+    FileInfo(ProjectFile),
+    CopyText(String),
+    ChooseUser(crate::storage::UserId),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -141,11 +149,10 @@ struct NewProjectDraft {
 }
 
 pub struct VfxLauncherApp {
+    ctx: egui::Context,
     view: View,
     jobs: Jobs,
-    projects: Vec<ProjectRow>,
-    selected_project: Option<usize>,
-    files: Vec<FileRow>,
+    workspace: ProjectWorkspace,
     project_filter: String,
     incoming_source: String,
     incoming_destination: String,
@@ -157,19 +164,22 @@ pub struct VfxLauncherApp {
     backup_destination: String,
     backup_exclusions: String,
     about_open: bool,
+    info_dialog: Option<(String, Vec<String>)>,
     new_project: Option<NewProjectDraft>,
-    /// A close request is pending until every worker thread has been reaped.
+    /// A close request is pending until the workers and the catalog have stopped.
     closing: bool,
+    /// The close command was already sent; no further coordination is wanted.
+    close_sent: bool,
 }
 
-impl Default for VfxLauncherApp {
-    fn default() -> Self {
+impl VfxLauncherApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf) -> Self {
+        apply_desktop_style(&cc.egui_ctx);
         Self {
+            ctx: cc.egui_ctx.clone(),
             view: View::Projects,
             jobs: Jobs::new(),
-            projects: Vec::new(),
-            selected_project: None,
-            files: Vec::new(),
+            workspace: ProjectWorkspace::new(&cc.egui_ctx, data_dir),
             project_filter: String::new(),
             incoming_source: String::new(),
             incoming_destination: String::new(),
@@ -181,16 +191,11 @@ impl Default for VfxLauncherApp {
             backup_destination: String::new(),
             backup_exclusions: String::new(),
             about_open: false,
+            info_dialog: None,
             new_project: None,
             closing: false,
+            close_sent: false,
         }
-    }
-}
-
-impl VfxLauncherApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_desktop_style(&cc.egui_ctx);
-        Self::default()
     }
 }
 
@@ -198,14 +203,37 @@ impl eframe::App for VfxLauncherApp {
     /// Runs before `ui` and also while the window is hidden, so job polling and
     /// close coordination never depend on a painted frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.workspace.poll(&mut self.jobs);
         if self.closing {
-            // Re-signal every frame so work started while the window is closing is
-            // cancelled too, and keep reaping on the same non-blocking poll.
             self.jobs.begin_shutdown();
-        } else {
-            self.jobs.poll();
+            let catalog_pending = self.workspace.shutdown_pending();
+            if !self.jobs.is_busy() && !catalog_pending {
+                self.closing = false;
+                self.close_sent = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(LIVE_POLL_INTERVAL);
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
+            return;
         }
-        self.coordinate_close(ctx);
+
+        self.jobs.poll();
+
+        if self.close_sent {
+            return;
+        }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            // Keep the window open for the length of the coordinated stop instead
+            // of killing queued catalog work with the process.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.closing = true;
+            self.jobs.begin_shutdown();
+            self.workspace.begin_shutdown();
+            ctx.request_repaint_after(LIVE_POLL_INTERVAL);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -226,44 +254,19 @@ impl eframe::App for VfxLauncherApp {
 
         let ctx = ui.ctx().clone();
         self.new_project_dialog(&ctx);
+        self.info_dialog(&ctx);
         self.about_dialog(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Non-blocking: signal cancellation and reap only threads that have
-        // already finished. Joining a live worker here could hang the process.
+        // Non-blocking: signal cancellation and start the catalog's coordinated
+        // shutdown. Joining a live worker here could hang the process.
         self.jobs.begin_shutdown();
+        self.workspace.begin_shutdown();
     }
 }
 
 impl VfxLauncherApp {
-    /// Delays the window close until every worker thread has been reaped.
-    ///
-    /// The first close request is cancelled, cancellation is signalled and the
-    /// status strip reports the wait. Only already-finished threads are joined,
-    /// on this same non-blocking poll, and the close is re-issued once no worker
-    /// remains. A worker blocked in OS I/O cannot be interrupted: the window stays
-    /// open and says so instead of claiming a timeout guarantee.
-    fn coordinate_close(&mut self, ctx: &egui::Context) {
-        if self.closing {
-            if !self.jobs.is_busy() {
-                self.closing = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if ctx.input(|input| input.viewport().close_requested()) {
-                // A repeated close request must not force the window shut while
-                // workers are still running.
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            }
-            return;
-        }
-
-        if ctx.input(|input| input.viewport().close_requested()) && self.jobs.is_busy() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.closing = true;
-            self.jobs.begin_shutdown();
-        }
-    }
-
     /// The approved workspace uses two compact horizontal bars.
     fn navigation(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("app_navigation").show(ui, |ui| {
@@ -375,7 +378,7 @@ impl VfxLauncherApp {
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(action) = action {
-                        let _ = primary_button(ui, action, false);
+                        explain(&primary_button(ui, action, false), UNAVAILABLE);
                     }
                     if let Some(job) = &job {
                         if job.is_terminal() && job.is_reaped() {
@@ -418,158 +421,334 @@ impl VfxLauncherApp {
         }
     }
 
+    // ------------------------------------------------------------------ projects
+
     fn projects_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let _ = primary_button(ui, "Scan folders", false);
-            ui.separator();
-            ui.add_enabled(
-                false,
-                egui::TextEdit::singleline(&mut self.project_filter)
-                    .hint_text("Filter projects")
-                    .desired_width(200.0),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("New project").clicked() {
-                    self.new_project = Some(NewProjectDraft::default());
-                }
-            });
-        });
+        let mut actions = Vec::new();
+        self.projects_toolbar(ui, &mut actions);
+        self.projects_notices(ui);
         ui.separator();
 
         egui::Panel::left("project_list_pane")
             .resizable(true)
-            .default_size(340.0)
-            .min_size(220.0)
+            .default_size(320.0)
+            .min_size(200.0)
             .max_size(620.0)
-            .show(ui, |ui| self.project_list_pane(ui));
+            .show(ui, |ui| {
+                project_list_pane(&self.workspace, ui, &mut actions)
+            });
 
-        egui::CentralPanel::default().show(ui, |ui| self.project_files_pane(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            project_files_pane(&self.workspace, ui, &mut actions)
+        });
+
+        for action in actions {
+            self.apply(action);
+        }
     }
 
-    fn project_list_pane(&mut self, ui: &mut egui::Ui) {
-        if self.projects.is_empty() {
-            empty_state(
+    fn projects_toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            let scan_running = self.workspace.scan_running();
+            let scan_ready = self.workspace.actions_enabled() && !scan_running;
+            let scan = primary_button(
                 ui,
-                "No projects yet.",
-                "Adding projects is not available in this build.",
+                if scan_running {
+                    "Scanning…"
+                } else {
+                    "Scan folders"
+                },
+                scan_ready,
             );
-            return;
+            if scan.clicked() {
+                self.workspace.begin_scan();
+            }
+            if scan_running && ui.button("Cancel scan").clicked() {
+                self.workspace.cancel_scan(&mut self.jobs);
+            }
+            if !scan_ready {
+                explain(
+                    &scan,
+                    &if scan_running {
+                        "A scan is already running.".to_string()
+                    } else {
+                        self.action_block_reason()
+                    },
+                );
+            }
+
+            let add = ui.add_enabled(
+                self.workspace.actions_enabled() && !self.workspace.registration_busy(),
+                egui::Button::new("Add existing folder…"),
+            );
+            if add.clicked() {
+                self.workspace.begin_add_folders();
+            }
+            if !self.workspace.actions_enabled() {
+                explain(&add, &self.action_block_reason());
+            }
+
+            ui.separator();
+            let filter_enabled = self.workspace.user().is_some();
+            let filter = ui.add_enabled(
+                filter_enabled,
+                egui::TextEdit::singleline(&mut self.project_filter)
+                    .hint_text("Filter projects")
+                    .desired_width(200.0),
+            );
+            if filter.changed() {
+                self.workspace.set_filter(self.project_filter.clone());
+            }
+
+            ui.separator();
+            for (tab, label) in [
+                (ProjectList::All, "All"),
+                (ProjectList::Favorites, "Favorites"),
+                (ProjectList::Recents, "Recent"),
+            ] {
+                let selected = self.workspace.tab() == tab;
+                let button = ui.add_enabled(
+                    self.workspace.user().is_some(),
+                    egui::Button::new(label).selected(selected),
+                );
+                if button.clicked() {
+                    actions.push(Action::SetTab(tab));
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("New project…").clicked() {
+                    self.new_project = Some(NewProjectDraft::default());
+                }
+                ui.separator();
+                self.user_chooser(ui, actions);
+            });
+        });
+    }
+
+    /// Who the recorded actions belong to. A catalog with several identities and
+    /// no recorded choice shows the picker instead of guessing one.
+    fn user_chooser(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let current = self
+            .workspace
+            .user()
+            .map(|user| user.username.clone())
+            .unwrap_or_else(|| "Choose user".to_string());
+        let users: Vec<(crate::storage::UserId, String)> = self
+            .workspace
+            .users()
+            .iter()
+            .map(|user| (user.id, user.username.clone()))
+            .collect();
+        egui::ComboBox::from_id_salt("active_user")
+            .selected_text(egui::RichText::new(current).small())
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                if users.is_empty() {
+                    ui.label(egui::RichText::new("No users yet").small().weak());
+                }
+                for (id, name) in users {
+                    let selected = self.workspace.user().map(|user| user.id) == Some(id);
+                    if ui.selectable_label(selected, name).clicked() {
+                        actions.push(Action::ChooseUser(id));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "Recorded actions (recent projects, favorites, file access) use this name.",
+            );
+    }
+
+    fn action_block_reason(&self) -> String {
+        self.workspace
+            .actions_blocked_reason()
+            .unwrap_or_else(|| UNAVAILABLE.to_string())
+    }
+
+    fn projects_notices(&mut self, ui: &mut egui::Ui) {
+        if let Some(error) = self.workspace.catalog_error() {
+            notice_row(ui, "The project catalog is unavailable.", Some(error), true);
+        }
+        if let Some(error) = self.workspace.settings_error() {
+            notice_row(
+                ui,
+                "The settings file could not be read.",
+                Some(error),
+                true,
+            );
+        }
+        if let Some(error) = self.workspace.settings_save_error() {
+            notice_row(
+                ui,
+                "The settings file could not be saved.",
+                Some(error),
+                true,
+            );
+        }
+        if self.workspace.user().is_none()
+            && self.workspace.catalog_error().is_none()
+            && !self.workspace.users().is_empty()
+        {
+            ui.label(
+                egui::RichText::new("Choose the name that recorded actions belong to.")
+                    .small()
+                    .weak(),
+            );
+        }
+        if let Some(error) = self.workspace.projects_error() {
+            notice_row(ui, "The project list could not be read.", Some(error), true);
         }
 
-        let mut selected = self.selected_project;
-        let projects = &self.projects;
-        egui_extras::TableBuilder::new(ui)
-            .id_salt("project_table")
-            .resizable(true)
-            .column(egui_extras::Column::remainder().at_least(120.0).clip(true))
-            .column(egui_extras::Column::initial(64.0).at_least(48.0))
-            .header(20.0, |mut header| {
-                header.col(|ui| {
-                    ui.label("Project");
-                });
-                header.col(|ui| {
-                    ui.label("Files");
-                });
-            })
-            .body(|mut body| {
-                for (index, project) in projects.iter().enumerate() {
-                    body.row(22.0, |mut row| {
-                        row.col(|ui| {
-                            ui.selectable_value(&mut selected, Some(index), project.name.as_str());
-                        });
-                        row.col(|ui| {
-                            ui.label(project.files.to_string());
-                        });
+        match self.workspace.registration_status() {
+            Some(status) => {
+                let line = status.summary_line();
+                let error = matches!(status, RegistrationStatus::Failed(_));
+                let details = status.detail_lines();
+                notice_row(ui, &line, None, error);
+                if !details.is_empty() {
+                    ui.collapsing("Folder details", |ui| {
+                        for line in details {
+                            ui.label(egui::RichText::new(line).small());
+                        }
                     });
                 }
-            });
-        self.selected_project = selected;
-    }
-
-    fn project_files_pane(&mut self, ui: &mut egui::Ui) {
-        let Some(index) = self.selected_project else {
-            empty_state(
-                ui,
-                "No project selected.",
-                "Select a project to see its Nuke and After Effects files.",
-            );
-            return;
-        };
-
-        let name = self
-            .projects
-            .get(index)
-            .map(|project| project.name.as_str())
-            .unwrap_or("Selected project");
-        ui.label(egui::RichText::new(name).small().weak());
-
-        if self.files.is_empty() {
-            empty_state(
-                ui,
-                "No files in this project yet.",
-                "Scan folders to list versions.",
-            );
-            return;
+            }
+            None => {}
         }
 
-        let files = &self.files;
-        egui_extras::TableBuilder::new(ui)
-            .id_salt("project_files_table")
-            .resizable(true)
-            .column(egui_extras::Column::remainder().at_least(160.0).clip(true))
-            .column(egui_extras::Column::initial(64.0).at_least(48.0))
-            .column(egui_extras::Column::initial(76.0).at_least(64.0))
-            .column(
-                egui_extras::Column::initial(120.0)
-                    .at_least(90.0)
-                    .clip(true),
-            )
-            .column(
-                egui_extras::Column::initial(110.0)
-                    .at_least(80.0)
-                    .clip(true),
-            )
-            .column(egui_extras::Column::initial(90.0).at_least(60.0).clip(true))
-            .header(20.0, |mut header| {
-                for title in ["File", "Version", "Launch", "Modified", "Last opened", "By"] {
-                    header.col(|ui| {
-                        ui.label(title);
-                    });
+        if !self.workspace.scan_lines().is_empty() {
+            let summary = format!(
+                "{} folder{} scanned",
+                self.workspace.scan_lines().len(),
+                if self.workspace.scan_lines().len() == 1 {
+                    ""
+                } else {
+                    "s"
                 }
-            })
-            .body(|mut body| {
-                for file in files {
-                    body.row(22.0, |mut row| {
-                        row.col(|ui| {
-                            ui.label(file.file.as_str());
-                        });
-                        row.col(|ui| {
-                            ui.label(file.version.as_str());
-                        });
-                        row.col(|ui| {
-                            let _ = ui.add_enabled(false, egui::Button::new("Launch").small());
-                        });
-                        row.col(|ui| {
-                            ui.label(file.modified.as_str());
-                        });
-                        row.col(|ui| {
-                            ui.label(file.last_opened.as_str());
-                        });
-                        row.col(|ui| {
-                            ui.label(file.by.as_str());
-                        });
-                    });
+            );
+            ui.collapsing(summary, |ui| {
+                for line in self.workspace.scan_lines() {
+                    ui.label(egui::RichText::new(line).small());
                 }
             });
+        }
+
+        if let Some(notice) = self.workspace.notice() {
+            let title = notice.title.clone();
+            let detail = notice.detail.clone();
+            let error = notice.error;
+            notice_row(ui, &title, detail.as_deref(), error);
+            if ui.small_button("Dismiss").clicked() {
+                self.workspace.dismiss_notice();
+            }
+        }
     }
+
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::SetTab(tab) => self.workspace.set_tab(tab),
+            Action::SelectProject(id) => self.workspace.select_project(id),
+            Action::ToggleFavorite(id) => self.workspace.toggle_favorite(id),
+            Action::Launch(file) => self.workspace.begin_launch(&file),
+            Action::Reveal(file) => self.workspace.reveal(&file),
+            Action::CopyText(text) => self.ctx.copy_text(text),
+            Action::ChooseUser(id) => self.workspace.choose_user(id),
+            Action::ProjectInfo(id) => {
+                if let Some(project) = self
+                    .workspace
+                    .projects()
+                    .iter()
+                    .find(|project| project.id == id)
+                {
+                    let mut lines = Vec::new();
+                    lines.push(format!("Name: {}", project.name));
+                    lines.push(format!(
+                        "Folder: {}",
+                        project
+                            .root
+                            .as_ref()
+                            .map(|root| root.display().to_string())
+                            .or_else(|| project.root_display.clone())
+                            .unwrap_or_else(|| UNKNOWN.to_string())
+                    ));
+                    for folder in &project.scan_folders {
+                        lines.push(format!(
+                            "Scanned folder: {}",
+                            folder
+                                .path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .or_else(|| folder.display.clone())
+                                .unwrap_or_else(|| UNKNOWN.to_string())
+                        ));
+                    }
+                    lines.push(format!("Added: {}", project.added_at));
+                    lines.push(format!("Favorite: {}", yes_no(project.favorite)));
+                    if let Some(accessed) = &project.accessed_at {
+                        lines.push(format!("Last opened: {accessed}"));
+                    }
+                    self.info_dialog = Some((project.name.clone(), lines));
+                }
+            }
+            Action::FileInfo(file) => {
+                let mut lines = Vec::new();
+                lines.push(format!(
+                    "Path: {}",
+                    file.path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .or_else(|| file.display.clone())
+                        .unwrap_or_else(|| UNKNOWN.to_string())
+                ));
+                lines.push(format!(
+                    "Version: {}",
+                    file.version
+                        .as_ref()
+                        .map(|version| version.text.clone())
+                        .unwrap_or_else(|| UNKNOWN.to_string())
+                ));
+                lines.push(format!(
+                    "Type: {}",
+                    file.filetype.clone().unwrap_or_else(|| UNKNOWN.to_string())
+                ));
+                lines.push(format!(
+                    "Size: {}",
+                    file.size_bytes
+                        .map(format_size)
+                        .unwrap_or_else(|| UNKNOWN.to_string())
+                ));
+                lines.push(format!(
+                    "Modified: {}",
+                    file.modified_unix_ns
+                        .and_then(unix_seconds)
+                        .map(|seconds| crate::storage::utc_timestamp(seconds))
+                        .unwrap_or_else(|| UNKNOWN.to_string())
+                ));
+                // The catalog records when a scan last saw the file; opening
+                // history is a later backend, so it is not invented here.
+                lines.push(format!(
+                    "Last scanned: {}",
+                    file.last_seen_at
+                        .clone()
+                        .unwrap_or_else(|| UNKNOWN.to_string())
+                ));
+                self.info_dialog = Some(("File information".to_string(), lines));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ views
 
     fn shots_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Project").small().weak());
             let current = self
-                .selected_project_name()
+                .workspace
+                .selected_project()
+                .map(|project| project.name.as_str())
                 .unwrap_or("No project selected");
-            ui.add_enabled(false, egui::Button::new(current));
+            ui.label(current);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let _ = pending_button(ui, "Templates…");
             });
@@ -623,7 +802,7 @@ impl VfxLauncherApp {
 
     fn incoming_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let _ = primary_button(ui, "Scan folders", false);
+            explain(&primary_button(ui, "Scan folders", false), UNAVAILABLE);
             ui.separator();
             folder_field(
                 ui,
@@ -673,9 +852,7 @@ impl VfxLauncherApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Planned files").small().weak());
-            });
+            ui.label(egui::RichText::new("Planned files").small().weak());
             ui.separator();
             empty_state(
                 ui,
@@ -687,7 +864,7 @@ impl VfxLauncherApp {
 
     fn copy_by_file_type_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let _ = primary_button(ui, "Scan folders", false);
+            explain(&primary_button(ui, "Scan folders", false), UNAVAILABLE);
             ui.separator();
             folder_field(
                 ui,
@@ -744,7 +921,7 @@ impl VfxLauncherApp {
 
     fn backup_view(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let _ = primary_button(ui, "Scan folders", false);
+            explain(&primary_button(ui, "Scan folders", false), UNAVAILABLE);
             ui.separator();
             folder_field(
                 ui,
@@ -802,32 +979,82 @@ impl VfxLauncherApp {
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
+        let mut actions = Vec::new();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.collapsing("Data location", |ui| {
+                ui.label(
+                    egui::RichText::new(self.workspace.data_dir().display().to_string())
+                        .monospace()
+                        .small(),
+                );
+                if let Some(error) = self.workspace.settings_error() {
+                    ui.label(egui::RichText::new(error).small());
+                }
+            });
+
             ui.collapsing("Applications", |ui| {
-                empty_state(
-                    ui,
-                    "No applications configured.",
-                    "Nuke and After Effects paths appear here.",
+                let applications = &self.workspace.settings().applications;
+                for (label, value) in [
+                    (
+                        "Nuke application",
+                        applications
+                            .nuke_path
+                            .as_ref()
+                            .map(|path| path.as_path().display().to_string()),
+                    ),
+                    (
+                        "After Effects application",
+                        applications
+                            .after_effects_path
+                            .as_ref()
+                            .map(|path| path.as_path().display().to_string()),
+                    ),
+                    (
+                        "Nuke launch command (Linux)",
+                        applications.nuke_launch_cmd_linux.clone(),
+                    ),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(label).small().weak());
+                        ui.label(
+                            egui::RichText::new(value.unwrap_or_else(|| "Not configured".into()))
+                                .small()
+                                .monospace(),
+                        );
+                    });
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Editing these values arrives with the Settings packet; Launch uses them read-only.",
+                    )
+                    .small()
+                    .weak(),
                 );
             });
-            ui.collapsing("Project discovery", |ui| {
-                empty_state(
-                    ui,
-                    "No project roots added.",
-                    "Folders searched for existing projects appear here.",
-                );
-            });
+
             ui.collapsing("Users", |ui| {
-                empty_state(
-                    ui,
-                    "No users yet.",
-                    "Names used for file attribution appear here.",
-                );
+                if self.workspace.users().is_empty() {
+                    ui.label(egui::RichText::new("No users yet.").small().weak());
+                }
+                for user in self.workspace.users() {
+                    let selected = self.workspace.user().map(|current| current.id) == Some(user.id);
+                    let mut label = user.username.clone();
+                    if user.is_admin {
+                        label.push_str(" (admin)");
+                    }
+                    if ui.selectable_label(selected, label).clicked() {
+                        actions.push(Action::ChooseUser(user.id));
+                    }
+                }
             });
+
             ui.collapsing("Logs", |ui| {
                 empty_state(ui, "No log entries yet.", "Diagnostics appear here.");
             });
         });
+        for action in actions {
+            self.apply(action);
+        }
     }
 
     fn new_project_dialog(&mut self, ctx: &egui::Context) {
@@ -863,7 +1090,7 @@ impl VfxLauncherApp {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Project creation needs the catalog, which is not in this build.",
+                        "Creating a project needs the folder-structure and template packets, so it stays disabled rather than creating an empty folder.",
                     )
                     .small()
                     .weak(),
@@ -872,6 +1099,32 @@ impl VfxLauncherApp {
 
         if open && !cancel {
             self.new_project = Some(draft);
+        }
+    }
+
+    fn info_dialog(&mut self, ctx: &egui::Context) {
+        let Some((title, lines)) = self.info_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(title.clone())
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for line in &lines {
+                            ui.label(egui::RichText::new(line).small().monospace());
+                        }
+                    });
+                if ui.button("Copy").clicked() {
+                    ctx.copy_text(lines.join("\n"));
+                }
+            });
+        if open {
+            self.info_dialog = Some((title, lines));
         }
     }
 
@@ -889,7 +1142,7 @@ impl VfxLauncherApp {
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.label(
                     egui::RichText::new(
-                        "Desktop foundation build. Project catalog, folder scanning and file operations arrive in later builds.",
+                        "Project catalog and file launch are wired. Folder structure creation, incoming organization, file-type copy, backup and settings editing arrive in later builds.",
                     )
                     .small()
                     .weak(),
@@ -897,27 +1150,358 @@ impl VfxLauncherApp {
             });
         self.about_open = open;
     }
+}
 
-    fn selected_project_name(&self) -> Option<&str> {
-        self.selected_project
-            .and_then(|index| self.projects.get(index))
-            .map(|project| project.name.as_str())
+// ---------------------------------------------------------------------- panes
+
+fn project_list_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    if workspace.catalog_error().is_some() || workspace.user().is_none() {
+        empty_state(
+            ui,
+            "Projects are unavailable.",
+            "The catalog or the active user must be available first.",
+        );
+        return;
     }
+    if workspace.projects().is_empty() {
+        empty_state(
+            ui,
+            "No projects yet.",
+            "Add an existing project folder to get started.",
+        );
+        return;
+    }
+
+    let projects = workspace.projects();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for project in projects {
+            let selected = workspace.selected() == Some(project.id);
+            let mut label = project.name.clone();
+            if project.favorite {
+                label.push_str("  *");
+            }
+            let response = ui.selectable_label(selected, label);
+            let response = response.on_hover_text(project_path(project));
+            if response.clicked() {
+                actions.push(Action::SelectProject(project.id));
+            }
+            row_menu(ui, &response, |ui| {
+                if ui
+                    .button(if project.favorite {
+                        "Remove from favorites"
+                    } else {
+                        "Add to favorites"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::ToggleFavorite(project.id));
+                    ui.close();
+                }
+                if ui.button("Copy folder path").clicked() {
+                    actions.push(Action::CopyText(project_path(project)));
+                    ui.close();
+                }
+                if ui.button("Project information").clicked() {
+                    actions.push(Action::ProjectInfo(project.id));
+                    ui.close();
+                }
+            });
+        }
+    });
+}
+
+fn project_files_pane(workspace: &ProjectWorkspace, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    let Some(project) = workspace.selected_project() else {
+        empty_state(
+            ui,
+            "No project selected.",
+            "Select a project to see its Nuke and After Effects files.",
+        );
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(project.name.clone()).small().weak());
+        if let Some(error) = workspace.files_error() {
+            ui.label(egui::RichText::new(error).small());
+        }
+    });
+
+    if workspace.files().is_empty() {
+        empty_state(
+            ui,
+            "No files in this project yet.",
+            "Scan folders to record its Nuke and After Effects files.",
+        );
+        return;
+    }
+
+    let actions_enabled = workspace.actions_enabled();
+    let mut previous_bucket: Option<(Option<String>, Option<String>)> = None;
+
+    egui_extras::TableBuilder::new(ui)
+        .id_salt("project_files_table")
+        .resizable(true)
+        .column(egui_extras::Column::remainder().at_least(180.0).clip(true))
+        .column(egui_extras::Column::initial(70.0).at_least(52.0).clip(true))
+        .column(egui_extras::Column::initial(78.0).at_least(66.0))
+        .column(
+            egui_extras::Column::initial(120.0)
+                .at_least(90.0)
+                .clip(true),
+        )
+        .column(
+            egui_extras::Column::initial(110.0)
+                .at_least(80.0)
+                .clip(true),
+        )
+        .column(egui_extras::Column::initial(90.0).at_least(60.0).clip(true))
+        .header(20.0, |mut header| {
+            for title in ["File", "Version", "Launch", "Modified", "Last opened", "By"] {
+                header.col(|ui| {
+                    ui.label(title);
+                });
+            }
+        })
+        .body(|mut body| {
+            for group in workspace.files() {
+                let bucket = (group.timeline.clone(), group.shot.clone());
+                if previous_bucket.as_ref() != Some(&bucket) {
+                    previous_bucket = Some(bucket.clone());
+                    let label = bucket_label(&bucket);
+                    body.row(18.0, |mut row| {
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(label).small().weak());
+                        });
+                        for _ in 0..5 {
+                            row.col(|_ui| {});
+                        }
+                    });
+                }
+                for file in &group.files {
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| {
+                            let name = file_name(file);
+                            let response = ui.selectable_label(false, name);
+                            let response = response.on_hover_text(file_path(file));
+                            if response.clicked() {
+                                // A single click only focuses the row; launching is the
+                                // explicit Launch control on the same line.
+                            }
+                            file_menu(ui, &response, workspace, file, actions);
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                file.version
+                                    .as_ref()
+                                    .map(|version| version.text.clone())
+                                    .unwrap_or_else(|| UNKNOWN.to_string()),
+                            );
+                        });
+                        row.col(|ui| {
+                            let tool = file.filetype.as_deref().and_then(Tool::from_filetype);
+                            let ready = actions_enabled && tool.is_some() && file.path.is_some();
+                            let button = ui.add_enabled(ready, egui::Button::new("Launch").small());
+                            if button.clicked() {
+                                actions.push(Action::Launch(file.clone()));
+                            }
+                            if !ready {
+                                let reason = if tool.is_none() {
+                                    "This file type has no configured application."
+                                } else if file.path.is_none() {
+                                    "This file has no usable path on this machine."
+                                } else {
+                                    "The catalog is not ready yet."
+                                };
+                                button.on_hover_text(reason);
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(modified_text(file));
+                        });
+                        row.col(|ui| {
+                            ui.label(UNKNOWN)
+                                .on_hover_text("Opening history is not recorded in this build.");
+                        });
+                        row.col(|ui| {
+                            ui.label(UNKNOWN)
+                                .on_hover_text("Attribution is not recorded in this build.");
+                        });
+                    });
+                }
+            }
+        });
+}
+
+fn file_menu(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    workspace: &ProjectWorkspace,
+    file: &ProjectFile,
+    actions: &mut Vec<Action>,
+) {
+    let path = file_path(file);
+    let ready = workspace.actions_enabled();
+    row_menu(ui, response, |ui| {
+        let launch = ui.add_enabled(
+            ready && file.path.is_some() && file.filetype.is_some(),
+            egui::Button::new("Launch"),
+        );
+        if launch.clicked() {
+            actions.push(Action::Launch(file.clone()));
+            ui.close();
+        }
+        let reveal = ui.add_enabled(
+            file.path.is_some(),
+            egui::Button::new("Reveal in file manager"),
+        );
+        if reveal.clicked() {
+            actions.push(Action::Reveal(file.clone()));
+            ui.close();
+        }
+        if ui.button("Copy path").clicked() {
+            actions.push(Action::CopyText(path));
+            ui.close();
+        }
+        if ui.button("Information").clicked() {
+            actions.push(Action::FileInfo(file.clone()));
+            ui.close();
+        }
+    });
+}
+
+/// Right-click context menu on a row, plus `Shift+F10` when that row has focus,
+/// so the same actions are reachable without a mouse.
+fn row_menu(ui: &mut egui::Ui, response: &egui::Response, contents: impl FnOnce(&mut egui::Ui)) {
+    let keyboard = response.has_focus()
+        && ui.input(|input| input.key_pressed(egui::Key::F10) && input.modifiers.shift);
+    let open = if response.secondary_clicked() || keyboard {
+        Some(egui::SetOpenCommand::Bool(true))
+    } else if response.clicked() {
+        Some(egui::SetOpenCommand::Bool(false))
+    } else {
+        None
+    };
+    let mut popup = egui::Popup::menu(response)
+        .open_memory(open)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick);
+    if !keyboard {
+        popup = popup.at_pointer_fixed();
+    }
+    popup.show(|ui| {
+        ui.set_min_width(180.0);
+        contents(ui);
+    });
+}
+
+// -------------------------------------------------------------------- helpers
+
+fn project_path(project: &crate::projects::Project) -> String {
+    project
+        .root
+        .as_ref()
+        .map(|root| root.display().to_string())
+        .or_else(|| project.root_display.clone())
+        .unwrap_or_else(|| "Unresolved folder on this machine".to_string())
+}
+
+fn file_path(file: &ProjectFile) -> String {
+    file.path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .or_else(|| file.display.clone())
+        .unwrap_or_else(|| "Unresolved path on this machine".to_string())
+}
+
+fn file_name(file: &ProjectFile) -> String {
+    file.filename
+        .clone()
+        .or_else(|| file.display.clone())
+        .unwrap_or_else(|| UNKNOWN.to_string())
+}
+
+fn bucket_label(bucket: &(Option<String>, Option<String>)) -> String {
+    match (&bucket.0, &bucket.1) {
+        (Some(timeline), Some(shot)) if !timeline.is_empty() => format!("{timeline} / {shot}"),
+        (_, Some(shot)) => shot.clone(),
+        (Some(timeline), None) if !timeline.is_empty() => timeline.clone(),
+        _ => "Unsorted".to_string(),
+    }
+}
+
+fn modified_text(file: &ProjectFile) -> String {
+    match file.modified_unix_ns.and_then(unix_seconds) {
+        Some(seconds) => {
+            // `YYYY-MM-DDTHH:MM:SSZ` -> `YYYY-MM-DD HH:MM`, still UTC.
+            let stamp = crate::storage::utc_timestamp(seconds);
+            stamp
+                .get(0..16)
+                .map(|text| text.replace('T', " "))
+                .unwrap_or(stamp)
+        }
+        None => UNKNOWN.to_string(),
+    }
+}
+
+fn unix_seconds(nanos: i64) -> Option<u64> {
+    u64::try_from(nanos / 1_000_000_000).ok()
+}
+
+fn format_size(bytes: u64) -> String {
+    let bytes = bytes as f64;
+    if bytes >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", bytes / (1024.0 * 1024.0))
+    } else if bytes >= 1024.0 {
+        format!("{:.1} KB", bytes / 1024.0)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     let text = egui::RichText::new(label).color(egui::Color32::WHITE);
-    let response = ui.add_enabled(enabled, egui::Button::new(text).fill(ACCENT));
-    if enabled {
-        response
-    } else {
-        response.on_hover_text(UNAVAILABLE)
-    }
+    ui.add_enabled(enabled, egui::Button::new(text).fill(ACCENT))
+}
+
+/// Attaches the one explanation a disabled control gets.
+fn explain(response: &egui::Response, reason: &str) {
+    let _ = response.clone().on_hover_text(reason);
 }
 
 fn pending_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_enabled(false, egui::Button::new(label))
         .on_hover_text(UNAVAILABLE)
+}
+
+fn notice_row(ui: &mut egui::Ui, title: &str, detail: Option<&str>, error: bool) {
+    ui.horizontal(|ui| {
+        let text = egui::RichText::new(title).small();
+        if error {
+            ui.label(text.color(egui::Color32::from_rgb(0xe0, 0x9a, 0x6a)));
+        } else {
+            ui.label(text);
+        }
+        if let Some(detail) = detail {
+            ui.label(
+                egui::RichText::new(detail.lines().next().unwrap_or(""))
+                    .small()
+                    .weak(),
+            );
+        }
+    });
+    if let Some(detail) = detail {
+        if detail.lines().count() > 1 || detail.len() > 80 {
+            ui.collapsing("Details", |ui| {
+                for line in detail.lines() {
+                    ui.label(egui::RichText::new(line).small().monospace());
+                }
+            });
+        }
+    }
 }
 
 fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {

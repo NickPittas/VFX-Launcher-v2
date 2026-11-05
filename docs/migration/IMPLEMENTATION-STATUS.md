@@ -1,5 +1,15 @@
 # Implementation status
 
+## Initial native Projects verification
+
+See NATIVE-PROJECTS-EVIDENCE.md for bounded executable build, native launch,
+disposable catalog restart, screenshots and idle-close evidence. Interactive
+registration/scanning/launching were not verified because desktop input
+automation failed. Coordinator corrected scan cancellation through reconcile,
+partial outcome/count reporting, operation-strip wording, and settings-worker
+draining during close. Latest library and binary cargo checks pass; no test
+suite or global tests ran. Other workspaces remain unfinished.
+
 ## Coordinator F2 integration corrections
 
 Catalog recognition now precedes persistent journal-mode changes. Mount
@@ -823,3 +833,162 @@ worker; nothing here executes SQL in an egui frame.
    and `log_file_access`; it must not fetch these on the UI thread.
 3. **F3 import** and **U3 settings** as previously listed; **X1** persists
    operation runs and reuses the same catalog worker.
+
+## Packet U1 + P2 — Projects wiring, launch, and the five P1 review fixes (2026-11-05)
+
+Branch `migration/rust-egui-suite`. Sole writer: one implementer. After the
+read-only backend review returned, ownership extended from the UI files to
+`projects.rs` and — for one small addition — `storage.rs`, so the review findings
+are fixed in the same pass that consumes them.
+
+| File | Change |
+|---|---|
+| `rust/src/project_workspace.rs` | **New.** All asynchronous Projects state: settings worker, catalog startup, user restore, project/file queries with stale-reply guards, registration pipeline, serial scan queue, launch/reveal workers, coordinated shutdown. |
+| `rust/src/launch.rs` | **New (P2).** Native argv for Nuke/After Effects, environment sanitation, reveal. |
+| `rust/src/app.rs` | Rewritten around the approved DCC composition; Projects and Settings wired to real state; other views keep explicit placeholders. |
+| `rust/src/main.rs` | Lossless `args_os` parsing, `--data-dir <ABSOLUTE>`, `--help`, reject-unknown, exit codes. |
+| `rust/src/lib.rs` | Declares `launch` and `project_workspace`; `run_gui(data_dir)`. |
+| `rust/src/projects.rs` | The five P1 review findings (below). |
+| `rust/src/storage.rs` | One addition: `TransactionOutcome` + `Catalog::transaction_or_rollback`. |
+| `rust/Cargo.toml`, `rust/Cargo.lock` | `rfd = "=0.17.2"`, `shlex = "=2.0.1"`, eframe feature `clipboard`. |
+
+### P1 review findings, and how each is fixed
+
+| Finding | Fix |
+|---|---|
+| **HIGH** — `reconcile_scan_tx` applied observations and returned `Ok` even when cancelled; the non-pruning branch had no final cancel check and the pruning branch wrote before checking. | `reconcile_scan` now runs through `Catalog::transaction_or_rollback`. `reconcile_scan_tx` returns `(summary, keep)`; cancellation at **any** boundary (before the writes, inside the upsert loop, inside the prune loop, or at the final boundary after both) returns `keep = false`, which **rolls the transaction back**. `apply_observations` and `prune_absent_memberships` check `control.is_cancelled()` between items and return `true` when they stopped early. The delivered `ReconcileSummary` reports `cancelled = true`, `applied = false`, zeroed mutation counters and an explicit reason, so cancellation is a readable result, not an error and not a silent commit. `checkpoint()` is still never used on the catalog worker, so a paused job cannot stall other requests. |
+| **MEDIUM** — grouping key used the base filename only. | `FileGroup` gained `timeline` and `shot`; the grouping key is `(timeline native bytes, shot native bytes, base name bytes)`. `bucket_of` reproduces `ui_slick/file_handlers.py::group_by_timeline` exactly: the **topmost** `Nuke`/`After Effects`/`AfterEffects` anchor that yields a timeline+shot pair wins (2 segments, then 1), and deeper nesting below the shot — artist folders such as `<shot>/nuke/script` — is deliberately ignored. No anchor → the legacy `group_by_shot` fallback (immediate parent, unless it is a plumbing name; then the `SH`/`sh` code matcher, then the first `_` part, then `Main`). Ordering is timeline → shot → base name, case-folded then byte-exact. The Projects table shows the bucket as a group separator row, so the approved `File | Version | Launch | Modified | Last opened | By` columns are unchanged. |
+| **MEDIUM** — pruning trusted `RootContinuity::Proven` alone. | Pruning now additionally requires `snapshot.root_identity` to be present **and** a fresh `paths::inspect_root(scope)` whose `compare_identity` against the snapshot is `Some(true)`, evaluated immediately before pruning. Otherwise observations are kept and `prune_suppressed` says the identity could not be re-proven. Discovery still reports `Uncertain`, so no pruning path is reachable in this build. |
+| **MEDIUM** — size/mtime conversions dropped overflow and overwrote known metadata with `NULL`. | `size_column`/`modified_column` push a `PathIssue` naming the path and the conversion cause (no wrapping, no truncation) and yield `None`. The file `UPDATE` now uses `size_bytes = COALESCE(?6, size_bytes)` and `modified_unix_ns = COALESCE(?7, modified_unix_ns)`, so a previously known value survives an unrepresentable reading. |
+| **LOW** — the AEP version fallback only read a trailing digit run. | `parse_version` now takes the **last digit run anywhere in the stem** and keeps at most its last five digits, matching `re.search(r'(\d{1,5})(?!.*\d)', stem)`: `comp_12_final.aep` → version 12, `comp_123456.aep` → 23456. `base_name_bytes` is unchanged because the legacy `get_base_name` regex is anchored with `$` and therefore only matches a trailing run. |
+
+### Implemented behavior — U1 Projects
+
+- **Startup, off the UI thread.** `SettingsWorker` (own thread, command channel)
+  creates nothing but loads `settings.json`; `Catalog::open` only spawns the
+  storage worker. `info()` → `list_users()` → (fresh catalog only)
+  `create_user("admin", true)` → project list. Every reply is a `Pending` polled
+  in `logic`, never awaited in a frame. The catalog completion notifier is wired
+  to `ctx.request_repaint()`.
+- **Identity.** The recorded `selected_username` is restored by name against live
+  users. `admin` is created only when the catalog has **no** identities; there is
+  no `id == 1` assumption, no invented name, and a malformed settings file is
+  reported and never overwritten (`save_settings` is a no-op until the load
+  succeeds). A catalog with users but no recorded choice shows the toolbar
+  chooser and gates writes instead of guessing.
+- **Projects.** All / Favorites / Recent plus a debounced (250 ms) filter, all
+  issued as `list_projects(user, tab, filter)`. Selecting a project loads
+  `list_project_files` and records `mark_recent`; favorites toggle through
+  `set_favorite` and re-read the list. **Stale replies** are dropped by
+  `(request id, project id)` and by the list request id, so switching tab, filter,
+  user or project can never display another selection's rows. No project counts
+  are fabricated: the pane shows names only, with the folder path in the tooltip
+  and context menu.
+- **Add existing folder.** `rfd::FileDialog::pick_folders` runs on a worker
+  thread (multi-selection when the platform supports it). `plan_registration`
+  then runs on its own worker thread, and `register_projects` is polled as a
+  `Pending`. The pane shows one summary line (`N added, M already registered, K
+  failed`) with per-folder details collapsed underneath.
+- **Scan folders.** The blue top action loads every project once, builds a queue
+  of **registered** scan folders only, and walks them serially in a `jobs` worker
+  using `discovery::default_filters(ScanPurpose::Projects)`. Progress and the
+  current folder come from `JobEvents`; Pause/Cancel come from the existing strip.
+  Each walk result is reconciled through `reconcile_scan` with that job's
+  `JobControl`, and a cancelled walk records nothing (rollback path above).
+- **Launch.** The row Launch control (the approved row exception) starts a worker
+  that re-validates the file and the configured program, spawns, and only then
+  does the UI submit `log_file_access`. Failures are shown with a readable
+  summary; success says the launch **command started**, with the file path in the
+  details, and never claims the application finished starting.
+- **Panes.** `Panel::left` (resizable, bounded) beside the files table, both
+  filling the same height; every table column is resizable; lists scroll
+  internally. Right-click and `Shift+F10` on a focused row open the same menu:
+  Launch, Reveal, Copy path, Information (projects: favorites, copy path,
+  information). Copy uses `Context::copy_text` (eframe's `clipboard` feature).
+- **Closing.** A close request is intercepted once: jobs are cancelled, the
+  catalog handle is consumed by `Catalog::shutdown()`, and the window closes only
+  when no worker is busy and `CatalogShutdown::try_finish()` reports the worker
+  finished. Nothing joins on the UI thread; repaints keep running while the stop
+  is pending; the handle is never dropped early, so accepted requests still
+  resolve. `on_exit` only signals.
+
+### Implemented behavior — P2 launch (`launch.rs`)
+
+- `Tool::Nuke` on Linux: `shlex::split(nuke_launch_cmd_linux)` + the file appended
+  as one `OsString` argument — the legacy `main_window.py::_launch_file` shape,
+  tokenized by a POSIX lexer rather than a hand-written quote parser. Unbalanced
+  quotes and an empty command are distinct, readable errors.
+- `Tool::Nuke` elsewhere: `[nuke_path, "--nukex", file]`. `Tool::AfterEffects`:
+  `[after_effects_path, file]`. No shell anywhere, so spaces and quotes in a file
+  name stay inside one argument.
+- Pre-spawn revalidation on the worker: the program must exist, be a file and
+  (Unix) be executable; the file must still exist and be a file. A bare program
+  name is a `PATH` lookup and is documented as unverifiable before spawn.
+- Environment: the parent environment is inherited unchanged (licence variables
+  survive). On Linux, `LD_LIBRARY_PATH_ORIG` restores `LD_LIBRARY_PATH` exactly as
+  `core/utils.py::get_external_process_env` did; otherwise `LD_LIBRARY_PATH`,
+  `PYTHONHOME`, `PYTHONPATH`, `QT_PLUGIN_PATH` and `QT_QPA_PLATFORM_PLUGIN_PATH`
+  are removed **only** when an inherited bundle marker is present (`_MEIPASS` or an
+  `_MEI*` path entry). Nothing is cleared wholesale.
+- Reveal: Linux `xdg-open <containing folder>`, Windows
+  `explorer.exe /select,"<path>"`, macOS `open -R`. Children are reaped by a
+  detached thread so no zombie accumulates.
+
+### Public API changes (exact)
+
+```rust
+// storage.rs — new
+pub enum TransactionOutcome<T> { Commit(T), Rollback(T) }
+impl Catalog { pub fn transaction_or_rollback<T, F>(&self, f: F) -> StorageResult<Pending<T>> }
+// projects.rs — changed
+pub struct FileGroup { pub timeline: Option<String>, pub shot: Option<String>,
+                       pub base_name: Option<String>, pub filetype: Option<String>,
+                       pub files: Vec<ProjectFile>, pub latest: Option<FileId> }
+```
+`reconcile_scan` keeps its signature; cancellation is reported inside the
+summary. No other public backend signature changed.
+
+### Verification actually performed
+
+- `rustfmt --edition 2024` (write then `--check`) on `app.rs`, `main.rs`,
+  `launch.rs`, `project_workspace.rs`, `projects.rs`, `storage.rs`, `lib.rs`:
+  clean, which also syntax-checks the `cfg(windows)` reveal branch the Linux
+  compiler skips.
+- `cargo check --manifest-path rust/Cargo.toml --lib` and `--bin vfx-launcher`
+  with `CARGO_HOME=artifacts/verification/cargo-home`,
+  `CARGO_TARGET_DIR=rust/target`, `TMPDIR=artifacts/verification/tmp`: **pass,
+  zero warnings, zero errors**. Every command ran under `timeout 30s`.
+- Dependency resolution: `Cargo.lock` gained exactly `rfd 0.17.2`,
+  `shlex 2.0.1`, `pollster 0.4.0`, `smithay-clipboard 0.7.3`,
+  `smithay-client-toolkit 0.19.2`, `calloop 0.13.0/0.14.5`,
+  `calloop-wayland-source`, `wayland-protocols-experimental`,
+  `wayland-protocols-misc`. No existing crate version was removed or changed.
+- Source hand-traces (no execution): settings-load-failure gating, empty-user
+  catalog, restore-by-name, missing-name chooser, stale project/file replies
+  across tab, filter, user and project switches, registration
+  Dialog → Plan → Register → Summary, scan queue with a cancelled walk (rollback),
+  unavailable root, launch failure/success ordering versus `log_file_access`,
+  close coordination with a busy worker, and the bucket derivation against
+  `group_by_timeline` for `Projects/Nuke/<timeline>/<shot>/<artist>/nuke/file.nk`
+  (deeper folder ignored), a one-segment path, and the no-anchor fallback.
+- **No tests, no test suites, no self-check scripts, no launches of Nuke, After
+  Effects, the app itself, or any reveal, no production database/config access,
+  no screenshots, no commits/pushes/PRs/worktrees.**
+
+### Deliberate limits of this packet
+
+- The application was not run, so no runtime or visual verification of the Rust
+  UI exists; `DESIGN-APPROVAL.md` stays a design baseline, not a native
+  acceptance. HTML screenshots remain the only visual evidence.
+- The `cfg(windows)` reveal branch and the Windows `nuke_path` argv are written
+  against the documented behavior but are **not compiled** on this Linux machine.
+- Launch reports spawn acceptance only. It cannot observe whether the DCC
+  application finished starting or loaded the file.
+- The "Last opened" and "By" columns show `—` with an explanatory tooltip: the
+  catalog has no per-file opening-history reader yet, and no value is invented.
+- `begin_scan` clears finished job rows when the next scope starts, so the strip
+  shows one scanning job rather than an unbounded history; per-scope results stay
+  in the Projects pane's scan details.
+- Settings editing, structure creation, incoming organization, file-type copy,
+  backup, legacy import and operation history remain placeholders; their views
+  stay visibly disabled.

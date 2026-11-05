@@ -252,6 +252,16 @@ impl<T> Pending<T> {
     }
 }
 
+/// How a transaction closure wants its transaction to end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionOutcome<T> {
+    /// Keep the writes: the transaction commits before the value is delivered.
+    Commit(T),
+    /// Keep nothing: the transaction rolls back and the value is still delivered,
+    /// so a deliberate cancellation is reported as a result, not as a failure.
+    Rollback(T),
+}
+
 /// Handle to the catalog worker. Cheap to keep in application state; every
 /// method either queues work or opens a reply channel, never blocks on SQLite.
 ///
@@ -396,6 +406,36 @@ impl Catalog {
                 .commit()
                 .map_err(|err| db_error("could not commit the catalog transaction", None, err))?;
             Ok(value)
+        })
+    }
+
+    /// Transaction entry point for work that must be able to report "nothing was
+    /// kept" as a value: same guarantees as [`Catalog::transaction`], but the
+    /// closure decides whether the transaction commits or rolls back. A
+    /// cancellation then stays a result state instead of becoming an I/O error.
+    pub fn transaction_or_rollback<T, F>(&self, f: F) -> StorageResult<Pending<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Transaction<'_>) -> StorageResult<TransactionOutcome<T>> + Send + 'static,
+    {
+        self.submit(move |connection| {
+            let mut transaction = connection
+                .transaction()
+                .map_err(|err| db_error("could not begin a catalog transaction", None, err))?;
+            match f(&mut transaction)? {
+                TransactionOutcome::Commit(value) => {
+                    transaction.commit().map_err(|err| {
+                        db_error("could not commit the catalog transaction", None, err)
+                    })?;
+                    Ok(value)
+                }
+                TransactionOutcome::Rollback(value) => {
+                    transaction.rollback().map_err(|err| {
+                        db_error("could not roll back the catalog transaction", None, err)
+                    })?;
+                    Ok(value)
+                }
+            }
         })
     }
 
