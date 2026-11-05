@@ -25,9 +25,13 @@
 //! - Identity comparison around a name-based rename or unlink is a fresh check,
 //!   not an atomic one: correctness assumes cooperating writers in the selected
 //!   directories and makes no hostile-race claim.
-//! - Source removal for Move re-checks the source identity, but a crash between
-//!   install and removal leaves both files; the run is then interrupted and
-//!   inspectable, never replayed automatically.
+//! - Sources are resolved only beneath the declared source root, whose recorded
+//!   identity must agree with the held handle before any item runs; an item
+//!   source is never reopened by absolute path.
+//! - Source removal for Move re-proves the directory entry and the copied handle
+//!   after the `RemovingSource` checkpoint, but a crash between install and
+//!   removal leaves both files; the run is then interrupted and inspectable,
+//!   never replayed automatically.
 
 use super::super::native::{EntryIdentity, Root};
 use super::super::{
@@ -50,7 +54,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, ErrorKind, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 /// Chunk size for staged copies. Cancellation and progress are checked between
@@ -99,6 +103,26 @@ pub fn execute(
     let run_id = journal.run_id();
     awaited(mark_run_running(catalog, run_id))?;
 
+    // Generated-only plans read nothing, so they never need a source root. A plan
+    // that copies or moves must confine every source to a declared root whose
+    // recorded identity agrees with the held handle before the first item runs.
+    let reads_sources = journal
+        .validated()
+        .items()
+        .iter()
+        .any(|item| matches!(item.effect, ItemEffect::Copy | ItemEffect::Move));
+    let (source_root, source_root_path) = if reads_sources {
+        match hold_source_root(journal.validated()) {
+            Ok((root, path)) => (Some(root), Some(path)),
+            Err(reason) => {
+                settle_refused(catalog, &journal, &reason)?;
+                return Err(refused(&reason));
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     let mut executor = Executor {
         catalog,
         journal: &journal,
@@ -115,6 +139,8 @@ pub fn execute(
                 return Err(refused(&reason));
             }
         },
+        source_root,
+        source_root_path,
         destination_root,
         blocked_directories: HashSet::new(),
         verified_folders: HashMap::new(),
@@ -160,6 +186,25 @@ pub fn execute(
                     format!("item {} failed: {message}", item.index + 1),
                 );
                 executor.record(item, ItemState::Failed, 0, Some(message), recovery)?;
+            }
+            Err(Flow::PostInstall { message, recovery }) => {
+                executor.note_failure(item);
+                events.diagnostic(
+                    JobPhase::Copying,
+                    format!(
+                        "item {} installed but was not verified: {message}",
+                        item.index + 1
+                    ),
+                );
+                // The reviewed bytes are already committed to the destination;
+                // the journal accepts them only after an install checkpoint.
+                executor.record(
+                    item,
+                    ItemState::Failed,
+                    item.bytes.unwrap_or(0),
+                    Some(message),
+                    recovery,
+                )?;
             }
             Err(Flow::Cancelled(recovery)) => {
                 executor.record(
@@ -302,6 +347,13 @@ enum Done {
 /// outcome; `Abort` stops the run because the journal itself is unusable.
 enum Flow {
     Problem(String, Vec<PathBuf>),
+    /// The destination was installed and journaled, then the result could not be
+    /// verified. The reviewed bytes are committed, so the item fails without
+    /// discarding or re-claiming them.
+    PostInstall {
+        message: String,
+        recovery: Vec<PathBuf>,
+    },
     Cancelled(Vec<PathBuf>),
     Abort(TransferError),
 }
@@ -314,8 +366,13 @@ impl From<TransferError> for Flow {
 
 /// Result of re-checking a source that a Move is about to delete.
 enum SourceCheck {
+    /// The entry still names the copied file, unchanged since review.
     Unchanged(EntryIdentity),
+    /// A known difference from the review or the copied file; the source is kept.
     Changed(String),
+    /// The entry or the copied handle could not be compared, so removing the
+    /// source cannot be proven safe.
+    Unknown(String),
 }
 
 /// What one commit established: the note to report and whether the destination
@@ -342,6 +399,10 @@ struct Executor<'a> {
     control: &'a JobControl,
     events: &'a JobEvents,
     root: Root,
+    /// The declared source root, opened and identity-proven once per run. `None`
+    /// for generated-only plans, which read no source at all.
+    source_root: Option<Root>,
+    source_root_path: Option<PathBuf>,
     destination_root: PathBuf,
     /// Destination-relative folders whose creation failed; children of these are
     /// failed without being attempted, so a blocked prerequisite stays visible.
@@ -568,6 +629,63 @@ impl Executor<'_> {
         ))
     }
 
+    /// Resolves one reviewed source beneath the source root held for this run.
+    /// The root identity proved at run start is what makes this spelling
+    /// trustworthy, so a source is never reopened by its absolute path; every
+    /// folder is reached through the held handle with the native no-follow,
+    /// beneath-root, no-cross-device resolver.
+    fn source_entry(&self, source: &Path) -> Result<(OwnedFd, OsString), Flow> {
+        let root_path = self.source_root_path.as_deref().ok_or_else(|| {
+            problem(format!(
+                "source {} has no reviewed source root",
+                source.display()
+            ))
+        })?;
+        let root = self.source_root.as_ref().ok_or_else(|| {
+            problem(format!(
+                "source {} has no source root held for this run",
+                source.display()
+            ))
+        })?;
+        let relative = source.strip_prefix(root_path).map_err(|_| {
+            problem(format!(
+                "source {} is outside the reviewed source root {}",
+                source.display(),
+                root_path.display()
+            ))
+        })?;
+        if relative.as_os_str().is_empty() {
+            return Err(problem(format!(
+                "source {} is the reviewed source root itself",
+                source.display()
+            )));
+        }
+        if !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(problem(format!(
+                "source {} is not a plain descendant of the reviewed source root {}",
+                source.display(),
+                root_path.display()
+            )));
+        }
+        let name = relative
+            .file_name()
+            .ok_or_else(|| problem(format!("source {} has no file name", source.display())))?
+            .to_os_string();
+        let parent_relative = relative.parent().unwrap_or(Path::new(""));
+        let parent = if parent_relative.as_os_str().is_empty() {
+            root.duplicate()
+        } else {
+            root.open_dir(parent_relative.as_os_str())
+        }
+        .map_err(|error| {
+            io_problem("the source folder", &root_path.join(parent_relative), error)
+        })?;
+        Ok((parent, name))
+    }
+
     /// Removes this run's own staging file. Returns a visible note when the file
     /// cannot be shown to be gone: a failed item must not hide junk it left.
     fn discard_staging(
@@ -745,16 +863,7 @@ impl Executor<'_> {
             .open_parent(&parent_relative)
             .map_err(|error| io_problem("the destination folder", &destination, error))?;
 
-        let source_parent_path = source
-            .parent()
-            .ok_or_else(|| problem(format!("source {} has no folder", source.display())))?
-            .to_path_buf();
-        let source_name = source
-            .file_name()
-            .ok_or_else(|| problem(format!("source {} has no file name", source.display())))?
-            .to_os_string();
-        let source_parent = Root::open(source_parent_path.as_os_str())
-            .map_err(|error| io_problem("the source folder", &source_parent_path, error))?;
+        let (source_parent, source_name) = self.source_entry(&source)?;
         let (mut source_file, source_identity) = self
             .root
             .open_regular(&source_parent, &source_name, false)
@@ -819,8 +928,9 @@ impl Executor<'_> {
                 &source_name,
                 &source,
                 &reviewed,
+                &source_file,
                 source_identity,
-            )? {
+            ) {
                 SourceCheck::Unchanged(identity) => identity,
                 SourceCheck::Changed(message) => {
                     return Ok(Done::SourceRetained {
@@ -828,6 +938,16 @@ impl Executor<'_> {
                             "{message}; the copy is installed and the source was kept instead of deleted"
                         ),
                         source,
+                    });
+                }
+                SourceCheck::Unknown(message) => {
+                    return Err(Flow::PostInstall {
+                        message: format!(
+                            "{message}; the installed copy at {} was kept and the source {} was left in place",
+                            destination.display(),
+                            source.display()
+                        ),
+                        recovery: vec![source, destination],
                     });
                 }
             };
@@ -850,48 +970,51 @@ impl Executor<'_> {
         Ok(Done::Succeeded(note))
     }
 
-    /// Re-checks the whole reviewed stamp on a freshly opened source. A Move deletes
-    /// the source only while it is provably the file that was copied, so a source
-    /// rewritten in place is kept rather than deleted under a stale copy.
+    /// Re-proves the source between the acknowledged `RemovingSource` checkpoint
+    /// and the unlink. A no-follow stat of the directory entry and the metadata of
+    /// the very handle that was copied must both still be the reviewed regular
+    /// file, and must be the same file; a Move deletes nothing it cannot re-prove.
     fn recheck_source(
         &self,
-        source_parent: &Root,
+        source_parent: &OwnedFd,
         source_name: &OsStr,
         source: &Path,
         reviewed: &SourceStamp,
+        copied: &File,
         opened: EntryIdentity,
-    ) -> Result<SourceCheck, Flow> {
-        let (file, fresh) = self
-            .root
-            .open_regular(source_parent, source_name, false)
-            .map_err(|error| {
-                Flow::Problem(
-                    format!(
-                        "the copy is installed, but the source {} could not be reopened before removal: {error}",
-                        source.display()
-                    ),
-                    vec![source.to_path_buf()],
-                )
-            })?;
-        let meta = file.metadata().map_err(|error| {
-            Flow::Problem(
-                format!(
-                    "the copy is installed, but the source {} could not be rechecked before removal: {error}",
+    ) -> SourceCheck {
+        let entry = match self.root.entry_stat(source_parent, source_name) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return SourceCheck::Unknown(format!(
+                    "the source entry {} could not be inspected after the install: {error}",
                     source.display()
-                ),
-                vec![source.to_path_buf()],
-            )
-        })?;
+                ));
+            }
+        };
+        if let Err(message) = verify_stamp_stat(&entry, reviewed, source) {
+            return SourceCheck::Changed(message);
+        }
+        let meta = match copied.metadata() {
+            Ok(meta) => meta,
+            Err(error) => {
+                return SourceCheck::Unknown(format!(
+                    "the copied source {} could no longer be inspected after the install: {error}",
+                    source.display()
+                ));
+            }
+        };
         if let Err(message) = verify_stamp(&meta, reviewed, source) {
-            return Ok(SourceCheck::Changed(message));
+            return SourceCheck::Changed(message);
         }
-        if fresh != opened {
-            return Ok(SourceCheck::Changed(format!(
-                "the source {} changed after it was read",
+        let entry_identity = EntryIdentity::from(entry);
+        if entry_identity.device != opened.device || entry_identity.inode != opened.inode {
+            return SourceCheck::Changed(format!(
+                "the source {} is no longer the file that was copied",
                 source.display()
-            )));
+            ));
         }
-        Ok(SourceCheck::Unchanged(fresh))
+        SourceCheck::Unchanged(entry_identity)
     }
 
     /// Copies the opened source into the staging file, preserves its metadata,
@@ -1155,7 +1278,7 @@ impl Executor<'_> {
 
     fn sync_move_directories(
         &self,
-        source_parent: &Root,
+        source_parent: &OwnedFd,
         destination_parent: &OwnedFd,
     ) -> Option<String> {
         match (
@@ -1225,6 +1348,43 @@ fn source_times(meta: &fs::Metadata) -> Timestamps {
             tv_nsec: meta.mtime_nsec(),
         },
     }
+}
+
+/// Opens the declared source root once per run and refuses unless its recorded
+/// identity provably agrees with the held handle. Every source is then resolved
+/// beneath that handle, so a later path swap cannot redirect a read.
+fn hold_source_root(validated: &ValidatedPlan) -> Result<(Root, PathBuf), String> {
+    let plan = validated.plan();
+    let path = plan
+        .source_root_path()
+        .ok_or_else(|| {
+            "the reviewed plan copies or moves files but declares no source root".to_string()
+        })?
+        .to_path_buf();
+    let evidence = plan.source_evidence.as_ref().ok_or_else(|| {
+        format!(
+            "the reviewed plan records no source evidence for {}, so its sources cannot be confined",
+            path.display()
+        )
+    })?;
+    let root = Root::open(path.as_os_str()).map_err(|error| {
+        format!(
+            "the reviewed source root {} cannot be opened: {error}",
+            path.display()
+        )
+    })?;
+    let fresh = identity_of_handle(&root).map_err(|error| {
+        format!(
+            "the reviewed source root {} can no longer be inspected: {error}",
+            path.display()
+        )
+    })?;
+    require_same_identity(
+        evidence.root_identity,
+        Some(fresh),
+        "the reviewed source root",
+    )?;
+    Ok((root, path))
 }
 
 fn identity_of_handle(handle: &impl AsFd) -> io::Result<NativeIdentity> {
@@ -1346,6 +1506,44 @@ fn verify_existing_destination(
         reviewed.identity,
         Some(native_identity(EntryIdentity::from(*stat))),
         &format!("the existing destination {}", path.display()),
+    )
+}
+
+/// The directory entry a Move is about to unlink must still be the reviewed
+/// regular file: type, size, modification time and identity all agree.
+fn verify_stamp_stat(
+    stat: &rustix::fs::Stat,
+    reviewed: &SourceStamp,
+    path: &Path,
+) -> Result<(), String> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(format!(
+            "source {} is no longer a regular file",
+            path.display()
+        ));
+    }
+    let size = u64::try_from(stat.st_size)
+        .map_err(|_| format!("source {} reports an unusable size", path.display()))?;
+    if size != reviewed.size {
+        return Err(format!(
+            "source {} is {size} bytes; the review recorded {}",
+            path.display(),
+            reviewed.size
+        ));
+    }
+    if let Some(expected) = reviewed.modified_ns {
+        let observed = i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec);
+        if observed != i128::from(expected) {
+            return Err(format!(
+                "source {} changed after review: its modification time moved",
+                path.display()
+            ));
+        }
+    }
+    require_same_identity(
+        reviewed.identity,
+        Some(native_identity(EntryIdentity::from(*stat))),
+        &format!("source {}", path.display()),
     )
 }
 

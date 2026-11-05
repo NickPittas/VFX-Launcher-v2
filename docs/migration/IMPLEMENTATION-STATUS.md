@@ -1,5 +1,21 @@
 # Implementation status
 
+## Source-root and Move revalidation integration
+
+Integrated the isolated executor packet for original Kimi findings 2 and 4.
+Copy/Move runs retain an identity-proven declared source root; per-file parents
+open beneath that handle with no-follow/no-cross-device resolution. Immediately
+after RemovingSource acknowledgement, entry and copied-handle metadata must
+still match the full reviewed regular-file size/mtime/identity. Known changes
+retain the source; inspection failure records a full-byte post-install failure
+with source/destination recovery paths. Generated-only runs require no source
+root. Same-filesystem rename optimization remains removed (finding 3).
+
+Coordinator read back the diff and compiled the integration without warnings
+under the 30s ceiling; formatting uses edition 2024. No runtime transfers or tests
+ran. Findings 1, 5, 6, 7, 8 remain open. Future non-extension-copy plan producers
+must populate source root/evidence before their file transfers can execute.
+
 ## Packet X1b — Linux transfer executor (2026-11-05)
 
 Implemented a real executor in `rust/src/transfers/executor/linux.rs` (wired

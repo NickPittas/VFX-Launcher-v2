@@ -1,5 +1,12 @@
 # Current implementation queue
 
+**Latest integration:** original executor findings 2 and 4 are implemented from
+the isolated source-safety packet: declared source root retained and identity
+checked, descendant parents resolved beneath its handle, full source entry and
+copied-handle stamps rechecked after removal intent. Unknown source disposition
+records a full-byte post-install failure. Finding 3's rename shortcut remains
+removed. Original findings 1, 5, 6, 7 and 8 remain open; the executor stays unwired.
+
 **Current executor ledger (2026-11-06):** the earlier claim that all eight
 findings were fixed is incorrect. Finding 3 is now corrected: `transfer_file`
 always stages Move as a copy and uses the single `RemovingSource` path. Findings
