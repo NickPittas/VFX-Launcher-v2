@@ -217,6 +217,7 @@ impl eframe::App for VfxLauncherApp {
         self.copy_by_type.poll(
             self.workspace.catalog_client().as_ref(),
             self.workspace.user().map(|user| user.id),
+            &self.jobs,
         );
         if self.closing {
             self.jobs.begin_shutdown();
@@ -375,9 +376,13 @@ impl VfxLauncherApp {
                 if self.view == View::CopyByFileType {
                     self.copy_by_type.validate_control(ui, &mut self.jobs);
                 }
-                ui.label(
-                    egui::RichText::new(status_text(job.as_ref(), closing, live_jobs)).small(),
-                );
+                if closing && self.copy_by_type.picker_pending() {
+                    ui.label("Close the folder chooser to finish quitting.");
+                } else {
+                    ui.label(
+                        egui::RichText::new(status_text(job.as_ref(), closing, live_jobs)).small(),
+                    );
+                }
                 if let Some(job) = &job {
                     if job.omitted_diagnostics > 0 {
                         ui.label(
@@ -411,6 +416,8 @@ impl VfxLauncherApp {
                             // Reported, still unwinding its own cleanup: the row
                             // stays visible and cannot be dismissed yet.
                             ui.label(egui::RichText::new("Finishing…").small().weak());
+                        } else if self.copy_by_type.is_picker_job(job.id) {
+                            ui.label("Waiting for folder chooser");
                         } else {
                             if ui.button("Cancel").clicked() {
                                 cancel = Some(job.id);

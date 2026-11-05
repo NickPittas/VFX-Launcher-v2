@@ -1,5 +1,27 @@
 # Implementation status
 
+## Copy workspace source-review corrections
+
+Coordinator corrected all four Copy workspace findings. Every admitted execution
+now retains a terminal UI report, including errors or an unexpected worker exit;
+unconfirmed items say Outcome unknown. Execution errors carry their journal ID
+after intent persistence; the worker reads available journal outcomes/recovery
+events without modifying them, and preserves its last progress. Journal read
+failure stays visible rather than inventing results. Abrupt worker exit can leave
+the UI without a run ID; it retains an explicit unknown outcome and last UI progress.
+
+Reports are bound to the original exact draft. Changed destinations/selections
+cannot reuse old table states; previous reports retain their actual destination,
+and new admitted execution clears the previous report. Worker-start failure
+consumes the old validation and explicitly requests revalidation. Native picker
+jobs hide Pause/Cancel and closing asks the user to dismiss the chooser.
+
+The revised native page manually copied three disposable files into two new
+folders, displayed the expanded report with journal run 2, then demonstrated
+destination editing clearing old Copied states while retaining a labeled previous
+report. Normal exit succeeded. See NATIVE-COPY-EVIDENCE.md. Compilation passes;
+execution-error/journal-failure/picker-close branches remain unverified at runtime.
+
 ## Incoming source review correction
 
 Kimi's source review found no sequence-grouping correctness blocker and one

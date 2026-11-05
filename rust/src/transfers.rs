@@ -78,6 +78,7 @@ pub struct TransferError {
     category: TransferCategory,
     path: Option<PathBuf>,
     message: String,
+    run_id: Option<i64>,
 }
 
 impl TransferError {
@@ -90,6 +91,7 @@ impl TransferError {
             category,
             path: path.map(Path::to_path_buf),
             message: message.into(),
+            run_id: None,
         }
     }
 
@@ -103,6 +105,17 @@ impl TransferError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Journal identity remains available even when execution cannot finish.
+    pub fn run_id(&self) -> Option<i64> {
+        self.run_id
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_run_id(mut self, run_id: i64) -> Self {
+        self.run_id = Some(run_id);
+        self
     }
 }
 
@@ -137,6 +150,7 @@ impl From<PathError> for TransferError {
             },
             path: error.path().map(Path::to_path_buf),
             message: error.message().to_string(),
+            run_id: None,
         }
     }
 }

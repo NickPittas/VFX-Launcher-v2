@@ -258,6 +258,7 @@ pub struct JobEvents {
     shared: Arc<EventShared>,
     ctx: egui::Context,
     last_repaint: Mutex<Option<Instant>>,
+    last_progress: Mutex<JobProgress>,
 }
 
 impl JobEvents {
@@ -266,6 +267,7 @@ impl JobEvents {
             shared,
             ctx,
             last_repaint: Mutex::new(None),
+            last_progress: Mutex::new(JobProgress::default()),
         }
     }
 
@@ -273,11 +275,17 @@ impl JobEvents {
     /// the wakeup is throttled to `PROGRESS_INTERVAL`, but a throttled wakeup is
     /// deferred rather than dropped, so the newest value is always painted.
     pub fn progress(&self, phase: JobPhase, progress: JobProgress) {
+        *lock(&self.last_progress) = progress.clone();
         *lock(&self.shared.progress) = Some((phase, progress));
         match self.progress_repaint_delay() {
             Some(delay) => self.ctx.request_repaint_after(delay),
             None => self.ctx.request_repaint(),
         }
+    }
+
+    /// Last producer progress, including values already drained by the UI.
+    pub fn last_progress(&self) -> JobProgress {
+        lock(&self.last_progress).clone()
     }
 
     /// Queues a diagnostic. Beyond the queue bound the message is dropped and

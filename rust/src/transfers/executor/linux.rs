@@ -105,148 +105,151 @@ pub fn execute(
 
     let journal = awaited(persist_validated_intent(catalog, validated))?;
     let run_id = journal.run_id();
-    awaited(mark_run_running(catalog, run_id))?;
+    (|| {
+        awaited(mark_run_running(catalog, run_id))?;
 
-    // Generated-only plans read nothing, so they never need a source root. A plan
-    // that copies or moves must confine every source to a declared root whose
-    // recorded identity agrees with the held handle before the first item runs.
-    let reads_sources = journal
-        .validated()
-        .items()
-        .iter()
-        .any(|item| matches!(item.effect, ItemEffect::Copy | ItemEffect::Move));
-    let (source_root, source_root_path) = if reads_sources {
-        match hold_source_root(journal.validated()) {
-            Ok((root, path)) => (Some(root), Some(path)),
-            Err(reason) => {
-                settle_refused(catalog, &journal, &reason)?;
-                return Err(refused(&reason));
+        // Generated-only plans read nothing, so they never need a source root. A plan
+        // that copies or moves must confine every source to a declared root whose
+        // recorded identity agrees with the held handle before the first item runs.
+        let reads_sources = journal
+            .validated()
+            .items()
+            .iter()
+            .any(|item| matches!(item.effect, ItemEffect::Copy | ItemEffect::Move));
+        let (source_root, source_root_path) = if reads_sources {
+            match hold_source_root(journal.validated()) {
+                Ok((root, path)) => (Some(root), Some(path)),
+                Err(reason) => {
+                    settle_refused(catalog, &journal, &reason)?;
+                    return Err(refused(&reason));
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut executor = Executor {
+            catalog,
+            journal: &journal,
+            control,
+            events,
+            root: match Root::open(destination_root.as_os_str()) {
+                Ok(root) => root,
+                Err(error) => {
+                    let reason = format!(
+                        "the reviewed destination root {} cannot be opened: {error}",
+                        destination_root.display()
+                    );
+                    settle_refused(catalog, &journal, &reason)?;
+                    return Err(refused(&reason));
+                }
+            },
+            source_root,
+            source_root_path,
+            destination_root,
+            blocked_directories: HashSet::new(),
+            verified_folders: HashMap::new(),
+            staging_counter: 0,
+            total_items,
+            total_bytes,
+            completed: 0,
+            bytes_done: 0,
+            outcomes: Vec::with_capacity(journal.validated().items().len()),
+        };
+
+        if let Err(reason) = executor.revalidate_destination_evidence(&evidence) {
+            settle_refused(catalog, &journal, &reason)?;
+            return Err(refused(&reason));
+        }
+
+        let items = journal.validated().items().to_vec();
+        let mut cancelled = false;
+        for item in &items {
+            if control.checkpoint() == Checkpoint::Cancelled {
+                cancelled = true;
+                break;
+            }
+            match executor.run(item) {
+                Ok(Done::Succeeded { note, recovery }) => {
+                    let state = success_state(item.effect);
+                    let bytes = item.bytes.unwrap_or(0);
+                    executor.record(item, state, bytes, note, recovery)?;
+                }
+                Ok(Done::SourceRetained { message, recovery }) => {
+                    executor.record(
+                        item,
+                        ItemState::CopiedSourceRetained,
+                        item.bytes.unwrap_or(0),
+                        Some(message),
+                        recovery,
+                    )?;
+                }
+                Err(Flow::Problem(message, recovery)) => {
+                    executor.note_failure(item);
+                    events.diagnostic(
+                        JobPhase::Copying,
+                        format!("item {} failed: {message}", item.index + 1),
+                    );
+                    executor.record(item, ItemState::Failed, 0, Some(message), recovery)?;
+                }
+                Err(Flow::PostInstall { message, recovery }) => {
+                    executor.note_failure(item);
+                    events.diagnostic(
+                        JobPhase::Copying,
+                        format!(
+                            "item {} installed but was not verified: {message}",
+                            item.index + 1
+                        ),
+                    );
+                    // The reviewed bytes are already committed to the destination;
+                    // the journal accepts them only after an install checkpoint.
+                    executor.record(
+                        item,
+                        ItemState::Failed,
+                        item.bytes.unwrap_or(0),
+                        Some(message),
+                        recovery,
+                    )?;
+                }
+                Err(Flow::Cancelled(recovery)) => {
+                    executor.record(
+                        item,
+                        ItemState::Cancelled,
+                        0,
+                        Some("cancelled before the destination was installed".to_string()),
+                        recovery,
+                    )?;
+                    cancelled = true;
+                    break;
+                }
+                Err(Flow::Abort(error)) => return Err(error),
             }
         }
-    } else {
-        (None, None)
-    };
 
-    let mut executor = Executor {
-        catalog,
-        journal: &journal,
-        control,
-        events,
-        root: match Root::open(destination_root.as_os_str()) {
-            Ok(root) => root,
-            Err(error) => {
-                let reason = format!(
-                    "the reviewed destination root {} cannot be opened: {error}",
-                    destination_root.display()
-                );
-                settle_refused(catalog, &journal, &reason)?;
-                return Err(refused(&reason));
-            }
-        },
-        source_root,
-        source_root_path,
-        destination_root,
-        blocked_directories: HashSet::new(),
-        verified_folders: HashMap::new(),
-        staging_counter: 0,
-        total_items,
-        total_bytes,
-        completed: 0,
-        bytes_done: 0,
-        outcomes: Vec::with_capacity(journal.validated().items().len()),
-    };
-
-    if let Err(reason) = executor.revalidate_destination_evidence(&evidence) {
-        settle_refused(catalog, &journal, &reason)?;
-        return Err(refused(&reason));
-    }
-
-    let items = journal.validated().items().to_vec();
-    let mut cancelled = false;
-    for item in &items {
-        if control.checkpoint() == Checkpoint::Cancelled {
-            cancelled = true;
-            break;
-        }
-        match executor.run(item) {
-            Ok(Done::Succeeded { note, recovery }) => {
-                let state = success_state(item.effect);
-                let bytes = item.bytes.unwrap_or(0);
-                executor.record(item, state, bytes, note, recovery)?;
-            }
-            Ok(Done::SourceRetained { message, recovery }) => {
-                executor.record(
-                    item,
-                    ItemState::CopiedSourceRetained,
-                    item.bytes.unwrap_or(0),
-                    Some(message),
-                    recovery,
-                )?;
-            }
-            Err(Flow::Problem(message, recovery)) => {
-                executor.note_failure(item);
-                events.diagnostic(
-                    JobPhase::Copying,
-                    format!("item {} failed: {message}", item.index + 1),
-                );
-                executor.record(item, ItemState::Failed, 0, Some(message), recovery)?;
-            }
-            Err(Flow::PostInstall { message, recovery }) => {
-                executor.note_failure(item);
-                events.diagnostic(
-                    JobPhase::Copying,
-                    format!(
-                        "item {} installed but was not verified: {message}",
-                        item.index + 1
-                    ),
-                );
-                // The reviewed bytes are already committed to the destination;
-                // the journal accepts them only after an install checkpoint.
-                executor.record(
-                    item,
-                    ItemState::Failed,
-                    item.bytes.unwrap_or(0),
-                    Some(message),
-                    recovery,
-                )?;
-            }
-            Err(Flow::Cancelled(recovery)) => {
+        let terminal = if cancelled {
+            // Every remaining reviewed item gets its own terminal outcome, so the
+            // returned report and the persisted run name the same items.
+            for item in items.iter().skip(executor.outcomes.len()) {
                 executor.record(
                     item,
                     ItemState::Cancelled,
                     0,
-                    Some("cancelled before the destination was installed".to_string()),
-                    recovery,
+                    Some("cancelled before this item was attempted".to_string()),
+                    Vec::new(),
                 )?;
-                cancelled = true;
-                break;
             }
-            Err(Flow::Abort(error)) => return Err(error),
-        }
-    }
-
-    let terminal = if cancelled {
-        // Every remaining reviewed item gets its own terminal outcome, so the
-        // returned report and the persisted run name the same items.
-        for item in items.iter().skip(executor.outcomes.len()) {
-            executor.record(
-                item,
-                ItemState::Cancelled,
-                0,
-                Some("cancelled before this item was attempted".to_string()),
-                Vec::new(),
-            )?;
-        }
-        RunTerminal::Cancelled
-    } else {
-        terminal_for(&executor.outcomes)
-    };
-    let summary = awaited(finalize_run(catalog, run_id, terminal))?;
-    Ok(RunReport {
-        run_id,
-        summary,
-        items: executor.outcomes,
-    })
+            RunTerminal::Cancelled
+        } else {
+            terminal_for(&executor.outcomes)
+        };
+        let summary = awaited(finalize_run(catalog, run_id, terminal))?;
+        Ok(RunReport {
+            run_id,
+            summary,
+            items: executor.outcomes,
+        })
+    })()
+    .map_err(|error: TransferError| error.with_run_id(run_id))
 }
 
 /// Sum of the reviewed byte counts, or `None` while any reviewed item has no

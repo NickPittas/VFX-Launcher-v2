@@ -37,7 +37,8 @@ use crate::{
     storage::{CatalogClient, UserId},
     transfers::{
         self, ActionKind, ConflictPolicy, ItemEffect, ItemState, ItemValidation, ReviewState,
-        RunCounts, RunReport, RunState, TransferError, ValidatedPlan, ValidationReport,
+        RunCounts, RunInspection, RunReport, RunState, TransferError, ValidatedPlan,
+        ValidationReport,
     },
 };
 
@@ -51,8 +52,7 @@ const POLICIES: [ConflictPolicy; 4] = [
     ConflictPolicy::PreserveExisting,
 ];
 const NO_CATALOG: &str = "The catalog is not ready yet.";
-const NO_USER: &str =
-    "Choose who is using the app first; recorded actions are attributed to that user.";
+const NO_USER: &str = "Choose who is using the app first.";
 
 /// Which folder field a browse request fills.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +126,7 @@ struct ScanResult {
 }
 
 struct PickRun {
+    job: JobId,
     field: Field,
     replies: Receiver<Option<PathBuf>>,
 }
@@ -152,8 +153,16 @@ struct ItemLabel {
 
 struct CopyRun {
     job: JobId,
-    replies: Receiver<Result<RunReport, String>>,
+    replies: Receiver<Result<RunReport, CopyFailure>>,
     labels: Vec<ItemLabel>,
+    draft: Draft,
+}
+
+struct CopyFailure {
+    message: String,
+    run_id: Option<i64>,
+    inspection: Option<RunInspection>,
+    progress: JobProgress,
 }
 
 /// One accepted validation. `ready` is the only handle that can execute, and it
@@ -184,6 +193,10 @@ struct ReportRow {
 }
 
 struct RunDone {
+    draft: Draft,
+    run_id: Option<i64>,
+    error: Option<String>,
+    progress: JobProgress,
     state: RunState,
     counts: RunCounts,
     rows: Vec<ReportRow>,
@@ -267,13 +280,13 @@ impl CopyByFileTypeState {
 
     /// Drains every worker reply and keeps the review bound to the current
     /// draft. Called once per frame from the application logic.
-    pub fn poll(&mut self, catalog: Option<&CatalogClient>, user: Option<UserId>) {
+    pub fn poll(&mut self, catalog: Option<&CatalogClient>, user: Option<UserId>, jobs: &Jobs) {
         self.catalog = catalog.cloned();
         self.user = user;
         self.poll_pick();
         self.poll_scan();
         self.poll_validation();
-        self.poll_copy();
+        self.poll_copy(jobs);
         self.sync_draft();
         self.invalidate_review();
     }
@@ -401,7 +414,7 @@ impl CopyByFileTypeState {
         }
     }
 
-    fn poll_copy(&mut self) {
+    fn poll_copy(&mut self, jobs: &Jobs) {
         let Some(run) = self.copy_run.take() else {
             return;
         };
@@ -412,7 +425,13 @@ impl CopyByFileTypeState {
                 return;
             }
             Err(TryRecvError::Disconnected) => {
-                Err("The copy worker stopped without a report.".to_string())
+                Err(CopyFailure {
+                    message: "The copy worker stopped without a report. Some files may have been installed; inspect the destination before retrying.".to_string(),
+                    run_id: None,
+                    inspection: None,
+                    progress: job_status(jobs, Some(run.job))
+                        .map(|job| job.progress.clone()).unwrap_or_default(),
+                })
             }
         };
         match result {
@@ -423,6 +442,10 @@ impl CopyByFileTypeState {
                     .map(|review| review.warnings.clone())
                     .unwrap_or_default();
                 self.report = Some(RunDone {
+                    draft: run.draft,
+                    run_id: Some(report.run_id),
+                    error: None,
+                    progress: report_progress(&report),
                     state: report.summary.state,
                     counts: report.summary.counts,
                     rows: report_rows(&report, &run.labels),
@@ -430,15 +453,23 @@ impl CopyByFileTypeState {
                 });
                 self.message = None;
             }
-            Err(message) => {
-                self.report = None;
-                self.message = Some(message);
+            Err(failure) => {
+                self.message = Some(failure.message.clone());
+                self.report = Some(failed_run(failure, &run.labels, run.draft));
             }
         }
         // A run changes the destination, so the reviewed plan can never be
         // reused: the next execution needs a fresh validation.
         self.review = None;
         self.rebuild_row_states();
+    }
+
+    pub fn is_picker_job(&self, id: JobId) -> bool {
+        self.pick.as_ref().is_some_and(|run| run.job == id)
+    }
+
+    pub fn picker_pending(&self) -> bool {
+        self.pick.is_some()
     }
 
     /// Drops the scan when the source or the suffix set it was taken with no
@@ -455,7 +486,6 @@ impl CopyByFileTypeState {
         self.selected.clear();
         self.row_states.clear();
         self.review = None;
-        self.report = None;
         self.selection_generation += 1;
         self.message = Some("The source folder or file types changed; scan again.".to_string());
     }
@@ -474,6 +504,14 @@ impl CopyByFileTypeState {
                 "The selection or settings changed; validate the selection again.".to_string(),
             );
             self.rebuild_row_states();
+        }
+        if self.review.is_none()
+            && self
+                .report
+                .as_ref()
+                .is_some_and(|report| report.draft != self.draft())
+        {
+            self.row_states.clear();
         }
     }
 
@@ -660,6 +698,9 @@ impl CopyByFileTypeState {
             return;
         }
         if let Some(report) = &self.report {
+            if report.draft != self.draft() {
+                return;
+            }
             for row in &report.rows {
                 let Some(source) = &row.source else {
                     continue;
@@ -707,7 +748,13 @@ impl CopyByFileTypeState {
                 .finish(JobOutcome::Succeeded, JobProgress::default());
         });
         match started {
-            Ok(_) => self.pick = Some(PickRun { field, replies: rx }),
+            Ok(job) => {
+                self.pick = Some(PickRun {
+                    job,
+                    field,
+                    replies: rx,
+                })
+            }
             Err(error) => {
                 self.message = Some(format!("The folder chooser could not be opened: {error}"));
             }
@@ -924,31 +971,44 @@ impl CopyByFileTypeState {
                 kind: item_kind_label(item),
             })
             .collect();
+        let draft = review.draft.clone();
         self.review = Some(review);
         let (tx, rx) = channel();
         let started = jobs.start(&self.ctx, "Copying files", move |context| {
             let JobContext {
                 control, events, ..
             } = context;
-            let result = transfers::execute(&catalog, validated, &control, &events);
+            let result =
+                transfers::execute(&catalog, validated, &control, &events).map_err(|error| {
+                    let mut message = describe(&error);
+                    let inspection = error.run_id().and_then(|run_id| {
+                        match transfers::read_run(&catalog, run_id).and_then(|reply| reply.wait()) {
+                            Ok(inspection) => inspection,
+                            Err(read_error) => {
+                                message
+                                    .push_str(&format!(" Journal inspection failed: {read_error}"));
+                                None
+                            }
+                        }
+                    });
+                    CopyFailure {
+                        message,
+                        run_id: error.run_id(),
+                        inspection,
+                        progress: events.last_progress(),
+                    }
+                });
             let (outcome, progress) = match &result {
                 Ok(report) => {
-                    let counts = report.summary.counts;
-                    let progress = JobProgress {
-                        completed: (counts.total - counts.unfinished()) as u64,
-                        total: Some(counts.total as u64),
-                        bytes_done: counts.committed_bytes.unwrap_or(0),
-                        bytes_total: None,
-                        current: None,
-                    };
+                    let progress = report_progress(report);
                     (job_outcome(report.summary.state), progress)
                 }
-                Err(error) => {
-                    events.diagnostic(JobPhase::Copying, describe(error));
-                    (JobOutcome::Failed, JobProgress::default())
+                Err(failure) => {
+                    events.diagnostic(JobPhase::Copying, failure.message.clone());
+                    (JobOutcome::Failed, failure.progress.clone())
                 }
             };
-            let _ = tx.send(result.map_err(|error| describe(&error)));
+            let _ = tx.send(result);
             events.finish(outcome, progress);
         });
         match started {
@@ -957,11 +1017,18 @@ impl CopyByFileTypeState {
                     job,
                     replies: rx,
                     labels,
+                    draft,
                 });
+                self.report = None;
                 self.message = None;
+                self.rebuild_row_states();
             }
             Err(error) => {
-                self.message = Some(format!("The copy could not be started: {error}"));
+                self.review = None;
+                self.rebuild_row_states();
+                self.message = Some(format!(
+                    "The copy could not be started: {error}. Validate the selection again before retrying."
+                ));
             }
         }
     }
@@ -1260,26 +1327,36 @@ impl CopyByFileTypeState {
                             row.col(|ui| {
                                 ui.label(egui::RichText::new(size_text(entry.size)).small());
                             });
-                            row.col(|ui| match self.row_states.get(&entry.path) {
-                                Some(state) => {
-                                    let text = egui::RichText::new(&state.label).small();
-                                    let text = if state.blocked {
-                                        text.color(WARNING)
-                                    } else {
-                                        text
-                                    };
-                                    let response = ui.label(text);
-                                    if let Some(detail) = &state.detail {
-                                        response.on_hover_text(detail);
+                            row.col(|ui| {
+                                match self.row_states.get(&entry.path).filter(|_| {
+                                    self.review.is_some()
+                                        || self
+                                            .report
+                                            .as_ref()
+                                            .is_none_or(|report| report.draft == self.draft())
+                                }) {
+                                    Some(state) => {
+                                        let text = egui::RichText::new(&state.label).small();
+                                        let text = if state.blocked {
+                                            text.color(WARNING)
+                                        } else {
+                                            text
+                                        };
+                                        let response = ui.label(text);
+                                        if let Some(detail) = &state.detail {
+                                            response.on_hover_text(detail);
+                                        }
                                     }
-                                }
-                                None => {
-                                    if selected {
-                                        ui.label(egui::RichText::new("Will copy").small().weak());
-                                    } else {
-                                        ui.label(
-                                            egui::RichText::new("Not selected").small().weak(),
-                                        );
+                                    None => {
+                                        if selected {
+                                            ui.label(
+                                                egui::RichText::new("Will copy").small().weak(),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("Not selected").small().weak(),
+                                            );
+                                        }
                                     }
                                 }
                             });
@@ -1394,6 +1471,7 @@ impl CopyByFileTypeState {
                         None => format!("{} items", job.progress.completed),
                     },
                     None => match &self.report {
+                        Some(report) if report.error.is_some() => "Stopped — inspect results".to_string(),
                         Some(report) => format!("{} item(s) reported", report.counts.total),
                         None => "Waiting for a validated file list".to_string(),
                     },
@@ -1401,11 +1479,7 @@ impl CopyByFileTypeState {
                 let copy_fraction = match copy_job {
                     Some(job) => job.progress.fraction(),
                     None => {
-                        if self.report.is_some() {
-                            1.0
-                        } else {
-                            0.0
-                        }
+                        self.report.as_ref().map(|report| report.progress.fraction()).unwrap_or(0.0)
                     }
                 };
                 progress_block(
@@ -1417,8 +1491,12 @@ impl CopyByFileTypeState {
                         .and_then(|job| job.progress.current.as_ref())
                         .map(|path| path_display(path))
                         .unwrap_or_else(|| {
-                            if self.report.is_some() {
-                                "Copy finished.".to_string()
+                            if let Some(report) = &self.report {
+                                if report.error.is_some() {
+                                    "Copy stopped. Some destinations may have changed; inspect the item outcomes before retrying.".to_string()
+                                } else {
+                                    run_headline(report)
+                                }
                             } else {
                                 "Waiting to copy".to_string()
                             }
@@ -1441,11 +1519,25 @@ impl CopyByFileTypeState {
                 }
 
                 if let Some(report) = &self.report {
-                    let headline = run_headline(report);
+                    let headline = if report.draft != self.draft() {
+                        format!("Previous run · {}", run_headline(report))
+                    } else {
+                        run_headline(report)
+                    };
                     egui::CollapsingHeader::new(headline)
                         .id_salt("copy_results")
-                        .default_open(report.state != RunState::Succeeded)
+                        .default_open(report.error.is_some() || report.state != RunState::Succeeded)
                         .show(ui, |ui| {
+                            if report.draft != self.draft() {
+                                ui.label("Previous run — the current selection or settings have changed.");
+                            }
+                            ui.label(format!("Destination: {}", report.draft.destination));
+                            if let Some(run_id) = report.run_id {
+                                ui.label(format!("Journal run {run_id}"));
+                            }
+                            if let Some(error) = &report.error {
+                                ui.label(egui::RichText::new(error).color(WARNING));
+                            }
                             ui.label(egui::RichText::new(run_counts_text(&report.counts)).small());
                             for warning in &report.warnings {
                                 ui.label(egui::RichText::new(warning).small().color(WARNING));
@@ -1602,6 +1694,85 @@ fn report_rows(report: &RunReport, labels: &[ItemLabel]) -> Vec<ReportRow> {
         .collect()
 }
 
+fn report_progress(report: &RunReport) -> JobProgress {
+    let counts = report.summary.counts;
+    JobProgress {
+        completed: (counts.total - counts.unfinished()) as u64,
+        total: Some(counts.total as u64),
+        bytes_done: counts.committed_bytes.unwrap_or(0),
+        bytes_total: None,
+        current: None,
+    }
+}
+
+fn failed_run(failure: CopyFailure, labels: &[ItemLabel], draft: Draft) -> RunDone {
+    let mut warnings = Vec::new();
+    let mut counts = RunCounts {
+        total: labels.len(),
+        ..RunCounts::default()
+    };
+    let mut state = RunState::Interrupted;
+    let mut inspected = HashMap::new();
+    let mut trustworthy = false;
+    if let Some(inspection) = &failure.inspection {
+        warnings.extend(inspection.warnings.clone());
+        if let Some(error) = &inspection.detail_error {
+            warnings.push(format!("Journal inspection: {error}"));
+        } else {
+            trustworthy = true;
+            state = inspection.state;
+            if let Some(result) = &inspection.result {
+                counts = result.counts;
+            }
+        }
+        inspected.extend(inspection.items.iter().map(|item| (item.ordinal, item)));
+    }
+    let rows = labels.iter().enumerate().map(|(ordinal, label)| {
+        let item = inspected.get(&(ordinal as i64)).copied();
+        let confirmed = item.filter(|item| trustworthy && item.message_error.is_none()
+            && !matches!(item.state, ItemState::Pending | ItemState::Running));
+        let mut messages = Vec::new();
+        let mut recovery = Vec::new();
+        if let Some(item) = item {
+            if let Some(error) = &item.message_error {
+                messages.push(format!("Journal inspection: {error}"));
+            }
+            for event in &item.events {
+                if let Some(message) = &event.message {
+                    messages.push(message.clone());
+                }
+                for path in event.recovery_paths() {
+                    let path = path_display(path);
+                    if !recovery.contains(&path) { recovery.push(path); }
+                }
+            }
+        }
+        if confirmed.is_none() {
+            messages.push("No confirmed terminal outcome. The destination may have changed; inspect it before retrying.".to_string());
+        }
+        ReportRow {
+            source: label.source.clone(),
+            kind: label.kind,
+            destination: label.destination.clone(),
+            state: confirmed.map(|item| item_state_label(item.state)).unwrap_or("Outcome unknown"),
+            failed: confirmed.is_none_or(|item| matches!(item.state, ItemState::Failed | ItemState::Cancelled | ItemState::CopiedSourceRetained)),
+            message: Some(messages.join("\n")),
+            recovery,
+            bytes: confirmed.and_then(|item| item.events.last()).and_then(|event| event.committed_bytes).unwrap_or(0),
+        }
+    }).collect();
+    RunDone {
+        draft,
+        run_id: failure.run_id,
+        error: Some(failure.message),
+        progress: failure.progress,
+        state,
+        counts,
+        rows,
+        warnings,
+    }
+}
+
 fn item_kind_label(item: &ItemValidation) -> &'static str {
     match item.kind {
         ActionKind::Directory => "Folder",
@@ -1635,6 +1806,9 @@ fn job_outcome(state: RunState) -> JobOutcome {
 }
 
 fn run_headline(report: &RunDone) -> String {
+    if report.error.is_some() {
+        return "Copy stopped — inspect the recorded outcomes".to_string();
+    }
     let counts = &report.counts;
     let mut text = match report.state {
         RunState::Succeeded => "Copy finished".to_string(),
