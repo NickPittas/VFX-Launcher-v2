@@ -352,18 +352,11 @@ impl VfxLauncherApp {
         egui::Panel::bottom("action_status_strip").show(ui, |ui| {
             ui.add_space(3.0);
             if let Some(job) = &job {
-                if !job.is_terminal() && job.progress.total.is_none() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(progress_label(job));
-                    });
-                } else {
-                    ui.add(
-                        egui::ProgressBar::new(job.progress.fraction())
-                            .text(progress_label(job))
-                            .desired_height(13.0),
-                    );
-                }
+                ui.add(
+                    egui::ProgressBar::new(job.progress.fraction())
+                        .text(progress_label(job))
+                        .desired_height(13.0),
+                );
                 if let Some(current) = &job.progress.current {
                     ui.label(
                         egui::RichText::new(current.display().to_string())

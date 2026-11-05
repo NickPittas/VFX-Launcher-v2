@@ -43,6 +43,7 @@ const MAX_DIAGNOSTICS_PER_POLL: usize = 32;
 /// Coarse stage reported by a worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobPhase {
+    Counting,
     Scanning,
     Validating,
     Copying,
@@ -52,6 +53,7 @@ pub enum JobPhase {
 impl JobPhase {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Counting => "Counting files",
             Self::Scanning => "Scanning",
             Self::Validating => "Validating",
             Self::Copying => "Copying",

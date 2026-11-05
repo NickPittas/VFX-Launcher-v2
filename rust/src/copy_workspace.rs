@@ -1618,10 +1618,11 @@ fn progress_block(
                 .show_percentage(),
         );
     } else {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Scanning folders…");
-        });
+        ui.add(
+            egui::ProgressBar::new(0.0)
+                .text("Counting matching files…")
+                .desired_height(16.0),
+        );
     }
     ui.label(egui::RichText::new(current).small().weak());
 }

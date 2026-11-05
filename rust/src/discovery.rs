@@ -254,6 +254,46 @@ pub fn walk(
     control: &JobControl,
     events: &JobEvents,
 ) -> PathResult<ScanSnapshot> {
+    // The original Launcher and extension copier count first, then process the
+    // matching files against that denominator. Keep both real filesystem passes.
+    if matches!(
+        request.purpose,
+        ScanPurpose::Projects | ScanPurpose::ExtensionCopy
+    ) {
+        let counted = walk_pass(request, control, events, None)?;
+        if counted.coverage != Coverage::Complete {
+            return Ok(counted);
+        }
+        let total = counted.entries.len() as u64;
+        drop(counted);
+        events.progress(
+            JobPhase::Scanning,
+            JobProgress {
+                total: Some(total),
+                current: Some(request.root.clone()),
+                ..JobProgress::default()
+            },
+        );
+        return walk_pass(request, control, events, Some(total));
+    }
+    walk_pass(request, control, events, None)
+}
+
+fn walk_pass(
+    request: &ScanRequest,
+    control: &JobControl,
+    events: &JobEvents,
+    total: Option<u64>,
+) -> PathResult<ScanSnapshot> {
+    let phase = if total.is_none()
+        && matches!(
+            request.purpose,
+            ScanPurpose::Projects | ScanPurpose::ExtensionCopy
+        ) {
+        JobPhase::Counting
+    } else {
+        JobPhase::Scanning
+    };
     if !request.root.is_absolute() {
         return Err(PathError::new(
             PathCategory::InvalidInput,
@@ -327,10 +367,10 @@ pub fn walk(
             Ok(_) => {}
         }
         events.progress(
-            JobPhase::Scanning,
+            phase,
             JobProgress {
                 completed: entries.len() as u64,
-                total: None,
+                total,
                 bytes_done: 0,
                 bytes_total: None,
                 current: Some(pending.absolute.clone()),
@@ -368,6 +408,15 @@ pub fn walk(
                 }
                 Visit::Keep(file_entry, issue) => {
                     entries.push(file_entry);
+                    events.progress(
+                        phase,
+                        JobProgress {
+                            completed: entries.len() as u64,
+                            total,
+                            current: Some(entry.path()),
+                            ..JobProgress::default()
+                        },
+                    );
                     if let Some((category, message)) = issue {
                         report_issue(&mut issues, events, &entry.path(), category, message);
                         degraded = true;
@@ -381,10 +430,10 @@ pub fn walk(
             }
             if index % CHECKPOINT_EVERY == 0 {
                 events.progress(
-                    JobPhase::Scanning,
+                    phase,
                     JobProgress {
                         completed: entries.len() as u64,
-                        total: None,
+                        total,
                         current: Some(entry.path()),
                         ..JobProgress::default()
                     },
