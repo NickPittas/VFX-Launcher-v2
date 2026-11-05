@@ -20,9 +20,10 @@
 - Never use production databases or real incoming/backup files for validation.
 - Concurrent agents that write files use orchestrator-managed worktrees with
   explicit file ownership. Do not create child checkouts in shell commands.
-- All worktrees must be inside `/home/npittas/VFX-Launcher-v2/worktrees/`.
-  Do not start isolated delegates if the orchestrator would place their checkout
-  outside this project root; report the configuration limitation instead.
+- User override (2026-11-06): T3-managed worktrees may be created wherever T3
+  places them. Use isolated worktrees for concurrent implementation agents with
+  explicit file ownership. Their assigned checkout is an allowed search scope;
+  reference clones remain read-only under the main project `gitclones/`.
 - Keep all task artifacts inside the project root, including temporary files,
   verification inputs/results, and UI/UX evidence. Save verification screenshots
   under `/home/npittas/VFX-Launcher-v2/artifacts/screenshots/` and other verification

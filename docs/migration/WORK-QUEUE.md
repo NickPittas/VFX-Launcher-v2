@@ -1,5 +1,18 @@
 # Current implementation queue
 
+**Current executor ledger (2026-11-06):** the earlier claim that all eight
+findings were fixed is incorrect. Finding 3 is now corrected: `transfer_file`
+always stages Move as a copy and uses the single `RemovingSource` path. Findings
+1, 2, 4, 5, 6, 7 and 8 remain incomplete; see the numbered ledger in
+IMPLEMENTATION-STATUS.md. Do not wire or run transfers yet. No commit was made.
+
+**Current blocker:** the executor still lacks safe Replace backup lifecycle,
+source-root confinement, held-entry cleanup identity, exact staging recovery
+intent, ancestor-chain verification, and post-install failure accounting. Only
+Finding 3 was completed in this turn. Formatting and offline compile checks are
+pending; no runtime or filesystem operation was performed. The executor is not
+wired to the UI and must not be described as safe or runtime-verified.
+
 This is the short live queue; IMPLEMENTATION-STATUS.md retains packet history.
 
 1. **X1a reviewed again; coordinator fixed the five remaining findings.**
@@ -21,17 +34,23 @@ This is the short live queue; IMPLEMENTATION-STATUS.md retains packet history.
    of unknown envelopes during interruption marking. See IMPLEMENTATION-STATUS.md.
    These last five small fixes have source/compile verification, not a new review
    or runtime pass.
-2. **X1b executor implemented; review and runtime pass open.**
+2. **X1b executor implemented and its eight review findings corrected; review
+   and runtime pass open.**
    `rust/src/transfers/executor/linux.rs` now executes validated plans:
    intent persisted before the first mutation, destination root/ancestor
    identities revalidated by handle, per-item source revalidation, staged
    no-clobber copy with metadata preservation and post-copy stability check,
    same-device `renameat2` move with `CopiedSourceRetained` fallback, and the
-   single displacement/restore window for Replace/PreserveExisting. Compiles
-   without warnings under the offline prepared CARGO_HOME and is rustfmt-clean;
-   no database, catalog row, filesystem operation or test ran, so behavior is
-   unverified. Still open: transfer concurrency (currently sequential), UI/app
-   wiring, and the live transfer pass on disposable folders.
+   single displacement/restore window for Replace/PreserveExisting. The
+   correction packet adds: durability-first backup deletion, a full pre-delete
+   source stamp recheck, staging cleanup on every failure path (including journal
+   failure), install evidence after the folder sync, a synced new folder,
+   terminal outcomes for items a cancellation never reached, and a per-item
+   parent-folder identity proof. Compiles without warnings under the offline
+   prepared CARGO_HOME and is rustfmt-clean; no database, catalog row, filesystem
+   operation or test ran, so behavior is unverified. Still open: independent
+   review of the correction packet, transfer concurrency (currently sequential),
+   UI/app wiring, and the live transfer pass on disposable folders.
 3. **Projects review items implemented, interactive verification open.** Each
    launch now keeps its own reply, worker handle, file and captured identity, so
    concurrent launches neither replace each other nor re-attribute access records;

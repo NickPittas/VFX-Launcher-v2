@@ -46,7 +46,7 @@ use rustix::{
     time::Timespec,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, ErrorKind, Read, Write},
@@ -117,6 +117,7 @@ pub fn execute(
         },
         destination_root,
         blocked_directories: HashSet::new(),
+        verified_folders: HashMap::new(),
         staging_counter: 0,
         total_items,
         total_bytes,
@@ -176,6 +177,17 @@ pub fn execute(
     }
 
     let terminal = if cancelled {
+        // Every remaining reviewed item gets its own terminal outcome, so the
+        // returned report and the persisted run name the same items.
+        for item in items.iter().skip(executor.outcomes.len()) {
+            executor.record(
+                item,
+                ItemState::Cancelled,
+                0,
+                Some("cancelled before this item was attempted".to_string()),
+                Vec::new(),
+            )?;
+        }
         RunTerminal::Cancelled
     } else {
         terminal_for(&executor.outcomes)
@@ -300,6 +312,19 @@ impl From<TransferError> for Flow {
     }
 }
 
+/// Result of re-checking a source that a Move is about to delete.
+enum SourceCheck {
+    Unchanged(EntryIdentity),
+    Changed(String),
+}
+
+/// What one commit established: the note to report and whether the destination
+/// folder's namespace sync succeeded. A move keeps its source without it.
+struct InstallOutcome {
+    note: Option<String>,
+    durable: bool,
+}
+
 fn problem(message: impl Into<String>) -> Flow {
     Flow::Problem(message.into(), Vec::new())
 }
@@ -321,6 +346,11 @@ struct Executor<'a> {
     /// Destination-relative folders whose creation failed; children of these are
     /// failed without being attempted, so a blocked prerequisite stays visible.
     blocked_directories: HashSet<PathBuf>,
+    /// Folders this run has proven unchanged: the reviewed ancestors captured
+    /// while validating, plus the folders it creates. Every parent is compared
+    /// with this evidence immediately before an item mutates it, so a folder
+    /// swapped after the run-level check is never written into.
+    verified_folders: HashMap<PathBuf, NativeIdentity>,
     staging_counter: u64,
     total_items: u64,
     total_bytes: Option<u64>,
@@ -407,11 +437,12 @@ impl Executor<'_> {
 
     // -- evidence ------------------------------------------------------------
 
-    /// Revalidates the reviewed destination root and every existing ancestor
-    /// folder against the identity snapshot captured while validating. Missing or
+    /// Revalidates the reviewed destination root and every reviewed ancestor
+    /// against the identity snapshot captured while validating. Missing or
     /// incomparable evidence refuses the run; it is never treated as agreement.
+    /// Each proof is kept for the per-item revalidation `open_parent` performs.
     fn revalidate_destination_evidence(
-        &self,
+        &mut self,
         evidence: &DestinationEvidence,
     ) -> Result<(), String> {
         let root_identity = identity_of_handle(&self.root)
@@ -421,6 +452,7 @@ impl Executor<'_> {
             Some(root_identity),
             "the destination root",
         )?;
+        self.verified_folders.insert(PathBuf::new(), root_identity);
         for ancestor in &evidence.ancestors {
             let path = ancestor.path.path();
             let relative = path.strip_prefix(&self.destination_root).map_err(|_| {
@@ -451,6 +483,7 @@ impl Executor<'_> {
                 Some(fresh),
                 &format!("reviewed destination folder {}", path.display()),
             )?;
+            self.verified_folders.insert(relative.to_path_buf(), fresh);
         }
         Ok(())
     }
@@ -507,17 +540,82 @@ impl Executor<'_> {
         Ok(None)
     }
 
+    /// Opens one destination folder and proves it is the very folder this run
+    /// verified, so an item never mutates a folder swapped in after that check.
+    /// A folder this run has not proven is refused instead of trusted by name.
     fn open_parent(&self, parent_relative: &Path) -> io::Result<OwnedFd> {
-        if parent_relative.as_os_str().is_empty() {
+        let handle = if parent_relative.as_os_str().is_empty() {
             self.root.duplicate()
         } else {
             self.root.open_dir(parent_relative.as_os_str())
+        }?;
+        let expected = self.verified_folders.get(parent_relative).copied();
+        let fresh = identity_of_handle(&handle);
+        let proven = match (expected, fresh) {
+            (Some(expected), Ok(fresh)) if expected.same(&fresh) == Some(true) => {
+                return Ok(handle);
+            }
+            (Some(_), Ok(_)) => "is no longer the folder this run verified".to_string(),
+            (Some(_), Err(error)) => return Err(error),
+            (None, _) => "was never verified for this run, so it is not written into".to_string(),
+        };
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "{} {proven}",
+                self.destination_root.join(parent_relative).display()
+            ),
+        ))
+    }
+
+    /// Removes this run's own staging file. Returns a visible note when the file
+    /// cannot be shown to be gone: a failed item must not hide junk it left.
+    fn discard_staging(
+        &self,
+        parent: &OwnedFd,
+        stage_name: &OsStr,
+        destination: &Path,
+    ) -> Option<String> {
+        let identity = match self.root.entry_identity(parent, stage_name) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == ErrorKind::NotFound => return None,
+            Err(error) => {
+                return Some(format!(
+                    "the staging file beside {} could not be inspected and may remain: {error}",
+                    destination.display()
+                ));
+            }
+        };
+        match self.root.remove_owned(parent, stage_name, identity) {
+            Ok(()) => None,
+            Err(error) => Some(format!(
+                "the staging file {} may remain: {error}",
+                destination.with_file_name(stage_name).display()
+            )),
         }
     }
 
-    fn discard_staging(&self, parent: &OwnedFd, stage_name: &OsStr) {
-        if let Ok(identity) = self.root.entry_identity(parent, stage_name) {
-            let _ = self.root.remove_owned(parent, stage_name, identity);
+    /// Discards the staging file of a step that failed, keeping the reason
+    /// visible: appended to a diagnostic outcome, or emitted when the journal
+    /// cannot carry it.
+    fn abandon_staging(
+        &self,
+        parent: &OwnedFd,
+        stage_name: &OsStr,
+        destination: &Path,
+        flow: Flow,
+    ) -> Flow {
+        match self.discard_staging(parent, stage_name, destination) {
+            Some(note) => match flow {
+                Flow::Problem(message, recovery) => {
+                    Flow::Problem(format!("{message}; {note}"), recovery)
+                }
+                other => {
+                    self.events.diagnostic(JobPhase::Copying, note);
+                    other
+                }
+            },
+            None => flow,
         }
     }
 
@@ -536,10 +634,19 @@ impl Executor<'_> {
             .map_err(|error| io_problem("the destination folder", &destination, error))?;
         match item.expectation.as_ref() {
             Some(DestinationExpectation::Absent) => match self.root.mkdir(&parent, &name) {
-                Ok(_created) => {
+                Ok(created) => {
+                    let identity = identity_of_handle(&created).map_err(|error| {
+                        io_problem("the new destination folder", &destination, error)
+                    })?;
+                    // The new folder's own entry set becomes durable only when it is
+                    // synced, so its children cannot outlive it after a crash.
+                    self.root.sync_dir(&created).map_err(|error| {
+                        io_problem("the new destination folder", &destination, error)
+                    })?;
                     self.root.sync_dir(&parent).map_err(|error| {
                         io_problem("the destination folder", &destination, error)
                     })?;
+                    self.verified_folders.insert(relative, identity);
                     Ok(Done::Succeeded(None))
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(problem(format!(
@@ -563,6 +670,7 @@ impl Executor<'_> {
                     &format!("folder {}", destination.display()),
                 )
                 .map_err(|message| Flow::Problem(message, Vec::new()))?;
+                self.verified_folders.insert(relative, fresh);
                 Ok(Done::Succeeded(None))
             }
             _ => Err(problem(format!(
@@ -594,22 +702,26 @@ impl Executor<'_> {
         self.checkpoint(item, ItemCheckpoint::Staging, None)?;
         let (mut staged, stage_name) = self.create_staging(&parent, &name, &destination)?;
         if let Err(error) = staged.write_all(&contents) {
-            self.discard_staging(&parent, &stage_name);
-            return Err(io_problem("the staging file", &destination, error));
+            let flow = io_problem("the staging file", &destination, error);
+            return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
         }
         if let Err(error) = staged.sync_all() {
-            self.discard_staging(&parent, &stage_name);
-            return Err(io_problem("the staging file", &destination, error));
+            let flow = io_problem("the staging file", &destination, error);
+            return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
         }
-        self.checkpoint(item, ItemCheckpoint::Staged, None)?;
+        if let Err(error) = self.checkpoint(item, ItemCheckpoint::Staged, None) {
+            return Err(self.abandon_staging(
+                &parent,
+                &stage_name,
+                &destination,
+                Flow::Abort(error),
+            ));
+        }
 
-        Ok(Done::Succeeded(self.install(
-            item,
-            &parent,
-            &name,
-            &stage_name,
-            &destination,
-        )?))
+        match self.install(item, &parent, &name, &stage_name, &destination) {
+            Ok(installed) => Ok(Done::Succeeded(installed.note)),
+            Err(flow) => Err(self.abandon_staging(&parent, &stage_name, &destination, flow)),
+        }
     }
 
     /// Copies or moves one source file into the destination root.
@@ -653,38 +765,6 @@ impl Executor<'_> {
         verify_stamp(&source_meta, &reviewed, &source)
             .map_err(|message| Flow::Problem(message, Vec::new()))?;
 
-        // Same-filesystem Move: one no-clobber rename installs the destination and
-        // removes the source atomically. Cross-device moves fall through to the
-        // staged copy below; unavailable no-clobber rename refuses the item.
-        if item.effect == ItemEffect::Move
-            && matches!(item.expectation, Some(DestinationExpectation::Absent))
-        {
-            match self
-                .root
-                .rename_between(&source_parent, &source_name, &parent, &name)
-            {
-                Ok(()) => {
-                    let note = self.sync_move_directories(&source_parent, &parent);
-                    self.checkpoint(item, ItemCheckpoint::Installed, None)?;
-                    return Ok(Done::Succeeded(note));
-                }
-                Err(error) if is_cross_device(&error) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    return Err(problem(format!(
-                        "destination {} appeared after review; the source was left in place",
-                        destination.display()
-                    )));
-                }
-                Err(error) if no_clobber_unavailable(&error) => {
-                    return Err(problem(format!(
-                        "this filesystem does not support a no-clobber rename ({error}); refusing to move {} without it",
-                        source.display()
-                    )));
-                }
-                Err(error) => return Err(io_problem("the source file", &source, error)),
-            }
-        }
-
         self.checkpoint(item, ItemCheckpoint::Staging, None)?;
         let (mut staged, stage_name) = self.create_staging(&parent, &name, &destination)?;
         let metadata_note = match self.fill_staging(
@@ -697,45 +777,60 @@ impl Executor<'_> {
         ) {
             Ok(note) => note,
             Err(flow) => {
-                self.discard_staging(&parent, &stage_name);
-                return Err(flow);
+                return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
             }
         };
-        self.checkpoint(item, ItemCheckpoint::Staged, None)?;
+        if let Err(error) = self.checkpoint(item, ItemCheckpoint::Staged, None) {
+            return Err(self.abandon_staging(
+                &parent,
+                &stage_name,
+                &destination,
+                Flow::Abort(error),
+            ));
+        }
 
-        let installed = self.install(item, &parent, &name, &stage_name, &destination);
-        let install_note = match installed {
-            Ok(note) => note,
+        let installed = match self.install(item, &parent, &name, &stage_name, &destination) {
+            Ok(installed) => installed,
             Err(flow) => {
-                self.discard_staging(&parent, &stage_name);
-                return Err(flow);
+                return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
             }
         };
-        let note = combine_notes(metadata_note, install_note);
+        let mut note = combine_notes(metadata_note, installed.note);
 
         if item.effect == ItemEffect::Move {
-            self.checkpoint(item, ItemCheckpoint::RemovingSource, None)?;
-            let current = self
-                .root
-                .entry_identity(&source_parent, &source_name)
-                .map_err(|error| {
-                    Flow::Problem(
-                        format!(
-                            "the copy is installed, but the source {} could not be rechecked before removal: {error}",
+            if !installed.durable {
+                return Ok(Done::SourceRetained {
+                    message: match note {
+                        Some(note) => format!(
+                            "the source {} was kept because the copy is not confirmed durable ({note})",
                             source.display()
                         ),
-                        vec![source.clone()],
-                    )
-                })?;
-            if current != source_identity {
-                return Ok(Done::SourceRetained {
-                    message: format!(
-                        "the copy is installed, but the source {} changed after it was read; it was kept",
-                        source.display()
-                    ),
+                        None => format!(
+                            "the source {} was kept because the copy is not confirmed durable",
+                            source.display()
+                        ),
+                    },
                     source,
                 });
             }
+            self.checkpoint(item, ItemCheckpoint::RemovingSource, None)?;
+            let current = match self.recheck_source(
+                &source_parent,
+                &source_name,
+                &source,
+                &reviewed,
+                source_identity,
+            )? {
+                SourceCheck::Unchanged(identity) => identity,
+                SourceCheck::Changed(message) => {
+                    return Ok(Done::SourceRetained {
+                        message: format!(
+                            "{message}; the copy is installed and the source was kept instead of deleted"
+                        ),
+                        source,
+                    });
+                }
+            };
             if let Err(error) = self
                 .root
                 .remove_owned(&source_parent, &source_name, current)
@@ -748,9 +843,55 @@ impl Executor<'_> {
                     source,
                 });
             }
-            self.sync_move_directories(&source_parent, &parent);
+            // The removal's own durability is a note, not a rollback: the copy is
+            // already committed and the source is gone.
+            note = combine_notes(note, self.sync_move_directories(&source_parent, &parent));
         }
         Ok(Done::Succeeded(note))
+    }
+
+    /// Re-checks the whole reviewed stamp on a freshly opened source. A Move deletes
+    /// the source only while it is provably the file that was copied, so a source
+    /// rewritten in place is kept rather than deleted under a stale copy.
+    fn recheck_source(
+        &self,
+        source_parent: &Root,
+        source_name: &OsStr,
+        source: &Path,
+        reviewed: &SourceStamp,
+        opened: EntryIdentity,
+    ) -> Result<SourceCheck, Flow> {
+        let (file, fresh) = self
+            .root
+            .open_regular(source_parent, source_name, false)
+            .map_err(|error| {
+                Flow::Problem(
+                    format!(
+                        "the copy is installed, but the source {} could not be reopened before removal: {error}",
+                        source.display()
+                    ),
+                    vec![source.to_path_buf()],
+                )
+            })?;
+        let meta = file.metadata().map_err(|error| {
+            Flow::Problem(
+                format!(
+                    "the copy is installed, but the source {} could not be rechecked before removal: {error}",
+                    source.display()
+                ),
+                vec![source.to_path_buf()],
+            )
+        })?;
+        if let Err(message) = verify_stamp(&meta, reviewed, source) {
+            return Ok(SourceCheck::Changed(message));
+        }
+        if fresh != opened {
+            return Ok(SourceCheck::Changed(format!(
+                "the source {} changed after it was read",
+                source.display()
+            )));
+        }
+        Ok(SourceCheck::Unchanged(fresh))
     }
 
     /// Copies the opened source into the staging file, preserves its metadata,
@@ -845,16 +986,16 @@ impl Executor<'_> {
         name: &OsStr,
         stage_name: &OsStr,
         destination: &Path,
-    ) -> Result<Option<String>, Flow> {
+    ) -> Result<InstallOutcome, Flow> {
         match item.expectation.as_ref() {
             Some(DestinationExpectation::Absent) => {
                 match self.root.publish_noreplace(parent, stage_name, name) {
                     Ok(()) => {
+                        // Journal evidence follows the namespace sync, so the record
+                        // never claims a durability the filesystem refused.
+                        let (note, durable) = self.namespace_sync(parent);
                         self.checkpoint(item, ItemCheckpoint::Installed, None)?;
-                        self.root.sync_dir(parent).map_err(|error| {
-                            io_problem("the destination folder", destination, error)
-                        })?;
-                        Ok(None)
+                        Ok(InstallOutcome { note, durable })
                     }
                     Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                         Err(problem(format!(
@@ -911,20 +1052,34 @@ impl Executor<'_> {
                 }
                 match self.root.publish_noreplace(parent, stage_name, name) {
                     Ok(()) => {
-                        let mut note = None;
+                        // The displaced original is deleted only once the install is
+                        // both durable and journaled, so an interrupted or unsynced
+                        // window keeps a copy of the file instead of losing it.
+                        let (mut note, durable) = self.namespace_sync(parent);
+                        self.checkpoint(item, ItemCheckpoint::Installed, None)?;
                         if !keep {
-                            if let Err(error) = self.remove_owned(parent, &backup) {
-                                note = Some(format!(
-                                    "installed, but the replaced file {} could not be removed: {error}",
-                                    destination.with_file_name(&backup).display()
-                                ));
+                            let backup_path = destination.with_file_name(&backup);
+                            if durable {
+                                if let Err(error) = self.remove_owned(parent, &backup) {
+                                    note = combine_notes(
+                                        note,
+                                        Some(format!(
+                                            "installed, but the replaced file {} could not be removed: {error}",
+                                            backup_path.display()
+                                        )),
+                                    );
+                                }
+                            } else {
+                                note = combine_notes(
+                                    note,
+                                    Some(format!(
+                                        "the previous destination was kept at {}",
+                                        backup_path.display()
+                                    )),
+                                );
                             }
                         }
-                        self.checkpoint(item, ItemCheckpoint::Installed, None)?;
-                        self.root.sync_dir(parent).map_err(|error| {
-                            io_problem("the destination folder", destination, error)
-                        })?;
-                        Ok(note)
+                        Ok(InstallOutcome { note, durable })
                     }
                     Err(error) => {
                         let backup_path = destination.with_file_name(&backup);
@@ -981,6 +1136,21 @@ impl Executor<'_> {
     fn staging_name(&mut self, name: &OsStr) -> OsString {
         self.staging_counter += 1;
         suffixed_name(name, STAGING_SUFFIX, self.staging_counter)
+    }
+
+    /// Syncs the folder that now holds a committed file. Some network and FUSE
+    /// filesystems refuse a directory fsync; that is reported, never assumed, and
+    /// a move keeps its source while the install is not confirmed durable.
+    fn namespace_sync(&self, parent: &OwnedFd) -> (Option<String>, bool) {
+        match self.root.sync_dir(parent) {
+            Ok(()) => (None, true),
+            Err(error) => (
+                Some(format!(
+                    "the destination folder could not be synced, so the install is not confirmed durable: {error}"
+                )),
+                false,
+            ),
+        }
     }
 
     fn sync_move_directories(
@@ -1177,10 +1347,6 @@ fn verify_existing_destination(
         Some(native_identity(EntryIdentity::from(*stat))),
         &format!("the existing destination {}", path.display()),
     )
-}
-
-fn is_cross_device(error: &io::Error) -> bool {
-    matches!(Errno::from_io_error(error), Some(Errno::XDEV))
 }
 
 /// `renameat2(RENAME_NOREPLACE)` is the no-clobber commit primitive. When the
