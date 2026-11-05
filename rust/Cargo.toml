@@ -26,3 +26,8 @@ eframe = { version = "=0.37.0", default-features = false, features = [
     "x11",
 ] }
 egui_extras = { version = "=0.37.0", default-features = false }
+# F2 storage/config. `bundled` ships the SQLite amalgamation so Linux and the
+# Windows target do not depend on a system sqlite3 install or link flags.
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"

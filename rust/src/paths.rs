@@ -19,15 +19,24 @@
 //! - Lexical equality is not proof of the same file, and lexical inequality is
 //!   not proof of different files (hardlinks, bind mounts, symlink spellings).
 //!   [`relation`] classifies lexical shape only; [`evidence_same_file`] returns
-//!   `Some` only when the OS gives definite identity evidence, `None` otherwise.
+//!   `Some` only when the OS gives definite identity evidence for both
+//!   spellings, and `None` when either stat fails or no identity kind is
+//!   present on both sides (no evidence is not evidence of difference).
 //!   Hardlinks are never "universally detected".
-//! - Windows case folding is ASCII-only on the native encoded bytes. Legacy
-//!   `normcase` lowercased full Unicode; this key deliberately avoids
-//!   Unicode-aware folding so non-UTF-8/WTF-8 bytes keep byte identity.
+//! - Windows case folding uses [`fold_native_text`]: Unicode `to_lowercase()`
+//!   over valid text (legacy `normcase` parity) and verbatim preservation of
+//!   ill-formed runs behind a `0xFF` escape, so non-UTF-8 POSIX bytes and
+//!   unpaired Windows surrogates keep distinct identities and no replacement
+//!   character is ever substituted. The same codec backs discovery's
+//!   case-insensitive suffix and exclude matching, and it is the persisted
+//!   catalog key format for schema 1 ([`PathKey::storage_bytes`]): changing it
+//!   requires a key migration.
 //! - Verbatim (`\\?\`) Windows spellings are anchored as std parses them; no
 //!   Win32-normalization equivalence is claimed for them.
 //! - Drive-relative Windows inputs (`C:foo`) resolve against per-drive CWD
-//!   state, which this module must not invent; they are rejected.
+//!   state, which this module must not invent; they are rejected, as are
+//!   rooted-but-relative spellings (`\temp`, `has_root() && !is_absolute()`),
+//!   which would otherwise be appended to the base and silently lose its anchor.
 //! - [`validate_destination`] is snapshot validation only. It rejects traversal,
 //!   absolute and foreign drive/UNC spellings, NUL and invalid native names,
 //!   then walks existing ancestors and fails closed (category [`PathCategory::Escape`])
@@ -292,13 +301,16 @@ pub fn relation(a: &PathKey, b: &PathKey) -> PathRelation {
 }
 
 /// Definite same-file evidence from one stat snapshot of both spellings, or
-/// `None` when either stat fails or the platform offers no identity fields.
-/// `Some(false)` means the two snapshots provably describe different files at
-/// the same instant; `None` means "no evidence", never "different".
+/// `None` when either stat fails, the platform gives no identity fields, or the
+/// two snapshots share no evidence kind. `Some(false)` means the two snapshots
+/// provably describe different files at the same instant; `None` means "no
+/// evidence", never "different".
 pub fn evidence_same_file(a: &Path, b: &Path) -> Option<bool> {
     let a_meta = fs::metadata(a).ok()?;
     let b_meta = fs::metadata(b).ok()?;
-    Some(FileIdentity::from_metadata(&a_meta).same_file(&FileIdentity::from_metadata(&b_meta)))
+    let a_identity = FileIdentity::from_metadata(&a_meta)?;
+    let b_identity = FileIdentity::from_metadata(&b_meta)?;
+    a_identity.compare_file(&b_identity)
 }
 
 /// Validates a destination the caller wants to create under an existing
@@ -438,6 +450,16 @@ fn anchored(path: &Path, base: &Path) -> PathResult<Fold> {
         kept: Vec::new(),
         anchors: 0,
     };
+    // `\temp` / `\\temp` on Windows are rooted but not absolute: they mean
+    // "current drive", not the base. Joining them would replace the anchor with
+    // a spelling that silently depends on process state, so they are refused.
+    if !path.is_absolute() && path.has_root() {
+        return Err(PathError::new(
+            PathCategory::InvalidInput,
+            Some(path),
+            "rooted path without a drive or UNC anchor is relative to the current drive; use an absolute spelling",
+        ));
+    }
     if path.is_absolute() {
         fold_components(&mut fold, path.components());
         return Ok(fold);
@@ -466,12 +488,49 @@ fn normalized_bytes(part: &OsStr) -> Box<[u8]> {
     let bytes = part.as_encoded_bytes();
     #[cfg(windows)]
     {
-        return bytes.to_ascii_lowercase().into_boxed_slice();
+        return fold_native_text(bytes).into_boxed_slice();
     }
     #[cfg(not(windows))]
     {
         Box::from(bytes)
     }
+}
+
+/// Case-folded form of native path text, for case-insensitive comparison.
+///
+/// Valid UTF-8 runs use [`str::to_lowercase`] (legacy `normcase`/`lower()`
+/// parity for real text). Ill-formed runs — non-UTF-8 POSIX bytes and the WTF-8
+/// encoding of unpaired Windows surrogates — are copied verbatim behind a `0xFF`
+/// escape, with any `0xFF` in the run escaped as `0xFF 0x00`. Valid text folded
+/// this way never contains `0xFF`, and each run is separated by the folded form
+/// of a non-empty valid run, so the codec is injective: no byte is dropped, no
+/// replacement character appears, and two distinct spellings never fold
+/// together.
+///
+/// This is the persisted Windows catalog key format for schema 1
+/// ([`PathKey::storage_bytes`]), so changing the codec requires a key migration.
+/// POSIX keys stay byte-exact because case is significant there.
+pub fn fold_native_text(bytes: &[u8]) -> Vec<u8> {
+    const RAW_RUN_START: u8 = 0xFF;
+    let mut folded = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid();
+        if !valid.is_empty() {
+            folded.extend_from_slice(valid.to_lowercase().as_bytes());
+        }
+        let invalid = chunk.invalid();
+        if invalid.is_empty() {
+            continue;
+        }
+        folded.push(RAW_RUN_START);
+        for byte in invalid {
+            folded.push(*byte);
+            if *byte == RAW_RUN_START {
+                folded.push(0);
+            }
+        }
+    }
+    folded
 }
 
 /// Rebuilds a [`PathBuf`] from kept components without [`PathBuf::push`]
@@ -715,55 +774,71 @@ impl RootIdentity {
     /// True only with positive matching evidence: at least one evidence kind
     /// must be present on both sides, and every shared kind must agree.
     pub fn same_identity(&self, other: &RootIdentity) -> bool {
+        self.compare_identity(other) == Some(true)
+    }
+
+    /// `Some(agreement)` when an evidence kind is present on both sides, `None`
+    /// when the snapshots cannot be compared (missing `volume_serial_number` /
+    /// `file_index` on Windows, for example).
+    pub fn compare_identity(&self, other: &RootIdentity) -> Option<bool> {
         identity_verdict(self.unix, other.unix, self.windows, other.windows)
     }
 }
 
 impl FileIdentity {
     #[cfg(unix)]
-    pub(crate) fn from_metadata(meta: &fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(meta: &fs::Metadata) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        Self {
+        Some(Self {
             unix: Some((meta.dev(), meta.ino())),
             windows: None,
-        }
+        })
     }
 
+    /// Windows identity is only present when the metadata actually carries
+    /// `volume_serial_number` + `file_index`. `DirEntry::metadata` does not
+    /// populate those fields, so callers that need identity must stat the entry
+    /// path; an identity-free snapshot is `None`, never `Some` with no evidence.
     #[cfg(windows)]
-    pub(crate) fn from_metadata(meta: &fs::Metadata) -> Self {
-        Self {
-            unix: None,
-            windows: meta
-                .volume_serial_number()
-                .zip(meta.file_index())
-                .map(|(volume, index)| (u64::from(volume), index)),
-        }
+    pub(crate) fn from_metadata(meta: &fs::Metadata) -> Option<Self> {
+        meta.volume_serial_number()
+            .zip(meta.file_index())
+            .map(|(volume, index)| Self {
+                unix: None,
+                windows: Some((u64::from(volume), index)),
+            })
     }
 
     /// Same contract as [`RootIdentity::same_identity`]: definite agreement on
     /// shared evidence, no claim when evidence is missing or disjoint.
     pub fn same_file(&self, other: &FileIdentity) -> bool {
+        self.compare_file(other) == Some(true)
+    }
+
+    /// `Some(agreement)` when an evidence kind is present on both sides, `None`
+    /// when the snapshots share no comparable evidence.
+    pub fn compare_file(&self, other: &FileIdentity) -> Option<bool> {
         identity_verdict(self.unix, other.unix, self.windows, other.windows)
     }
 }
 
-/// `Some(agreement)` per evidence kind present on both sides, `None` when that
-/// kind is missing on either side. Two identities with no shared evidence kind
-/// cannot be compared and report `false` — never a positive claim.
+/// `Some(agreement)` per evidence kind present on both sides, `None` when no
+/// kind is present on both sides. No shared evidence is "unknown", never a
+/// negative or positive claim.
 fn identity_verdict(
     a_unix: Option<(u64, u64)>,
     b_unix: Option<(u64, u64)>,
     a_windows: Option<(u64, u64)>,
     b_windows: Option<(u64, u64)>,
-) -> bool {
+) -> Option<bool> {
     match (
         evidence_pair(a_unix, b_unix),
         evidence_pair(a_windows, b_windows),
     ) {
-        (Some(same), Some(other)) => same && other,
-        (Some(same), None) => same,
-        (None, Some(same)) => same,
-        (None, None) => false,
+        (Some(same), Some(other)) => Some(same && other),
+        (Some(same), None) => Some(same),
+        (None, Some(same)) => Some(same),
+        (None, None) => None,
     }
 }
 

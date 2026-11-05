@@ -29,8 +29,13 @@
 //!   with the exact native path bytes as tie-break, so no two distinct paths
 //!   can compare equal and non-UTF-8 names keep their identity.
 //! - **Controls.** Pause/cancel flow through [`JobControl::checkpoint`] between
-//!   directories and every batch of entries; progress and diagnostics flow
-//!   through [`JobEvents`]. The terminal `finish` mapping is the caller's job.
+//!   directories, before and after every directory listing, and while a listing
+//!   is still being collected, so a cancelled read reports
+//!   [`Coverage::Cancelled`] instead of a completed directory. A single blocked
+//!   OS call (a stalled network `read_dir`/`stat`) still cannot be interrupted;
+//!   cancellation takes effect at the next entry the OS returns. Progress and
+//!   diagnostics flow through [`JobEvents`]; the terminal `finish` mapping is
+//!   the caller's job.
 //!
 //! Deliberate limits:
 //!
@@ -44,8 +49,18 @@
 //!   backup packet. Literal patterns match any single component or the full
 //!   root-relative path, case-insensitively, mirroring the legacy finder.
 //! - Repeated observable directory identities are skipped and make coverage partial.
-//! - Case-insensitive suffix matching is ASCII-only on native bytes; the
-//!   shipped defaults and legacy filters are ASCII extensions.
+//! - Case-insensitive suffix and exclude matching folds valid native text with
+//!   [`crate::paths::fold_native_text`] — Unicode lowercase, legacy `lower()`
+//!   parity for non-ASCII names — while ill-formed bytes/units keep exact byte
+//!   identity instead of being replaced by a lossy character.
+//! - Only regular files, and links whose target is a regular file, become
+//!   [`FileEntry`] values. FIFOs, sockets and device nodes are reported as
+//!   `Unsupported` issues, degrade coverage to `Partial` and are never stamped
+//!   as files; `Open`/copy planning later can never see a non-regular entry.
+//! - [`std::fs::DirEntry::metadata`] does not populate Windows
+//!   `volume_serial_number`/`file_index`, so Windows re-stats the entry path for
+//!   the stamp. When no identity kind is available the stamp carries `None`
+//!   rather than an evidence-free identity.
 //! - [`ScanPurpose::Incoming`] and [`ScanPurpose::StructureExport`] have no
 //!   filter preset here: their pattern/sequence discovery belongs to later
 //!   packets and is not approximated.
@@ -59,7 +74,8 @@ use std::time::SystemTime;
 
 use crate::jobs::{Checkpoint, JobControl, JobEvents, JobPhase, JobProgress};
 use crate::paths::{
-    FileIdentity, PathCategory, PathError, PathIssue, PathResult, RootIdentity, inspect_root,
+    FileIdentity, PathCategory, PathError, PathIssue, PathResult, RootIdentity, fold_native_text,
+    inspect_root,
 };
 
 /// Pause acknowledged every this many entries inside one directory.
@@ -115,7 +131,7 @@ impl ScanFilters {
         if self
             .excluded_name_suffixes
             .iter()
-            .any(|suffix| name_ends_with_ignore_ascii_case(bytes, suffix.as_bytes()))
+            .any(|suffix| name_ends_with_case_insensitive(bytes, suffix.as_bytes()))
         {
             return false;
         }
@@ -124,7 +140,7 @@ impl ScanFilters {
             SuffixMode::NameSuffix => self
                 .suffixes
                 .iter()
-                .any(|suffix| name_ends_with_ignore_ascii_case(bytes, suffix.as_bytes())),
+                .any(|suffix| name_ends_with_case_insensitive(bytes, suffix.as_bytes())),
         }
     }
 }
@@ -320,9 +336,13 @@ pub fn walk(
                 current: Some(pending.absolute.clone()),
             },
         );
-        let dir_entries = match read_sorted(&pending.absolute) {
-            Ok(dir_entries) => dir_entries,
-            Err((category, message)) => {
+        let dir_entries = match read_sorted(&pending.absolute, control) {
+            Listing::Entries(dir_entries) => dir_entries,
+            Listing::Cancelled => {
+                cancelled = true;
+                break 'outer;
+            }
+            Listing::Failed(category, message) => {
                 report_issue(&mut issues, events, &pending.absolute, category, message);
                 degraded = true;
                 continue;
@@ -441,9 +461,17 @@ pub fn child_directories(
         });
     }
     let mut coverage = Coverage::Complete;
-    let entries = match read_sorted(root) {
-        Ok(entries) => entries,
-        Err((category, message)) => {
+    let entries = match read_sorted(root, control) {
+        Listing::Entries(entries) => entries,
+        Listing::Cancelled => {
+            return Ok(ChildDirectories {
+                root: root.to_path_buf(),
+                directories,
+                coverage: Coverage::Cancelled,
+                issues,
+            });
+        }
+        Listing::Failed(category, message) => {
             report_issue(&mut issues, events, root, category, message);
             return Ok(ChildDirectories {
                 root: root.to_path_buf(),
@@ -470,7 +498,7 @@ pub fn child_directories(
                 );
                 coverage = Coverage::Partial;
             }
-            EntryShape::File(_) | EntryShape::FileLink(_) => {}
+            EntryShape::File(_) | EntryShape::FileLink(_) | EntryShape::Special => {}
         }
     }
     directories.sort_by(|a, b| display_sort_key(a).cmp(&display_sort_key(b)));
@@ -497,11 +525,14 @@ enum Visit {
 /// Classifies one directory entry into what the walker should do with it.
 enum EntryShape {
     Directory,
+    /// Regular file, stamped from its own metadata.
     File(fs::Metadata),
     /// Directory symlink or reparse point: never descended by this walker.
     DirectoryLink,
-    /// Symlink resolving to a non-directory; stamped through the target.
+    /// Symlink resolving to a regular file; stamped through the target.
     FileLink(fs::Metadata),
+    /// FIFO, socket, device node or a link to one: not a planable file.
+    Special,
     Unreadable(std::io::Error),
 }
 
@@ -520,8 +551,9 @@ fn entry_shape(entry: &std::fs::DirEntry) -> EntryShape {
         }
         return EntryShape::Directory;
     }
-    // Regular files, non-directory special files, and platforms whose readdir
-    // type was unknown: resolve through no-follow metadata.
+    // Regular files, non-regular special files, and platforms whose readdir type
+    // was unknown: resolve through no-follow metadata. Only a regular file is a
+    // planable file; special kinds must not inherit `open`/copy semantics.
     match entry.metadata() {
         Ok(meta) if meta.file_type().is_symlink() => follow_link(&entry.path()),
         Ok(meta) if meta.is_dir() => {
@@ -531,7 +563,8 @@ fn entry_shape(entry: &std::fs::DirEntry) -> EntryShape {
             }
             EntryShape::Directory
         }
-        Ok(meta) => EntryShape::File(meta),
+        Ok(meta) if meta.is_file() => EntryShape::File(meta),
+        Ok(_) => EntryShape::Special,
         Err(error) => EntryShape::Unreadable(error),
     }
 }
@@ -539,7 +572,8 @@ fn entry_shape(entry: &std::fs::DirEntry) -> EntryShape {
 fn follow_link(path: &Path) -> EntryShape {
     match fs::metadata(path) {
         Ok(meta) if meta.is_dir() => EntryShape::DirectoryLink,
-        Ok(meta) => EntryShape::FileLink(meta),
+        Ok(meta) if meta.is_file() => EntryShape::FileLink(meta),
+        Ok(_) => EntryShape::Special,
         Err(error) => EntryShape::Unreadable(error),
     }
 }
@@ -557,11 +591,16 @@ fn visit_entry(entry: &std::fs::DirEntry, parent_relative: &Path, filters: &Scan
             "directory symlink/reparse point not followed".to_string(),
         ),
         EntryShape::Directory => Visit::Descend(entry.path(), child_relative),
+        EntryShape::Special => Visit::Issue(
+            PathCategory::Unsupported,
+            "special file kind (FIFO, socket or device) is not a regular file; not included"
+                .to_string(),
+        ),
         EntryShape::File(meta) | EntryShape::FileLink(meta) => {
             if !filters.matches_name(&name) {
                 return Visit::Skip;
             }
-            let (stamp, issue) = stamp_from(&meta);
+            let (stamp, issue) = stamp_from(&entry.path(), &meta);
             Visit::Keep(
                 FileEntry {
                     path: entry.path(),
@@ -573,52 +612,99 @@ fn visit_entry(entry: &std::fs::DirEntry, parent_relative: &Path, filters: &Scan
     }
 }
 
-fn stamp_from(meta: &fs::Metadata) -> (FileStamp, Option<(PathCategory, String)>) {
-    let modified = match meta.modified() {
+/// Builds the stamp from the metadata the walker already has. Windows identity
+/// fields are absent from `DirEntry::metadata`, so the entry path is re-statted
+/// there; a failed re-stat keeps the stamp without identity evidence and reports
+/// the metadata failure instead of inventing an identity.
+fn stamp_from(path: &Path, meta: &fs::Metadata) -> (FileStamp, Option<(PathCategory, String)>) {
+    let mut issue = None;
+    #[cfg(windows)]
+    let stamp_meta = match fs::metadata(path) {
+        Ok(fresh) => fresh,
+        Err(error) => {
+            issue = Some((
+                io_category(&error),
+                format!("could not re-stat entry for file identity: {error}"),
+            ));
+            meta.clone()
+        }
+    };
+    #[cfg(not(windows))]
+    let stamp_meta = {
+        // Only Windows re-stats; the path parameter is unused elsewhere.
+        let _ = path;
+        meta.clone()
+    };
+
+    let modified = match stamp_meta.modified() {
         Ok(time) => Some(time),
         Err(_) => {
-            return (
-                FileStamp {
-                    size: meta.len(),
-                    modified: None,
-                    identity: Some(FileIdentity::from_metadata(meta)),
-                },
-                Some((
-                    PathCategory::Unsupported,
-                    "modified time is not representable; entry kept without a stamp".to_string(),
-                )),
-            );
+            issue = Some((
+                PathCategory::Unsupported,
+                "modified time is not representable; entry kept without a stamp".to_string(),
+            ));
+            None
         }
     };
     (
         FileStamp {
-            size: meta.len(),
+            size: stamp_meta.len(),
             modified,
-            identity: Some(FileIdentity::from_metadata(meta)),
+            identity: FileIdentity::from_metadata(&stamp_meta),
         },
-        None,
+        issue,
     )
 }
 
-fn read_sorted(directory: &Path) -> Result<Vec<std::fs::DirEntry>, (PathCategory, String)> {
-    let read = fs::read_dir(directory).map_err(|error| {
-        (
-            io_category(&error),
-            format!("cannot read directory: {error}"),
-        )
-    })?;
-    let mut entries = read.collect::<Result<Vec<_>, _>>().map_err(|error| {
-        (
-            io_category(&error),
-            format!("cannot list directory contents: {error}"),
-        )
-    })?;
+/// Outcome of one directory listing: entries, a cancelled read, or a per-
+/// directory failure that degrades coverage instead of aborting the scan.
+enum Listing {
+    Entries(Vec<std::fs::DirEntry>),
+    Cancelled,
+    Failed(PathCategory, String),
+}
+
+fn read_sorted(directory: &Path, control: &JobControl) -> Listing {
+    // Cancellation is observed before the read, after it (covering the empty
+    // directory case) and periodically while entries are collected, so a
+    // cancelled listing is never reported as a complete one.
+    if control.checkpoint() == Checkpoint::Cancelled {
+        return Listing::Cancelled;
+    }
+    let read = match fs::read_dir(directory) {
+        Ok(read) => read,
+        Err(error) => {
+            return Listing::Failed(
+                io_category(&error),
+                format!("cannot read directory: {error}"),
+            );
+        }
+    };
+    let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+    for (index, entry) in read.enumerate() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Listing::Failed(
+                    io_category(&error),
+                    format!("cannot list directory contents: {error}"),
+                );
+            }
+        };
+        entries.push(entry);
+        if index % CHECKPOINT_EVERY == 0 && control.checkpoint() == Checkpoint::Cancelled {
+            return Listing::Cancelled;
+        }
+    }
+    if control.checkpoint() == Checkpoint::Cancelled {
+        return Listing::Cancelled;
+    }
     entries.sort_by(|a, b| {
         a.file_name()
             .as_encoded_bytes()
             .cmp(b.file_name().as_encoded_bytes())
     });
-    Ok(entries)
+    Listing::Entries(entries)
 }
 
 fn report_issue(
@@ -681,16 +767,16 @@ fn build_excludes(filters: &ScanFilters, events: &JobEvents) -> PathResult<Exclu
             );
             continue;
         }
-        plan.components.push(bytes.to_ascii_lowercase());
+        plan.components.push(fold_native_text(bytes));
         plan.full.push(exclude_full_form(bytes));
     }
     Ok(plan)
 }
 
-/// Lowercased bytes, with backslashes treated as separators on Windows only
-/// (on POSIX a backslash is an ordinary name byte).
+/// Folded bytes, with backslashes treated as separators on Windows only (on
+/// POSIX a backslash is an ordinary name byte).
 fn exclude_full_form(bytes: &[u8]) -> Vec<u8> {
-    let lowered = bytes.to_ascii_lowercase();
+    let lowered = fold_native_text(bytes);
     #[cfg(windows)]
     {
         return lowered
@@ -710,7 +796,7 @@ fn is_excluded(relative: &Path, plan: &ExcludePlan) -> bool {
         let Component::Normal(name) = component else {
             continue;
         };
-        let lowered = name.as_encoded_bytes().to_ascii_lowercase();
+        let lowered = fold_native_text(name.as_encoded_bytes());
         if plan.components.iter().any(|pattern| *pattern == lowered) {
             return true;
         }
@@ -719,24 +805,28 @@ fn is_excluded(relative: &Path, plan: &ExcludePlan) -> bool {
     plan.full.iter().any(|pattern| *pattern == lowered)
 }
 
-fn name_ends_with_ignore_ascii_case(bytes: &[u8], suffix: &[u8]) -> bool {
-    !suffix.is_empty()
-        && bytes.len() >= suffix.len()
-        && bytes[bytes.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+fn name_ends_with_case_insensitive(bytes: &[u8], suffix: &[u8]) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    let folded_suffix = fold_native_text(suffix);
+    fold_native_text(bytes).ends_with(&folded_suffix)
 }
 
 fn last_extension_matches(bytes: &[u8], suffixes: &[String]) -> bool {
     let Some(dot) = bytes.iter().rposition(|byte| *byte == b'.') else {
         return false;
     };
-    // `splitext` parity: a leading dot belongs to a hidden stem, not an extension.
-    if dot == 0 {
+    // `splitext` parity: leading dots belong to the stem, so `.nk` and `..nk`
+    // have no extension. At least one non-dot byte must precede the final dot.
+    if dot == 0 || bytes[..dot].iter().all(|byte| *byte == b'.') {
         return false;
     }
     let extension = &bytes[dot + 1..];
+    let folded_extension = fold_native_text(extension);
     suffixes.iter().any(|suffix| {
         let suffix = suffix.as_bytes();
         let suffix = suffix.strip_prefix(b".").unwrap_or(suffix);
-        !suffix.is_empty() && extension.eq_ignore_ascii_case(suffix)
+        !suffix.is_empty() && folded_extension == fold_native_text(suffix)
     })
 }
