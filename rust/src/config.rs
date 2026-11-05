@@ -12,8 +12,12 @@
 //!   the previous file stays untouched;
 //! - a missing file loads the defaults (first run, not an error);
 //! - saves go to a sibling temporary file in the destination directory, are
-//!   flushed and `sync_all`ed, then atomically renamed over the destination, so
-//!   a crash leaves either the old or the new file, never a truncated one.
+//!   flushed and `sync_all`ed, then replaced atomically, so a crash leaves either
+//!   the old or the new file, never a truncated one. On Unix the rename is
+//!   followed by a directory `sync_all`; on Windows the flush plus the native
+//!   replace are the whole guarantee, because those APIs document no directory
+//!   metadata flush (`ReplaceFileW`'s write-through flag is documented as not
+//!   supported) and a plain `rename` never flushes directory metadata by itself.
 //!
 //! Path fields are UTF-8 strings in JSON (`CONTRACTS.md` §1). A native path that
 //! is not representable as UTF-8 is refused at save time via
@@ -44,9 +48,9 @@ pub type ConfigResult<T> = Result<T, ConfigError>;
 pub enum ConfigCategory {
     /// File system read/write/rename/permission failure.
     Io,
-    /// The file exists but is not the JSON we can read.
+    /// The file exists but cannot be parsed as JSON at all.
     InvalidJson,
-    /// `schema_version` is missing, older or newer than this build supports.
+    /// `schema_version` is missing, or older/newer than this build supports.
     UnsupportedVersion,
     /// Well-formed JSON that is not a valid value for this build (including a
     /// path that cannot be represented as UTF-8).
@@ -457,16 +461,26 @@ fn read_versioned<T: DeserializeOwned>(
             format!("the {kind} is not valid JSON: {err}"),
         )
     })?;
-    let version = value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            ConfigError::new(
-                ConfigCategory::InvalidJson,
+    let version = match value.get("schema_version") {
+        None => {
+            return Err(ConfigError::new(
+                ConfigCategory::UnsupportedVersion,
                 Some(path),
-                format!("the {kind} has no integer schema_version"),
+                format!(
+                    "the {kind} has no schema_version field; this build supports schema version {supported}"
+                ),
+            ));
+        }
+        Some(field) => field.as_u64().ok_or_else(|| {
+            ConfigError::new(
+                ConfigCategory::InvalidValue,
+                Some(path),
+                format!(
+                    "the {kind} has a non-integer schema_version ({field}); this build supports schema version {supported}"
+                ),
             )
-        })?;
+        })?,
+    };
     if version != u64::from(supported) {
         let cause = if version > u64::from(supported) {
             format!(
@@ -505,8 +519,21 @@ fn write_versioned<T: Serialize>(path: &Path, kind: &str, value: &T) -> ConfigRe
     write_atomic(path, &bytes)
 }
 
-/// Same-directory temporary file, flush, `sync_all`, atomic rename, directory
+/// Same-directory temporary file, flush, `sync_all`, native replace, directory
 /// sync where the platform supports it.
+///
+/// Durability, stated exactly:
+/// - the new bytes are `sync_all`ed before anything replaces the destination, so
+///   a successful return never reports contents that are still only in the page
+///   cache;
+/// - on Unix the replacement is `rename(2)` followed by a directory `sync_all`,
+///   which is what makes the *name change* durable;
+/// - on Windows the replacement is `replace_file`: `ReplaceFileW` when the
+///   destination exists (it keeps the destination's identity, attributes and
+///   ACLs) or `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` when it does not. No
+///   directory-metadata flush is claimed there: `ReplaceFileW`'s write-through
+///   flag is documented as not supported, and neither API documents flushing the
+///   parent directory entry.
 fn write_atomic(path: &Path, bytes: &[u8]) -> ConfigResult<()> {
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -564,7 +591,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> ConfigResult<()> {
             format!("could not write the temporary settings file: {err}"),
         ));
     }
-    if let Err(err) = fs::rename(&temporary, path) {
+    if let Err(err) = replace_file(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(ConfigError::new(
             ConfigCategory::Io,
@@ -574,6 +601,70 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> ConfigResult<()> {
     }
     sync_parent_directory(parent, path)?;
     Ok(())
+}
+
+/// Windows replacement: `ReplaceFileW` requires the destination to exist, so a
+/// missing destination falls back to `MoveFileExW` with write-through.
+#[cfg(windows)]
+fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let replaced = wide(path);
+    let replacement = wide(temporary);
+    // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the
+    // call; no backup name and no dedicated exclude/reserved blocks are passed.
+    let replaced_ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced_ok != 0 {
+        return Ok(());
+    }
+    // SAFETY: GetLastError reads the calling thread's last error, which the
+    // immediately preceding API call set.
+    let replace_error = unsafe { GetLastError() };
+    if replace_error != ERROR_FILE_NOT_FOUND {
+        return Err(std::io::Error::from_raw_os_error(replace_error as i32));
+    }
+    // SAFETY: same NUL-terminated buffers; MOVEFILE_WRITE_THROUGH makes the call
+    // return only once the file is actually on disk.
+    let moved = unsafe {
+        MoveFileExW(
+            replacement.as_ptr(),
+            replaced.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved != 0 {
+        return Ok(());
+    }
+    // SAFETY: as above; MoveFileExW set the thread error on failure.
+    let move_error = unsafe { GetLastError() };
+    Err(std::io::Error::from_raw_os_error(move_error as i32))
+}
+
+/// Unix replacement: `rename(2)` is atomic within the directory, and the caller
+/// syncs the directory afterwards.
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, path)
 }
 
 #[cfg(unix)]
@@ -593,6 +684,10 @@ fn sync_parent_directory(parent: &Path, path: &Path) -> ConfigResult<()> {
 
 #[cfg(not(unix))]
 fn sync_parent_directory(_parent: &Path, _path: &Path) -> ConfigResult<()> {
-    // Windows has no std directory-sync; the rename itself is atomic there.
+    // No documented way to flush a directory entry on Windows: `ReplaceFileW`'s
+    // write-through flag is documented as unsupported and `MoveFileExW`'s
+    // write-through covers the moved file itself. The new bytes are already
+    // `sync_all`ed and the replace is done by `replace_file`, so no
+    // directory-durability claim is made here.
     Ok(())
 }

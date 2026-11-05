@@ -641,3 +641,185 @@ that turned a listing failure into a plain `Err`.
 4. **X1 transfers/backup**: persist intent through `operation_runs`/
    `operation_items` in one transaction before mutating files and outcomes after,
    and mark unfinished runs `interrupted` at startup.
+
+## Packet P1 — catalog backend, plus storage/config review corrections (2026-11-05)
+
+Branch `migration/rust-egui-suite`. Sole writer for this packet: one implementer
+for `projects.rs`, and — after the read-only storage/config reviewer finished —
+the same writer owned `storage.rs`, `config.rs`, `Cargo.toml` and `Cargo.lock` to
+apply the review findings. `paths.rs`, `discovery.rs`, `jobs.rs`, `app.rs`,
+`main.rs` and the reference clones were not modified.
+
+| File | Change |
+|---|---|
+| `rust/src/projects.rs` | **New.** Catalog registration, scan reconciliation and the project/grouped-file views. |
+| `rust/src/lib.rs` | Declares the `projects` module and names it in the crate documentation. Module declarations stay with the integration owner. |
+| `rust/src/storage.rs` | Read-only-first recognition, canonical schema comparison, `appid=0` object rule, Windows catalog-location classification, retained worker handle with pollable shutdown, completion notifier. |
+| `rust/src/config.rs` | `schema_version` error categories, Windows native replace with documented durability. |
+| `rust/Cargo.toml`, `rust/Cargo.lock` | One `cfg(windows)`-only `windows-sys = "=0.61.2"` dependency (`Win32_Foundation`, `Win32_Storage_FileSystem`). Cargo resolved it from the already-present lock entry; no new crate version entered the graph. |
+
+### Public catalog API (`rust/src/projects.rs`)
+
+Everything returns `StorageResult<Pending<T>>` and runs on the single catalog
+worker; nothing here executes SQL in an egui frame.
+
+| API | Purpose |
+|---|---|
+| `plan_registration(&[PathBuf]) -> RegistrationPlan` | Preworker: stats and opens each candidate root, rejects missing/unreadable ones, and applies the legacy literal-`Projects` parent identity. No database access. |
+| `register_projects(&Catalog, UserId, RegistrationPlan)` | One transaction; per-root `added` / `skipped` / `failed` in request order. |
+| `list_projects(&Catalog, UserId, ProjectList, Option<String>)` | `All` / `Favorites` / `Recents` per selected user with a case-folded name/root filter and deterministic ordering. |
+| `scan_scopes(&Catalog, ProjectId)` | Registered native scan folders plus unresolved display spellings; the only roots a scan may use. |
+| `reconcile_scan(&Catalog, ProjectId, PathBuf, ScanSnapshot, JobControl)` | Validates scope, then commits observed files/memberships and (only with trusted coverage) prunes; always returns a `ReconcileSummary`. |
+| `list_project_files(&Catalog, ProjectId, Option<FileKind>)` | Version-grouped files, newest first, with `latest` per group; optional Nuke/AEP view filter. |
+| `set_favorite`, `mark_recent`, `log_file_access` | Per-user favorite/recent/access writes, live identity required. |
+| `remove_project(&Catalog, UserId, ProjectId)` | Soft remove: `removed_at`, memberships, favorites, recents and one activity row; no filesystem change. |
+
+### Preserved legacy behavior
+
+- `ui_slick/async_workers.py::register_project_folders`: per-root results,
+  already-registered roots skipped rather than duplicated, request order kept.
+- `ui_slick/scanner.py::_update_database`: `os.path.basename(path) == "Projects"`
+  registers the **parent** as project identity; files are upserted by path; the
+  deleted-file sweep is skipped when the scan was cancelled or the root was
+  unavailable, and each candidate is re-verified before removal.
+- Current code still updates observed rows on a `Partial` scan and only skips
+  the write on cancellation/unavailable roots, as the scanner did.
+- `_parse_version_from_filename`: `_v<1-4 digits>` case-insensitive, and the
+  `.aep` trailing-number fallback (last run, at most five digits).
+- `ui_slick/file_handlers.py::get_base_name` / `group_versioned_files` and
+  `core/utils.py::get_latest_version_file`: `_v<digits>` stripped from the group
+  base name, `.aep` trailing-number stripping with `_`/`-` trim, latest = parsed
+  version, then modification time, then a stable spelling.
+- `core/database.py` favorite/recent semantics: recents upsert on access,
+  favorites per user, `ORDER BY name` for favorites; project removal clears
+  memberships, favorites and recents.
+
+### Deliberate deviations (all documented in the module)
+
+- `_parse_version_from_filename` returns `"1"` when nothing matches; the new
+  catalog stores **no** version instead, so unknown versions stay visible rather
+  than being invented (`CONTRACTS.md` §2).
+- Only a live (non-tombstoned) user id may register, favorite, mark recent, log
+  access or remove. No `id == 1` or `admin` assumption anywhere.
+- `projects` carries `UNIQUE (root_platform, root_storage)`, so registration
+  **revives** a soft-removed project with the same root instead of inserting a
+  second row. Scan-folder rows are kept on removal for that revival; pruning
+  only ever deletes `project_files` membership rows and never `files`, so shared
+  files and their history survive.
+- A file name that is not valid UTF-8 keeps its native identity and spelling
+  columns, but `files.filename` cannot hold it: the column stays empty, the
+  reconcile summary reports it, and grouping uses the native name bytes so two
+  distinct non-UTF-8 names are never merged.
+- Listing/filtering runs in Rust over the live rows so case folding uses
+  `paths::fold_native_text` rather than SQLite's ASCII-only `lower()`.
+- `JobControl` is honoured as a **cancellation** checkpoint on the catalog
+  worker, not as a pause gate: `checkpoint()` blocks while paused, which would
+  stall every other catalog request.
+- Reconciliation's absence `stat` runs on the catalog worker so the prune
+  decision and its evidence are one transaction. That loop is only reachable
+  with `RootContinuity::Proven`, which discovery never reports today.
+
+### Storage corrections from the review
+
+| Finding | Correction |
+|---|---|
+| Foreign/legacy DB with a hot journal could be recovered before it was recognized | `read_header` reads the 100-byte SQLite header (magic, `user_version` at 60, `application_id` at 68) with **no** SQLite call, then `recognize_catalog` opens **`SQLITE_OPEN_READ_ONLY`** and refuses foreign ids, newer versions, unidentified object sets and any incomplete/empty-but-versioned state. A writable open only follows a recognized empty-or-owned state, and `inspect_identity` + `verify_catalog_schema` re-run on the writable connection, which narrows but does not close the replace-between-opens race. `immutable=1` is never used. |
+| A hot journal on **our own** catalog would have been refused | Only when the header already proves this build's `application_id` does a read-only inspection failure with a database/I-O category fall through to the writable open (rollback needs write access); a latent schema objection still refuses before any write. |
+| Schema verification was table names only | New `schema_objects` reads every non-internal `sqlite_schema` object (tables, indexes, views, triggers — not just tables) with whitespace-normalized DDL, and `verify_catalog_schema` compares it against the canonical schema built in an in-memory connection from `SCHEMA_STEPS`. `PRAGMA foreign_key_check` must also be clean. `EXPECTED_TABLES` is gone. Because the stored DDL text is the canonical text, a released step's SQL text must never be edited — a schema change is a new step and version. |
+| `appid = 0` initialization was gated on tables only | `inspect_identity` now requires `user_version = 0` **and** zero non-internal `sqlite_schema` objects (views/indexes/triggers count), and refuses a `user_version != 0` with no objects. |
+| Windows catalog location was unconditionally "unknown" | `classify_location` (cfg(windows)) refuses `Prefix::UNC` / `Prefix::VerbatimUNC` by spelling and asks `GetDriveTypeW` about the drive root: only `DRIVE_FIXED` is a verified local volume, `DRIVE_REMOTE` (mapped network volume) is refused with its root named, and removable/CD-ROM/RAM-disk/unknown/invalid-root stay `unknown` — which never implies WAL. Existing-ancestor resolution still runs first. |
+| Worker thread handle was dropped; no wake for an idle UI | `Catalog` retains the `JoinHandle` and holds an `Arc<Mutex<Option<CompletionNotifier>>>`; `Catalog::set_completion_notifier` installs a framework-neutral `Fn()`, fired after every delivered reply and once when the worker queue ends. `Catalog::shutdown(self)` closes the request queue (accepted work drains, replies resolve) and returns a `CatalogShutdown` the GUI can poll with `try_finish()` or join from a non-UI thread with `join()`. `submit`/`transaction` stay non-blocking. Integration seam for the future UI: `catalog.set_completion_notifier(Some(Arc::new(move || ctx.request_repaint())))`. |
+
+### Config corrections from the review
+
+- `schema_version` categories: missing field → `UnsupportedVersion`; present but
+  not a non-negative integer → `InvalidValue`; `InvalidJson` is now only for a
+  document that cannot be parsed as JSON at all. Category docs updated.
+- Windows saves now replace through `replace_file`: `ReplaceFileW` when the
+  destination exists (keeps its identity/attributes/ACLs) and, on
+  `ERROR_FILE_NOT_FOUND`, `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)`. The temp
+  file is still created with `create_new`, `write_all`ed and `sync_all`ed first,
+  and any failure removes it and propagates the OS error. Durability is stated
+  exactly: `REPLACEFILE_WRITE_THROUGH` is **documented as not supported**, and
+  neither API documents flushing the parent directory entry, so Windows makes no
+  directory-durability claim; Unix keeps `rename(2)` + directory `sync_all`.
+
+### Verification actually performed
+
+- `rustfmt --edition 2024` write on `projects.rs`, `lib.rs`, `storage.rs`,
+  `config.rs`: clean, and it also syntax-checks the `cfg(windows)` blocks the
+  Linux compiler skips.
+- `cargo check --offline --locked --manifest-path rust/Cargo.toml --lib` with
+  `CARGO_HOME=artifacts/verification/cargo-home`,
+  `CARGO_TARGET_DIR=rust/target`, `TMPDIR=artifacts/verification/tmp`:
+  **passes with zero warnings and zero errors** (`rustc 1.99.1`, Linux). The one
+  intermediate warning (`ParsedVersion::padding` never read) was fixed by
+  deriving padding from the stored version text instead. Cargo updated
+  `Cargo.lock` by one line for the target-specific dependency; no crate version
+  changed.
+- `SCHEMA_V1` extracted verbatim from `storage.rs` and executed once with the
+  system `sqlite3` CLI against `:memory:` (`artifacts/verification/p1-schema-v1.sql`,
+  output `artifacts/verification/p1-schema-objects.out`): DDL accepted, 13 tables
+  + 4 explicit indexes listed, which is the object set the canonical comparison
+  expects.
+- SQLite header offsets verified empirically on a synthetic database
+  (`artifacts/verification/p1-header-probe.db`): bytes 60..64 = `00 00 00 01` for
+  `user_version`, bytes 68..72 = `56 46 58 4c` = `0x5646584C` for
+  `application_id`, matching `APPLICATION_ID`. The probe also confirmed SQLite
+  stores `sqlite_schema.sql` as the statement text it was given, which is what
+  the whitespace-normalized comparison relies on.
+- Source hand-traces (no execution): registration of a fresh root, of an
+  already-registered root, of a second scan scope on a live project, of a
+  duplicate root inside one request, and of a soft-removed root (revival);
+  reconcile of `Complete`/`Partial`/`Cancelled`/`RootUnavailable` snapshots,
+  a snapshot whose declared root differs from the scope, a scope that is not
+  registered, a non-project purpose, an entry lexically outside the scope, an
+  overlapping second project (no membership touched), and pruning suppressed by
+  `Uncertain` continuity; the group/version ordering against
+  `get_base_name`/`get_latest_version_file`; the recognition matrix (foreign app
+  id, newer version, `appid=0` with objects, `appid=0` with objects and a hot
+  journal, empty file, our catalog with a hot journal, our catalog with a
+  dropped index) through `read_header` → `recognize_catalog` →
+  `inspect_identity` → `migrate` → `verify_catalog_schema`.
+- Every command ran under `timeout 20s`/`timeout 30s`. **No tests, no test
+  suites, no self-check harness, no launches, no screenshots, no installs, no
+  production database or media access, no commits/pushes/PRs.**
+
+### Deliberate limits of this packet
+
+- The `cfg(windows)` code (`GetDriveTypeW` classification, `ReplaceFileW`
+  replacement) was written against the official `GetDriveTypeW`, `ReplaceFileW`
+  and `MoveFileExW` documentation and `windows-sys 0.61.2` sources, but it is
+  **not compiled** on this Linux machine: `rustfmt` proves syntax only. No
+  Windows runtime or compile claim is made.
+- Canonical schema comparison is strict by design. A catalog created by a build
+  that later edited a released step's SQL text would be refused; that is
+  intentional, and the rule is documented next to `SCHEMA_STEPS`.
+- `PRAGMA foreign_key_check` scans the catalog at open time. It is bounded by
+  catalog size, not by media size, but a very large catalog pays a startup cost.
+- Discovery still reports `RootContinuity::Uncertain` for every walk, so pruning
+  remains unreachable in practice; P1 implements and gates it rather than
+  enabling it.
+- Registration validates existence/readability in `plan_registration` only. A
+  root that disappears between that check and the transaction is still
+  registered (it becomes an offline project), which is what legacy registration
+  did and what keeps already-registered offline records intact.
+- No UI is wired: `app.rs` still shows its placeholder rows. Add-folder,
+  multi-add summary, scan-folder queue, favorites/recents and grouped file views
+  are the next UI packet's work, together with P2 launch. No part of the app is
+  claimed functional.
+- Nothing here creates project folders, writes templates/scripts (S1/S2), copies
+  or moves media (X1), imports legacy data (F3) or records operation runs.
+
+### Next integration (exact)
+
+1. **U1/P1 wiring**: construct the `Catalog` in application startup, pass
+   `set_completion_notifier` an `Arc` that calls `ctx.request_repaint()`, and poll
+   `list_projects`/`scan_scopes`/`list_project_files` `Pending` values from view
+   state. `plan_registration` runs on a preworker thread; `register_projects`
+   then reports `added`/`skipped`/`failed` per root. `Catalog::shutdown` returns
+   a `CatalogShutdown` the GUI polls with `try_finish()` during close.
+2. **P2 launch** (`rust/src/launch.rs`) consumes `ProjectFile`/`Project` values
+   and `log_file_access`; it must not fetch these on the UI thread.
+3. **F3 import** and **U3 settings** as previously listed; **X1** persists
+   operation runs and reuses the same catalog worker.

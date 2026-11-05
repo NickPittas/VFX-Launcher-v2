@@ -19,21 +19,39 @@
 //!   that is not this application's catalog — in particular the original legacy
 //!   database, which has tables and no application id — is refused, never
 //!   initialized or rewritten;
+//! - an existing file is recognized through its 100-byte header and a
+//!   **read-only** connection before anything can write it, so a foreign or
+//!   legacy database with a hot journal is refused instead of being recovered or
+//!   modified, and no `immutable=1` shortcut ever ignores journal state. A
+//!   recognized catalog is then reopened writable and revalidated (identity,
+//!   version, canonical schema, `foreign_key_check`), which narrows — it does not
+//!   eliminate — the window in which another process could replace the file;
+//! - the recognized schema is compared against the canonical schema built from
+//!   the migration steps, so objects, columns, constraints and indexes are all
+//!   checked, not just table names;
+//! - the worker's thread handle is retained. [`Catalog::shutdown`] closes the
+//!   request queue and returns a pollable handle, so accepted work drains and the
+//!   join happens off the UI thread;
+//! - replies can wake an idle UI through a framework-neutral completion notifier
+//!   ([`Catalog::set_completion_notifier`]) instead of requiring a poll loop;
 //! - paths are stored as native tagged bytes plus a separate UTF-8 display
 //!   spelling, keyed by [`PathKey::storage_bytes`]. Foreign or unresolved
 //!   spellings keep their source bytes and no key ([`PathColumns::unresolved`]).
 //!
-//! Not implemented here (later packets): legacy import (F3), project
-//! registration and scan reconciliation (P1), transfer execution (X1). No
+//! Not implemented here (later packets): legacy import (F3), transfer execution
+//! (X1). Project registration and scan reconciliation are implemented in
+//! [`crate::projects`] on top of [`Catalog::transaction`]. No
 //! provider credentials, tokens or secrets are stored in this catalog.
 
-use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::thread;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
@@ -236,10 +254,22 @@ impl<T> Pending<T> {
 
 /// Handle to the catalog worker. Cheap to keep in application state; every
 /// method either queues work or opens a reply channel, never blocks on SQLite.
+///
+/// The worker thread handle is retained: [`Catalog::shutdown`] closes the request
+/// queue, lets accepted requests finish and hands back a pollable
+/// [`CatalogShutdown`], so no UI frame ever joins a thread. Dropping the handle
+/// without calling `shutdown` still closes the queue (the worker drains what it
+/// accepted and exits), but only `shutdown` gives a joined exit.
 pub struct Catalog {
     path: PathBuf,
     requests: SyncSender<Request>,
+    worker: Option<JoinHandle<()>>,
+    completion: Arc<Mutex<Option<CompletionNotifier>>>,
 }
+
+/// Framework-neutral "a reply is available" callback. The UI installs one that
+/// requests a repaint; the catalog never depends on a UI toolkit.
+pub type CompletionNotifier = Arc<dyn Fn() + Send + Sync>;
 
 type Request = Box<dyn for<'a> FnOnce(StorageResult<&'a mut Connection>) + Send + 'static>;
 
@@ -252,10 +282,12 @@ impl Catalog {
     pub fn open(path: impl Into<PathBuf>) -> StorageResult<Self> {
         let path = path.into();
         let (requests, queue) = mpsc::sync_channel::<Request>(REQUEST_QUEUE_BOUND);
+        let completion: Arc<Mutex<Option<CompletionNotifier>>> = Arc::new(Mutex::new(None));
         let worker_path = path.clone();
-        thread::Builder::new()
+        let worker_completion = Arc::clone(&completion);
+        let worker = thread::Builder::new()
             .name("vfx-catalog".to_string())
-            .spawn(move || run_worker(worker_path, queue))
+            .spawn(move || run_worker(worker_path, queue, worker_completion))
             .map_err(|err| {
                 StorageError::new(
                     StorageCategory::WorkerStartup,
@@ -263,7 +295,34 @@ impl Catalog {
                     format!("could not start the catalog worker thread: {err}"),
                 )
             })?;
-        Ok(Self { path, requests })
+        Ok(Self {
+            path,
+            requests,
+            worker: Some(worker),
+            completion,
+        })
+    }
+
+    /// Installs (or with `None` clears) the callback fired after every delivered
+    /// reply and once when the worker stops, so an idle UI can be woken instead
+    /// of polling. The callback runs on the catalog worker thread and must not
+    /// block or call back into this catalog.
+    pub fn set_completion_notifier(&self, notifier: Option<CompletionNotifier>) {
+        *lock(&self.completion) = notifier;
+    }
+
+    /// Consuming graceful shutdown: closes the request queue, so the worker
+    /// answers every already-accepted request and then exits, and returns a
+    /// handle the caller can poll ([`CatalogShutdown::try_finish`]) or join from a
+    /// non-UI thread ([`CatalogShutdown::join`]).
+    pub fn shutdown(mut self) -> CatalogShutdown {
+        // Dropping the sender ends the worker's receive loop after the requests
+        // it already accepted are answered.
+        let worker = self.worker.take();
+        CatalogShutdown {
+            path: self.path.clone(),
+            worker,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -292,10 +351,12 @@ impl Catalog {
         F: for<'a> FnOnce(&'a mut Connection) -> StorageResult<T> + Send + 'static,
     {
         let (reply, pending) = mpsc::channel::<StorageResult<T>>();
+        let completion = Arc::clone(&self.completion);
         let request: Request = Box::new(move |connection| {
             let outcome = connection.and_then(f);
             // A dropped Pending is a cancelled read, not a worker failure.
             let _ = reply.send(outcome);
+            notify_completion(&completion);
         });
         match self.requests.try_send(request) {
             Ok(()) => Ok(Pending {
@@ -678,7 +739,70 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year + i64::from(month <= 2), month, day)
 }
 
-fn run_worker(path: PathBuf, queue: Receiver<Request>) {
+/// Pollable handle for the catalog worker's graceful exit, returned by
+/// [`Catalog::shutdown`]. The request queue is already closed, so the worker
+/// answers accepted requests and exits on its own; this handle only decides when
+/// the join happens.
+pub struct CatalogShutdown {
+    path: PathBuf,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl CatalogShutdown {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// True while the worker still has accepted work to finish.
+    pub fn is_running(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Non-blocking reap: joins only when the worker already finished. Returns
+    /// true once the worker is gone, so a UI can poll this each frame instead of
+    /// waiting on the thread.
+    pub fn try_finish(&mut self) -> bool {
+        let Some(handle) = self.worker.as_ref() else {
+            return true;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        if let Some(handle) = self.worker.take() {
+            // A panicking worker already delivered its terminal event through the
+            // dropped reply channel; the join result carries nothing else.
+            let _ = handle.join();
+        }
+        true
+    }
+
+    /// Blocking join. Call this from a non-UI thread, or only after
+    /// [`CatalogShutdown::try_finish`] reported the worker gone.
+    pub fn join(mut self) {
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn notify_completion(completion: &Mutex<Option<CompletionNotifier>>) {
+    let callback = lock(completion).clone();
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+fn run_worker(
+    path: PathBuf,
+    queue: Receiver<Request>,
+    completion: Arc<Mutex<Option<CompletionNotifier>>>,
+) {
     match open_catalog(&path) {
         Ok(mut connection) => {
             while let Ok(request) = queue.recv() {
@@ -694,6 +818,240 @@ fn run_worker(path: PathBuf, queue: Receiver<Request>) {
             }
         }
     }
+    // The queue just ended: wake anyone waiting for one more reply.
+    notify_completion(&completion);
+}
+
+/// What an existing catalog file turned out to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogIdentity {
+    /// No database content yet: this build may create the catalog.
+    Fresh,
+    /// This application's catalog, at the version the file declares.
+    Owned { user_version: i64 },
+}
+
+const SQLITE_HEADER_LEN: usize = 100;
+const SQLITE_HEADER_USER_VERSION: usize = 60;
+const SQLITE_HEADER_APPLICATION_ID: usize = 68;
+
+struct FileHeader {
+    user_version: i64,
+    application_id: i64,
+}
+
+/// Reads the fixed SQLite header fields without opening the database, so a hot
+/// journal is neither replayed nor ignored and no `immutable=1` shortcut is
+/// needed. A missing or zero-length file is `None`; anything unreadable,
+/// truncated or not SQLite is refused.
+fn read_header(path: &Path) -> StorageResult<Option<FileHeader>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(StorageError::new(
+                StorageCategory::Io,
+                Some(path),
+                format!("could not read the catalog header: {err}"),
+            ));
+        }
+    };
+    let mut header = [0u8; SQLITE_HEADER_LEN];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+            if length == 0 {
+                return Ok(None);
+            }
+            return Err(StorageError::new(
+                StorageCategory::InvalidSchema,
+                Some(path),
+                format!(
+                    "the existing catalog file is only {length} bytes long, which is too short to be an SQLite database; refusing to overwrite it"
+                ),
+            ));
+        }
+        Err(err) => {
+            return Err(StorageError::new(
+                StorageCategory::Io,
+                Some(path),
+                format!("could not read the catalog header: {err}"),
+            ));
+        }
+    }
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(StorageError::new(
+            StorageCategory::InvalidSchema,
+            Some(path),
+            "the existing catalog file is not an SQLite database; refusing to overwrite it",
+        ));
+    }
+    let mut version_bytes = [0u8; 4];
+    version_bytes
+        .copy_from_slice(&header[SQLITE_HEADER_USER_VERSION..SQLITE_HEADER_USER_VERSION + 4]);
+    let mut id_bytes = [0u8; 4];
+    id_bytes
+        .copy_from_slice(&header[SQLITE_HEADER_APPLICATION_ID..SQLITE_HEADER_APPLICATION_ID + 4]);
+    Ok(Some(FileHeader {
+        user_version: i64::from(i32::from_be_bytes(version_bytes)),
+        application_id: i64::from(i32::from_be_bytes(id_bytes)),
+    }))
+}
+
+/// Recognizes an existing catalog through a **read-only** connection, before any
+/// write-capable open can recover a journal or modify the file. Foreign, legacy,
+/// incomplete and newer databases are refused here.
+///
+/// If the file is provably this build's catalog but cannot be read read-only
+/// (typically a hot journal left by a crash, which only a writable connection may
+/// roll back), recognition reports [`CatalogIdentity::Owned`] and lets the
+/// caller open it writable — the follow-up revalidation covers the risk.
+fn recognize_catalog(path: &Path) -> StorageResult<CatalogIdentity> {
+    let Some(header) = read_header(path)? else {
+        return Ok(CatalogIdentity::Fresh);
+    };
+    if header.application_id != 0 && header.application_id != i64::from(APPLICATION_ID) {
+        return Err(StorageError::new(
+            StorageCategory::InvalidSchema,
+            Some(path),
+            format!(
+                "this database belongs to another application (application_id 0x{:08X}); refusing to use or modify it",
+                header.application_id
+            ),
+        ));
+    }
+    if header.user_version > SCHEMA_VERSION {
+        return Err(StorageError::new(
+            StorageCategory::InvalidSchema,
+            Some(path),
+            format!(
+                "the catalog uses schema version {}, but this build supports {SCHEMA_VERSION}; refusing to downgrade it",
+                header.user_version
+            ),
+        ));
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = match Connection::open_with_flags(path, flags) {
+        Ok(connection) => connection,
+        Err(err) => {
+            if header.application_id == i64::from(APPLICATION_ID) {
+                return Ok(CatalogIdentity::Owned {
+                    user_version: header.user_version,
+                });
+            }
+            return Err(StorageError::new(
+                StorageCategory::InvalidSchema,
+                Some(path),
+                format!(
+                    "the existing database is not recognized as this build's catalog and cannot be read read-only ({err}); a legacy or foreign database is refused instead of being recovered or modified"
+                ),
+            ));
+        }
+    };
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|err| db_error("could not apply the 5 second busy timeout", Some(path), err))?;
+    // SQLite defers journal handling until the first statement, so a hot journal
+    // on our own catalog surfaces here as a database/I-O failure rather than at
+    // open. Only this build's application id may take that path to a writable
+    // open; a latent schema objection still refuses before any write.
+    let inspected = (|| -> StorageResult<CatalogIdentity> {
+        let identity = inspect_identity(&connection, path)?;
+        if let CatalogIdentity::Owned { user_version } = identity
+            && user_version == SCHEMA_VERSION
+        {
+            verify_catalog_schema(&connection, path)?;
+        }
+        Ok(identity)
+    })();
+    drop(connection);
+    match inspected {
+        Ok(identity) => {
+            if header.application_id == i64::from(APPLICATION_ID)
+                && identity == CatalogIdentity::Fresh
+            {
+                return Err(StorageError::new(
+                    StorageCategory::InvalidSchema,
+                    Some(path),
+                    "the catalog file changed while it was being recognized; refusing to initialize it",
+                ));
+            }
+            Ok(identity)
+        }
+        Err(error)
+            if header.application_id == i64::from(APPLICATION_ID)
+                && matches!(
+                    error.category(),
+                    StorageCategory::Database | StorageCategory::Io
+                ) =>
+        {
+            // Our own catalog cannot be inspected read-only, which is what a hot
+            // journal or WAL left by a crash looks like. Rollback needs a writable
+            // connection, and the follow-up revalidation proves identity and
+            // schema again.
+            Ok(CatalogIdentity::Owned {
+                user_version: header.user_version,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Identity, version and emptiness of the database behind `connection`.
+fn inspect_identity(connection: &Connection, path: &Path) -> StorageResult<CatalogIdentity> {
+    let application_id = pragma_i64(connection, "application_id")?;
+    let version = pragma_i64(connection, "user_version")?;
+    if application_id != 0 && application_id != i64::from(APPLICATION_ID) {
+        return Err(StorageError::new(
+            StorageCategory::InvalidSchema,
+            Some(path),
+            format!(
+                "this database belongs to another application (application_id 0x{application_id:08X}); refusing to use or modify it"
+            ),
+        ));
+    }
+    if application_id == 0 {
+        let objects = schema_objects(connection)?;
+        if !objects.is_empty() {
+            let names: Vec<String> = objects
+                .iter()
+                .take(6)
+                .map(|object| format!("{} {}", object.kind, object.name))
+                .collect();
+            return Err(StorageError::new(
+                StorageCategory::InvalidSchema,
+                Some(path),
+                format!(
+                    "unrecognized existing database with {} schema objects and no VFX Launcher application id ({}); a legacy or foreign database is refused and left untouched",
+                    objects.len(),
+                    names.join(", ")
+                ),
+            ));
+        }
+        if version != 0 {
+            return Err(StorageError::new(
+                StorageCategory::InvalidSchema,
+                Some(path),
+                format!(
+                    "the existing database has no schema objects but declares user_version {version}; it is incomplete or foreign, so it is refused instead of initialized"
+                ),
+            ));
+        }
+        return Ok(CatalogIdentity::Fresh);
+    }
+    if version > SCHEMA_VERSION {
+        return Err(StorageError::new(
+            StorageCategory::InvalidSchema,
+            Some(path),
+            format!(
+                "the catalog uses schema version {version}, but this build supports {SCHEMA_VERSION}; refusing to downgrade it"
+            ),
+        ));
+    }
+    Ok(CatalogIdentity::Owned {
+        user_version: version,
+    })
 }
 
 fn open_catalog(path: &Path) -> StorageResult<Connection> {
@@ -710,7 +1068,7 @@ fn open_catalog(path: &Path) -> StorageResult<Connection> {
             StorageCategory::RefusedLocation,
             Some(path),
             format!(
-                "the catalog must be local; this path is on a {file_system} network mount ({}), and SQLite over a network share is not a supported writable mode",
+                "the catalog must be local; this path is on a {file_system} network target ({}), and SQLite over a network share is not a supported writable mode",
                 mount_point.display()
             ),
         ));
@@ -726,6 +1084,10 @@ fn open_catalog(path: &Path) -> StorageResult<Connection> {
             })?;
         }
     }
+
+    // Recognize through a read-only connection first: nothing may repair,
+    // recover or rewrite the file before it is known to be ours.
+    let identity = recognize_catalog(path)?;
 
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
@@ -745,8 +1107,25 @@ fn open_catalog(path: &Path) -> StorageResult<Connection> {
             "foreign key enforcement could not be enabled on this connection",
         ));
     }
-    // Recognize the database before changing its persistent journal mode.
-    prepare_schema(&mut connection, path)?;
+
+    // Revalidate on the connection that may write: recovery may have run and
+    // another process may have replaced the file between the two opens. This
+    // narrows the window; it is not a race-proof guarantee.
+    let opened = inspect_identity(&connection, path)?;
+    match (identity, opened) {
+        (CatalogIdentity::Fresh, CatalogIdentity::Fresh) => migrate(&mut connection, 0, path)?,
+        (CatalogIdentity::Owned { .. }, CatalogIdentity::Owned { user_version }) => {
+            migrate(&mut connection, user_version, path)?;
+        }
+        _ => {
+            return Err(StorageError::new(
+                StorageCategory::InvalidSchema,
+                Some(path),
+                "the catalog file changed between recognition and the writable open; refusing to use it",
+            ));
+        }
+    }
+    verify_catalog_schema(&connection, path)?;
     if location.local {
         connection
             .pragma_update(None, "journal_mode", "WAL")
@@ -761,50 +1140,6 @@ fn open_catalog(path: &Path) -> StorageResult<Connection> {
         }
     }
     Ok(connection)
-}
-
-/// Recognizes the catalog before touching it: refuses foreign/legacy databases,
-/// migrates older catalogs transactionally and verifies a current one.
-fn prepare_schema(connection: &mut Connection, path: &Path) -> StorageResult<()> {
-    let application_id = pragma_i64(connection, "application_id")?;
-    let version = pragma_i64(connection, "user_version")?;
-    if application_id != 0 && application_id != i64::from(APPLICATION_ID) {
-        return Err(StorageError::new(
-            StorageCategory::InvalidSchema,
-            Some(path),
-            format!(
-                "this database belongs to another application (application_id 0x{application_id:08X}); refusing to use or modify it"
-            ),
-        ));
-    }
-    if application_id == 0 {
-        let tables = user_tables(connection)?;
-        if !tables.is_empty() {
-            return Err(StorageError::new(
-                StorageCategory::InvalidSchema,
-                Some(path),
-                format!(
-                    "unrecognized existing database with {} tables and no VFX Launcher application id ({}); a legacy or foreign database is refused and left untouched",
-                    tables.len(),
-                    tables.join(", ")
-                ),
-            ));
-        }
-        // An empty file: create this application's catalog.
-        migrate(connection, 0, path)?;
-        return verify_tables(connection, path);
-    }
-    if version > SCHEMA_VERSION {
-        return Err(StorageError::new(
-            StorageCategory::InvalidSchema,
-            Some(path),
-            format!(
-                "the catalog uses schema version {version}, but this build supports {SCHEMA_VERSION}; refusing to downgrade it"
-            ),
-        ));
-    }
-    migrate(connection, version, path)?;
-    verify_tables(connection, path)
 }
 
 /// Applies schema steps newer than `from` inside one transaction, including the
@@ -861,38 +1196,156 @@ fn migrate(connection: &mut Connection, from: i64, path: &Path) -> StorageResult
         .map_err(|err| db_error("could not commit the catalog schema", Some(path), err))
 }
 
-fn user_tables(connection: &Connection) -> StorageResult<Vec<String>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )
-        .map_err(|err| db_error("could not read the catalog table list", None, err))?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|err| db_error("could not read the catalog table list", None, err))?;
-    let mut names = Vec::new();
-    for row in rows {
-        names.push(row.map_err(|err| db_error("could not read a catalog table name", None, err))?);
-    }
-    Ok(names)
+/// One `sqlite_schema` object with its DDL normalized for comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SchemaObject {
+    kind: String,
+    name: String,
+    table: String,
+    sql: String,
 }
 
-fn verify_tables(connection: &Connection, path: &Path) -> StorageResult<()> {
-    let present: HashSet<String> = user_tables(connection)?.into_iter().collect();
-    let missing: Vec<&str> = EXPECTED_TABLES
-        .iter()
-        .copied()
-        .filter(|name| !present.contains(*name))
-        .collect();
-    if missing.is_empty() {
+/// Every non-internal schema object: tables, indexes, views and triggers. Used
+/// both for the canonical comparison and to decide whether an unidentified
+/// database is empty.
+fn schema_objects(connection: &Connection) -> StorageResult<Vec<SchemaObject>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .map_err(|err| db_error("could not read the catalog schema objects", None, err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                kind: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                table: row.get::<_, String>(2)?,
+                sql: row.get::<_, String>(3)?,
+            })
+        })
+        .map_err(|err| db_error("could not read the catalog schema objects", None, err))?;
+    let mut objects = Vec::new();
+    for row in rows {
+        let mut object =
+            row.map_err(|err| db_error("could not read a catalog schema object", None, err))?;
+        object.sql = normalize_sql(&object.sql);
+        objects.push(object);
+    }
+    Ok(objects)
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Canonical object list for the current schema version, built in memory from the
+/// same migration steps a new catalog runs. Comparing against it checks tables,
+/// columns, constraints and indexes — not just table names.
+fn canonical_schema_objects(path: &Path) -> StorageResult<Vec<SchemaObject>> {
+    let connection = Connection::open_in_memory().map_err(|err| {
+        db_error(
+            "could not build the canonical schema for comparison",
+            Some(path),
+            err,
+        )
+    })?;
+    for (version, statements) in SCHEMA_STEPS {
+        if *version > SCHEMA_VERSION {
+            break;
+        }
+        connection.execute_batch(statements).map_err(|err| {
+            db_error(
+                "could not build the canonical schema for comparison",
+                Some(path),
+                err,
+            )
+        })?;
+    }
+    schema_objects(&connection)
+}
+
+/// Strict canonical comparison plus `PRAGMA foreign_key_check` for a recognized
+/// current-version catalog.
+fn verify_catalog_schema(connection: &Connection, path: &Path) -> StorageResult<()> {
+    let actual = schema_objects(connection)?;
+    let canonical = canonical_schema_objects(path)?;
+    let mut differences: Vec<String> = Vec::new();
+    for expected in &canonical {
+        match actual
+            .iter()
+            .find(|object| object.kind == expected.kind && object.name == expected.name)
+        {
+            None => differences.push(format!("missing {} `{}`", expected.kind, expected.name)),
+            Some(found) if found != expected => differences.push(format!(
+                "{} `{}` does not match its canonical definition",
+                expected.kind, expected.name
+            )),
+            Some(_) => {}
+        }
+    }
+    for found in &actual {
+        if !canonical
+            .iter()
+            .any(|object| object.kind == found.kind && object.name == found.name)
+        {
+            differences.push(format!(
+                "unexpected {} `{}` on {}",
+                found.kind, found.name, found.table
+            ));
+        }
+    }
+    if !differences.is_empty() {
+        let shown: Vec<String> = differences.iter().take(6).cloned().collect();
+        let more = differences.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        return Err(StorageError::new(
+            StorageCategory::InvalidSchema,
+            Some(path),
+            format!(
+                "the catalog schema does not match schema version {SCHEMA_VERSION}: {}{suffix}",
+                shown.join("; ")
+            ),
+        ));
+    }
+    verify_foreign_keys(connection, path)
+}
+
+fn verify_foreign_keys(connection: &Connection, path: &Path) -> StorageResult<()> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|err| db_error("could not check the catalog references", Some(path), err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|err| db_error("could not check the catalog references", Some(path), err))?;
+    let mut violations = 0usize;
+    let mut examples = Vec::new();
+    for row in rows {
+        let (table, rowid, parent) =
+            row.map_err(|err| db_error("could not check the catalog references", Some(path), err))?;
+        violations += 1;
+        if examples.len() < 5 {
+            examples.push(format!("{table} row {rowid:?} has no {parent} row"));
+        }
+    }
+    if violations == 0 {
         return Ok(());
     }
     Err(StorageError::new(
         StorageCategory::InvalidSchema,
         Some(path),
         format!(
-            "the catalog schema is incomplete; missing tables: {}",
-            missing.join(", ")
+            "the catalog has {violations} foreign key violation(s): {}",
+            examples.join("; ")
         ),
     ))
 }
@@ -951,25 +1404,11 @@ fn db_error(context: &str, path: Option<&Path>, error: rusqlite::Error) -> Stora
     StorageError::new(category, path, format!("{context}: {cause}"))
 }
 
-/// Table set created by schema version 1; used to detect a truncated or foreign
-/// catalog that carries our application id.
-const EXPECTED_TABLES: &[&str] = &[
-    "users",
-    "projects",
-    "project_scan_folders",
-    "files",
-    "project_files",
-    "favorites",
-    "recents",
-    "file_access_log",
-    "user_activity_log",
-    "import_origins",
-    "import_origin_rows",
-    "operation_runs",
-    "operation_items",
-];
-
 /// Ordered schema steps: `(user_version after the step, statements)`.
+///
+/// These statements are also the canonical definition a recognized catalog is
+/// compared against, so the text of a released step must never be edited: a
+/// schema change is a new step and a new `SCHEMA_VERSION`.
 const SCHEMA_STEPS: &[(i64, &str)] = &[(1, SCHEMA_V1)];
 
 /// Minimum catalog schema (`CONTRACTS.md` §3). Native path columns are
@@ -1176,13 +1615,75 @@ fn classify_location(path: &Path) -> TargetLocation {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn classify_location(path: &Path) -> TargetLocation {
-    // Windows drive types and non-Linux Unix mounts are not inspected here: the
-    // path alone cannot certify a local target, so WAL is not imposed and the
-    // limitation is reported instead of guessed.
+    // Non-Linux Unix mounts are not inspected here: the path alone cannot certify
+    // a local target, so WAL is not imposed and the limitation is reported
+    // instead of guessed.
     let _ = path;
     TargetLocation::unknown()
+}
+
+/// `GetDriveTypeW` return values (winbase/fileapi documentation; the constants
+/// are macros, so windows-sys does not export them).
+#[cfg(windows)]
+const DRIVE_UNKNOWN: u32 = 0;
+#[cfg(windows)]
+const DRIVE_NO_ROOT_DIR: u32 = 1;
+#[cfg(windows)]
+const DRIVE_REMOVABLE: u32 = 2;
+#[cfg(windows)]
+const DRIVE_FIXED: u32 = 3;
+#[cfg(windows)]
+const DRIVE_REMOTE: u32 = 4;
+#[cfg(windows)]
+const DRIVE_CDROM: u32 = 5;
+#[cfg(windows)]
+const DRIVE_RAMDISK: u32 = 6;
+
+/// Windows: UNC and verbatim-UNC spellings are refused by spelling, and a drive
+/// letter is asked for its drive type. Only `DRIVE_FIXED` counts as a verified
+/// local volume, `DRIVE_REMOTE` (a mapped network volume) is refused, and every
+/// other answer — removable/CD-ROM/RAM disk/unknown/invalid root — stays
+/// unknown, which means no WAL is claimed.
+#[cfg(windows)]
+fn classify_location(path: &Path) -> TargetLocation {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => TargetLocation {
+                local: false,
+                network: Some(("UNC".to_string(), path.to_path_buf())),
+            },
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                let root = format!("{}:\\", char::from(letter));
+                let wide: Vec<u16> = std::ffi::OsStr::new(&root)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives
+                // the call, as GetDriveTypeW requires.
+                match unsafe { GetDriveTypeW(wide.as_ptr()) } {
+                    DRIVE_FIXED => TargetLocation {
+                        local: true,
+                        network: None,
+                    },
+                    DRIVE_REMOTE => TargetLocation {
+                        local: false,
+                        network: Some(("mapped network volume".to_string(), PathBuf::from(root))),
+                    },
+                    DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR | DRIVE_REMOVABLE | DRIVE_CDROM
+                    | DRIVE_RAMDISK => TargetLocation::unknown(),
+                    _ => TargetLocation::unknown(),
+                }
+            }
+            Prefix::DeviceNS(_) | Prefix::Verbatim(_) => TargetLocation::unknown(),
+        },
+        _ => TargetLocation::unknown(),
+    }
 }
 
 #[cfg(target_os = "linux")]
