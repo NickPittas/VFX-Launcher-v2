@@ -17,6 +17,7 @@ pub mod config;
 pub mod discovery;
 pub mod jobs;
 pub mod launch;
+pub mod nuke;
 pub mod paths;
 pub mod project_workspace;
 pub mod projects;

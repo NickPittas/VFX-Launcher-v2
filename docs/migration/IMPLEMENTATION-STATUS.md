@@ -1,5 +1,17 @@
 # Implementation status
 
+## S2 Nuke content generator integrated
+
+`nuke.rs` ports the FolderStructurer template as pure script text/bytes generation,
+with fps, dimensions/presets, proxy and ACES settings, named sequence or independent
+shot targets, script versions and Sphere/Kent comp roots. Legacy template blocks
+were compared by the implementation agent; the coordinator read back the source.
+No filesystem writer or Nuke launcher is involved, and this is not wired into the
+Shots & Sequences UI yet. Names requiring Nuke-token escaping are currently
+refused, and comp-root paths still rely on final operation-plan containment
+validation. Header/layout stay legacy values. These limitations need review.
+No Nuke acceptance or whole-document runtime parity is claimed; no tests ran.
+
 ## Source-root and Move revalidation integration
 
 Integrated the isolated executor packet for original Kimi findings 2 and 4.
