@@ -1,0 +1,28 @@
+[package]
+name = "vfx-launcher"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "VFX Launcher desktop application (Rust/egui migration)"
+publish = false
+
+[lib]
+name = "vfx_launcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vfx-launcher"
+path = "src/main.rs"
+
+[dependencies]
+# glow instead of the default wgpu renderer: smaller dependency surface and the
+# renderer the plan targets for Linux/Windows. wayland+x11 for Linux sessions.
+eframe = { version = "=0.37.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
+egui_extras = { version = "=0.37.0", default-features = false }
