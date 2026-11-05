@@ -12,7 +12,7 @@ use crate::{
     discovery::{Coverage, FileEntry, RootContinuity, ScanPurpose, ScanSnapshot},
     paths::{self, PathCategory, PathError, PathIssue, PathKey, PathRelation},
     storage::{
-        CURRENT_PLATFORM, Catalog, PathColumns, Pending, StorageCategory, StorageError,
+        CURRENT_PLATFORM, CatalogClient, PathColumns, Pending, StorageCategory, StorageError,
         StorageResult, utc_timestamp_now,
     },
 };
@@ -378,6 +378,33 @@ pub struct SourceEvidence {
     pub root_identity: Option<NativeIdentity>,
     pub root_modified_ns: Option<u64>,
     pub issues: Vec<IssueSummary>,
+}
+
+/// One existing destination directory observed while validating a plan.
+///
+/// `identity` is `None` when that stat snapshot carried no comparable evidence
+/// (Windows `volume_serial_number`/`file_index` unavailable, for example). Missing
+/// or incomparable evidence is unknown, never agreement. Directory modification
+/// time is deliberately absent: creating children inside a directory changes it
+/// without changing the directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEvidence {
+    /// Native spelling of the directory, tagged so non-UTF-8 spellings round trip.
+    pub path: StoredPath,
+    pub identity: Option<NativeIdentity>,
+}
+
+/// Review-time evidence about the destination a plan writes into: the reviewed
+/// root identity plus every ancestor directory that already existed and is needed
+/// by a reviewed item, recorded once each. Directories the plan creates are
+/// ordinary [`PlannedAction::CreateDirectory`] actions and gain an identity only
+/// when execution creates them, which is a later packet's job.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DestinationEvidence {
+    pub observed_at: String,
+    /// `None` when the root stat carried no comparable evidence: unknown, not agreed.
+    pub root_identity: Option<NativeIdentity>,
+    pub ancestors: Vec<DirectoryEvidence>,
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +900,9 @@ pub struct ValidationReport {
     pub warnings: Vec<String>,
     /// Plan-level refusal cause; every action is then reported blocked.
     pub refusal: Option<String>,
+    /// Review-time destination evidence; `None` only when the plan was refused
+    /// before the destination could be inspected at all.
+    pub destination_evidence: Option<DestinationEvidence>,
 }
 
 /// Validation-bound plan. Only [`validate_plan`] constructs it, and its fields
@@ -881,6 +911,7 @@ pub struct ValidatedPlan {
     plan: OperationPlan,
     items: Vec<ItemValidation>,
     warnings: Vec<String>,
+    destination_evidence: DestinationEvidence,
 }
 
 impl ValidatedPlan {
@@ -911,6 +942,12 @@ impl ValidatedPlan {
 
     pub fn destination_root(&self) -> &Path {
         self.plan.destination_root_path()
+    }
+
+    /// Read-only review-time destination evidence for the future executor: the
+    /// reviewed root identity and every existing ancestor it has to revalidate.
+    pub fn destination_evidence(&self) -> &DestinationEvidence {
+        &self.destination_evidence
     }
 }
 
@@ -949,6 +986,11 @@ struct Validator<'a> {
     executing_destination_identities: Vec<(usize, NativeIdentity)>,
     destinations: HashSet<PathKey>,
     executing_destinations: Vec<(usize, PathKey)>,
+    /// Observable identity of the destination root as reviewed in this pass.
+    root_identity: Option<NativeIdentity>,
+    /// Existing ancestors already recorded, so each is captured exactly once.
+    ancestors: HashSet<PathKey>,
+    ancestor_evidence: Vec<DirectoryEvidence>,
     warnings: Vec<String>,
 }
 
@@ -1000,6 +1042,18 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
     if let Err(error) = paths::inspect_root(destination_root) {
         return refused_report(plan, format!("destination root cannot be used: {error}"));
     }
+    // The reviewed root identity is destination evidence, not a courtesy: without it
+    // a later pass cannot tell the reviewed root from a different directory at the
+    // same spelling, so the plan is refused here instead of being journaled blind.
+    let root_identity = match fs::metadata(destination_root) {
+        Ok(meta) => identity_of(&meta),
+        Err(error) => {
+            return refused_report(
+                plan,
+                format!("destination root identity cannot be inspected: {error}"),
+            );
+        }
+    };
 
     let source_root_key = match plan.source_root.as_ref() {
         Some(source_root) => {
@@ -1130,6 +1184,9 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
         executing_destination_identities: Vec::new(),
         destinations: HashSet::new(),
         executing_destinations: Vec::new(),
+        root_identity,
+        ancestors: HashSet::new(),
+        ancestor_evidence: Vec::new(),
         warnings,
     };
     validator.index_directories();
@@ -1150,12 +1207,30 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
             ReviewState::Blocked => counts.blocked += 1,
         }
     }
-    let warnings = validator.warnings;
+    let destination_evidence = validator.destination_evidence();
+    let mut warnings = validator.warnings;
+    let unproven_ancestors = destination_evidence
+        .ancestors
+        .iter()
+        .filter(|ancestor| ancestor.identity.is_none())
+        .count();
+    if unproven_ancestors > 0 {
+        warnings.push(format!(
+            "{unproven_ancestors} reviewed destination folder(s) carry no comparable identity evidence; they cannot be proven unchanged before execution"
+        ));
+    }
+    if destination_evidence.root_identity.is_none() {
+        warnings.push(
+            "the destination root carries no comparable identity evidence; its continuity cannot be proven before execution"
+                .to_string(),
+        );
+    }
     let ready = if counts.blocked == 0 {
         Some(ValidatedPlan {
             plan: plan.clone(),
             items: items.clone(),
             warnings: warnings.clone(),
+            destination_evidence: destination_evidence.clone(),
         })
     } else {
         None
@@ -1167,6 +1242,7 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
         space_unknown: true,
         warnings,
         refusal: None,
+        destination_evidence: Some(destination_evidence),
     }
 }
 
@@ -1202,10 +1278,42 @@ fn refused_report(plan: &OperationPlan, reason: impl Into<String>) -> Validation
         space_unknown: true,
         warnings: plan.warnings.clone(),
         refusal: Some(reason),
+        destination_evidence: None,
     }
 }
 
 impl<'a> Validator<'a> {
+    /// Records one existing destination ancestor exactly once. Only directories a
+    /// reviewed item actually needs are captured, and the identity stays `None`
+    /// when this stat snapshot carried none: unknown is never treated as agreement.
+    fn record_ancestor(
+        &mut self,
+        key: PathKey,
+        path: &Path,
+        identity: Option<NativeIdentity>,
+    ) -> Result<(), String> {
+        if !self.ancestors.insert(key) {
+            return Ok(());
+        }
+        let path = StoredPath::from_native(path, self.destination_root)
+            .map_err(|error| error.message().to_string())?;
+        self.ancestor_evidence
+            .push(DirectoryEvidence { path, identity });
+        Ok(())
+    }
+
+    /// The destination evidence this pass observed, with ancestors in a stable
+    /// order so an unchanged destination produces an unchanged envelope.
+    fn destination_evidence(&self) -> DestinationEvidence {
+        let mut ancestors = self.ancestor_evidence.clone();
+        ancestors.sort_by(|a, b| a.path.spelling().cmp(b.path.spelling()));
+        DestinationEvidence {
+            observed_at: utc_timestamp_now(),
+            root_identity: self.root_identity,
+            ancestors,
+        }
+    }
+
     fn index_directories(&mut self) {
         for (index, action) in self.plan.actions.iter().enumerate() {
             if !matches!(action, PlannedAction::CreateDirectory { .. }) {
@@ -1326,6 +1434,13 @@ impl<'a> Validator<'a> {
             ),
             Some(meta) if meta.is_dir() => {
                 if self.plan.add_to_existing {
+                    if let Err(reason) = self.record_ancestor(
+                        destination_key.clone(),
+                        &destination,
+                        identity_of(&meta),
+                    ) {
+                        return self.blocked(index, action, reason);
+                    }
                     self.ready(
                         index,
                         action,
@@ -1744,7 +1859,7 @@ impl<'a> Validator<'a> {
         ))
     }
 
-    fn check_parent_chain(&self, relative: &Path, index: usize) -> Result<(), String> {
+    fn check_parent_chain(&mut self, relative: &Path, index: usize) -> Result<(), String> {
         let mut components = relative.components().peekable();
         let mut prefix = PathBuf::new();
         while let Some(component) = components.next() {
@@ -1781,7 +1896,10 @@ impl<'a> Validator<'a> {
                 }
             }
             match fs::symlink_metadata(&parent) {
-                Ok(meta) if meta.is_dir() => continue,
+                Ok(meta) if meta.is_dir() => {
+                    self.record_ancestor(key, &parent, identity_of(&meta))?;
+                    continue;
+                }
                 Ok(meta) if meta.file_type().is_symlink() => {
                     return Err(format!(
                         "parent {} is a symbolic link; containment cannot be proven",
@@ -2187,7 +2305,9 @@ impl RunTerminal {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunCounts {
-    /// Bytes committed by successful item outcomes; None for older unknown data.
+    /// Bytes committed to the destination. Includes outcomes that installed the
+    /// reviewed destination and then failed or were cancelled; None for older
+    /// unknown data, which never becomes zero by assumption.
     #[serde(default)]
     pub committed_bytes: Option<u64>,
     pub total: usize,
@@ -2211,22 +2331,20 @@ impl RunCounts {
     }
 
     fn add_bytes(&mut self, state: ItemState, event: Option<&ItemEvent>) {
-        if matches!(
-            state,
-            ItemState::Copied
-                | ItemState::Moved
-                | ItemState::Created
-                | ItemState::CopiedSourceRetained
-        ) {
-            self.committed_bytes = self
-                .committed_bytes
-                .zip(
-                    event
-                        .filter(|event| event.state == state)
-                        .and_then(|event| event.committed_bytes),
-                )
-                .and_then(|(total, bytes)| total.checked_add(bytes));
+        // Every terminal outcome can have written the destination, including a
+        // failure or cancellation after a complete install, so all of them count.
+        // A recorded event without a byte count is older unknown data: the total
+        // then stays unknown instead of silently becoming zero.
+        if !state.is_terminal() {
+            return;
         }
+        let Some(event) = event.filter(|event| event.state == state) else {
+            return;
+        };
+        self.committed_bytes = self
+            .committed_bytes
+            .zip(event.committed_bytes)
+            .and_then(|(total, bytes)| total.checked_add(bytes));
     }
     fn add(&mut self, state: ItemState, count: usize) {
         self.total += count;
@@ -2263,6 +2381,36 @@ impl RunInspection {
     }
 }
 
+/// Append-only progress step for an item that is already `Running`. These record
+/// intent, not outcomes: they carry no committed bytes, never make the item
+/// terminal and must move forward in the order declared here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemCheckpoint {
+    /// About to write the operation-owned staging file.
+    Staging,
+    /// Staging file written, flushed and checked; nothing installed yet.
+    Staged,
+    /// About to move the reviewed existing destination to its numbered path.
+    Displacing,
+    /// Destination installed by the no-clobber commit.
+    Installed,
+    /// About to remove the source of a Move.
+    RemovingSource,
+}
+
+impl ItemCheckpoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Staged => "staged",
+            Self::Displacing => "displacing",
+            Self::Installed => "installed",
+            Self::RemovingSource => "removing_source",
+        }
+    }
+}
+
 /// One appended journal event for an item. Earlier events are never dropped, so
 /// recovery paths reported mid-run survive later terminal updates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2274,6 +2422,10 @@ pub struct ItemEvent {
     /// Committed destination bytes, not attempted or staged bytes.
     #[serde(default)]
     pub committed_bytes: Option<u64>,
+    /// Progress checkpoint carried by a `Running` event; `None` for outcome events
+    /// and for events written before checkpoints existed.
+    #[serde(default)]
+    pub checkpoint: Option<ItemCheckpoint>,
 }
 
 impl ItemEvent {
@@ -2301,6 +2453,10 @@ struct RunEnvelope {
     intent: OperationPlan,
     items: Vec<ItemValidation>,
     warnings: Vec<String>,
+    /// Review-time destination evidence. Absent in envelopes written before this
+    /// field existed; that absence is reported as unknown and never as agreement.
+    #[serde(default)]
+    destination_evidence: Option<DestinationEvidence>,
     #[serde(default)]
     result: Option<RunResultSummary>,
 }
@@ -2347,6 +2503,13 @@ pub struct RunInspection {
     pub intent: Option<OperationPlan>,
     pub reviewed_items: Vec<ItemValidation>,
     pub warnings: Vec<String>,
+    /// Review-time destination evidence; `None` when the run predates it (see
+    /// [`RunInspection::destination_evidence_missing`]).
+    pub destination_evidence: Option<DestinationEvidence>,
+    /// Set when the run predates review-time destination evidence. That is a
+    /// legacy limitation, not corruption: the run stays inspectable and may be
+    /// finalized or marked interrupted, but it can never start.
+    pub destination_evidence_missing: bool,
     pub result: Option<RunResultSummary>,
     pub detail_error: Option<String>,
     pub items: Vec<ItemInspection>,
@@ -2384,7 +2547,7 @@ impl JournaledPlan {
 /// single catalog transaction. Callers must await the reply before X1b may
 /// touch the filesystem.
 pub fn persist_validated_intent(
-    catalog: &Catalog,
+    catalog: &CatalogClient,
     validated: ValidatedPlan,
 ) -> StorageResult<Pending<JournaledPlan>> {
     catalog.transaction(move |tx| {
@@ -2399,6 +2562,7 @@ fn insert_intent(tx: &mut Transaction<'_>, validated: &ValidatedPlan) -> Storage
         intent: validated.plan.clone(),
         items: validated.items.clone(),
         warnings: validated.warnings.clone(),
+        destination_evidence: Some(validated.destination_evidence.clone()),
         result: None,
     };
     let detail = serde_json::to_string(&envelope)
@@ -2459,10 +2623,18 @@ fn insert_intent(tx: &mut Transaction<'_>, validated: &ValidatedPlan) -> Storage
 
 /// Marks a pending run running. Only `pending -> running` is accepted; every
 /// other state is a state-machine violation with a readable cause.
-pub fn mark_run_running(catalog: &Catalog, run_id: i64) -> StorageResult<Pending<RunCounts>> {
+pub fn mark_run_running(catalog: &CatalogClient, run_id: i64) -> StorageResult<Pending<RunCounts>> {
     catalog.transaction(move |tx| {
         let envelope = load_run_envelope(tx, run_id)?;
         verify_reviewed_items(tx, run_id, &envelope)?;
+        // A journal written before destination evidence existed cannot be
+        // revalidated against the destination it reviewed, so it may be inspected
+        // and finalized but never started. No older run can become executable.
+        if envelope.destination_evidence.is_none() {
+            return Err(invalid(format!(
+                "operation run {run_id} recorded no destination root/ancestor evidence; its reviewed destinations cannot be revalidated, so it may not start"
+            )));
+        }
         let affected = tx
             .execute(
                 "UPDATE operation_runs SET state='running' WHERE id=?1 AND state='pending'",
@@ -2489,11 +2661,56 @@ pub fn mark_run_running(catalog: &Catalog, run_id: i64) -> StorageResult<Pending
 /// Records one item outcome after its filesystem step. Terminal items are never
 /// overwritten; a recorded event is appended so prior recovery paths survive.
 pub fn update_item_outcome(
-    catalog: &Catalog,
+    catalog: &CatalogClient,
     run: &JournaledPlan,
     ordinal: i64,
     state: ItemState,
     committed_bytes: u64,
+    message: Option<String>,
+    recovery: &[PathBuf],
+) -> StorageResult<Pending<()>> {
+    record_item_event(
+        catalog,
+        run,
+        ordinal,
+        state,
+        committed_bytes,
+        None,
+        message,
+        recovery,
+    )
+}
+
+/// Appends one append-only progress checkpoint for an item that is already
+/// `Running` (or still `Pending`, which the checkpoint starts). The item stays
+/// unfinished, the event records no committed bytes, and earlier events are kept.
+pub fn append_item_checkpoint(
+    catalog: &CatalogClient,
+    run: &JournaledPlan,
+    ordinal: i64,
+    checkpoint: ItemCheckpoint,
+    message: Option<String>,
+    recovery: &[PathBuf],
+) -> StorageResult<Pending<()>> {
+    record_item_event(
+        catalog,
+        run,
+        ordinal,
+        ItemState::Running,
+        0,
+        Some(checkpoint),
+        message,
+        recovery,
+    )
+}
+
+fn record_item_event(
+    catalog: &CatalogClient,
+    run: &JournaledPlan,
+    ordinal: i64,
+    state: ItemState,
+    committed_bytes: u64,
+    checkpoint: Option<ItemCheckpoint>,
     message: Option<String>,
     recovery: &[PathBuf],
 ) -> StorageResult<Pending<()>> {
@@ -2541,33 +2758,48 @@ pub fn update_item_outcome(
             || destination.as_deref() != reviewed.destination.as_ref().map(StoredPath::spelling) {
             return Err(invalid("item path rows disagree with the journaled review"));
         }
-        item_transition(current, state, reviewed.effect).map_err(invalid)?;
-        check_committed_bytes(&reviewed, state, committed_bytes).map_err(invalid)?;
-        write_item_event(
-            tx,
-            run_id,
-            ordinal,
-            existing_message,
+        item_transition(current, state, reviewed.effect, checkpoint).map_err(invalid)?;
+        let event = ItemEvent {
+            recorded_at: utc_timestamp_now(),
             state,
-            committed_bytes,
             message,
-            &recovery,
-        )?;
+            recovery,
+            committed_bytes: Some(committed_bytes),
+            checkpoint,
+        };
+        check_event(&reviewed, &event).map_err(invalid)?;
+        write_item_event(tx, run_id, ordinal, existing_message, event)?;
         Ok(())
     })
 }
 
-fn item_transition(current: ItemState, next: ItemState, effect: ItemEffect) -> Result<(), String> {
+fn item_transition(
+    current: ItemState,
+    next: ItemState,
+    effect: ItemEffect,
+    checkpoint: Option<ItemCheckpoint>,
+) -> Result<(), String> {
     if next == ItemState::Pending {
         return Err("an item cannot move back to pending".to_string());
     }
     // The reviewed effect decides which terminal outcomes are possible: a copied
     // item can never be recorded as moved, and a skipped item is never created.
+    // `Running` is not an outcome: it is a checkpoint that must name its step.
     let allowed = terminals_for(effect);
     if next == ItemState::Running {
         if effect == ItemEffect::Skip {
             return Err("a skipped item is never executed, so it never runs".to_string());
         }
+        if checkpoint.is_none() {
+            return Err(format!(
+                "a running update must name the checkpoint it records; use append_item_checkpoint"
+            ));
+        }
+    } else if checkpoint.is_some() {
+        return Err(format!(
+            "a {} outcome cannot carry a progress checkpoint",
+            next.as_str()
+        ));
     } else if !allowed.contains(&next) {
         return Err(format!(
             "a reviewed {:?} item cannot be recorded as {}; it allows {}",
@@ -2581,14 +2813,10 @@ fn item_transition(current: ItemState, next: ItemState, effect: ItemEffect) -> R
         ));
     }
     match current {
-        ItemState::Pending => Ok(()),
-        ItemState::Running => {
-            if next == ItemState::Running {
-                Err("the item is already running".to_string())
-            } else {
-                Ok(())
-            }
-        }
+        // A running item may append further checkpoints, but only forward ones
+        // (checked when the history is read back), and only outcomes make it
+        // terminal. Terminal outcomes themselves are never overwritten.
+        ItemState::Pending | ItemState::Running => Ok(()),
         terminal => Err(format!(
             "the item is already {}; terminal item outcomes are never overwritten",
             terminal.as_str()
@@ -2614,6 +2842,10 @@ fn terminals_for(effect: ItemEffect) -> &'static [ItemState] {
     }
 }
 
+/// A recorded byte count must be one this operation can honestly claim: the full
+/// reviewed count for a completed outcome, and zero for any state that commits no
+/// destination bytes. Failure and cancellation are handled by [`check_event`], where
+/// a complete install may be recorded but a partial staging count never is.
 fn check_committed_bytes(
     item: &ItemValidation,
     state: ItemState,
@@ -2635,6 +2867,55 @@ fn check_committed_bytes(
         ));
     }
     Ok(())
+}
+
+/// One journal event must be consistent with the reviewed item it belongs to.
+fn check_event(reviewed: &ItemValidation, event: &ItemEvent) -> Result<(), String> {
+    if event.state == ItemState::Running && event.checkpoint.is_none() {
+        return Err("a running item event must name the checkpoint it records".to_string());
+    }
+    if event.state != ItemState::Running && event.checkpoint.is_some() {
+        return Err(format!(
+            "a {} item event cannot carry a progress checkpoint",
+            event.state.as_str()
+        ));
+    }
+    let Some(bytes) = event.committed_bytes else {
+        // An event written before byte counts existed; unknown stays unknown.
+        return Ok(());
+    };
+    match event.state {
+        ItemState::Failed | ItemState::Cancelled => {
+            if bytes == 0 {
+                return Ok(());
+            }
+            // A complete install followed by a failure or cancellation (flush or
+            // cleanup, for example) may record exactly the reviewed bytes, but a
+            // partial staging count is never a committed outcome.
+            if Some(bytes) != reviewed.bytes {
+                return Err(format!(
+                    "a {} outcome records {bytes} committed bytes; only 0 or the reviewed {} bytes of a fully installed destination may be recorded",
+                    event.state.as_str(),
+                    reviewed
+                        .bytes
+                        .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+                ));
+            }
+            if event
+                .message
+                .as_deref()
+                .map_or(true, |text| text.trim().is_empty())
+                && event.recovery.is_empty()
+            {
+                return Err(format!(
+                    "a {} outcome that installed {bytes} reviewed bytes must explain the failure or name a recovery path",
+                    event.state.as_str()
+                ));
+            }
+            Ok(())
+        }
+        _ => check_committed_bytes(reviewed, event.state, bytes),
+    }
 }
 
 /// Reads the intent envelope of one run inside a transaction.
@@ -2737,19 +3018,26 @@ fn write_item_event(
     run_id: i64,
     ordinal: i64,
     existing_message: Option<String>,
-    state: ItemState,
-    committed_bytes: u64,
-    message: Option<String>,
-    recovery: &[StoredPath],
+    event: ItemEvent,
 ) -> StorageResult<()> {
     let mut envelope = parse_item_envelope(existing_message, run_id, ordinal)?;
-    envelope.events.push(ItemEvent {
-        recorded_at: utc_timestamp_now(),
-        state,
-        message,
-        recovery: recovery.to_vec(),
-        committed_bytes: Some(committed_bytes),
-    });
+    if let (Some(previous), Some(next)) = (
+        envelope
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| event.checkpoint),
+        event.checkpoint,
+    ) {
+        if next <= previous {
+            return Err(invalid(format!(
+                "progress checkpoint {} was already recorded or precedes the last one; checkpoints only move forward",
+                next.as_str()
+            )));
+        }
+    }
+    let state = event.state;
+    envelope.events.push(event);
     let text = serde_json::to_string(&envelope)
         .map_err(|error| db_error("could not encode the item envelope", error))?;
     let affected = tx
@@ -2799,7 +3087,7 @@ fn parse_item_envelope(
 /// items stay completed. The intent envelope is preserved and only the result
 /// section is added.
 pub fn finalize_run(
-    catalog: &Catalog,
+    catalog: &CatalogClient,
     run_id: i64,
     terminal: RunTerminal,
 ) -> StorageResult<Pending<RunSummary>> {
@@ -2900,10 +3188,14 @@ fn cancel_unfinished_items(tx: &Transaction<'_>, run_id: i64) -> StorageResult<(
             run_id,
             ordinal,
             message,
-            ItemState::Cancelled,
-            0,
-            Some("run cancelled before this item completed".to_string()),
-            &[],
+            ItemEvent {
+                recorded_at: utc_timestamp_now(),
+                state: ItemState::Cancelled,
+                message: Some("run cancelled before this item completed".to_string()),
+                recovery: Vec::new(),
+                committed_bytes: Some(0),
+                checkpoint: None,
+            },
         )?;
     }
     Ok(())
@@ -2912,7 +3204,9 @@ fn cancel_unfinished_items(tx: &Transaction<'_>, run_id: i64) -> StorageResult<(
 /// Marks every pending/running run interrupted, for startup recovery. Item
 /// states are left untouched for inspection. Idempotent, and it never deletes
 /// or replays anything.
-pub fn mark_unfinished_interrupted(catalog: &Catalog) -> StorageResult<Pending<InterruptReport>> {
+pub fn mark_unfinished_interrupted(
+    catalog: &CatalogClient,
+) -> StorageResult<Pending<InterruptReport>> {
     catalog.transaction(|tx| {
         let run_ids: Vec<i64> = {
             let mut statement = tx
@@ -2950,7 +3244,7 @@ pub fn mark_unfinished_interrupted(catalog: &Catalog) -> StorageResult<Pending<I
 
 /// Reads every unfinished or interrupted run with its intent, evidence, item
 /// states and recovery paths. Inspection only.
-pub fn read_incomplete_runs(catalog: &Catalog) -> StorageResult<Pending<Vec<RunInspection>>> {
+pub fn read_incomplete_runs(catalog: &CatalogClient) -> StorageResult<Pending<Vec<RunInspection>>> {
     catalog.submit(|connection| {
         let run_ids: Vec<i64> = {
             let mut statement = connection
@@ -2978,7 +3272,10 @@ pub fn read_incomplete_runs(catalog: &Catalog) -> StorageResult<Pending<Vec<RunI
 }
 
 /// Reads one run whatever its state, for recovery inspection.
-pub fn read_run(catalog: &Catalog, run_id: i64) -> StorageResult<Pending<Option<RunInspection>>> {
+pub fn read_run(
+    catalog: &CatalogClient,
+    run_id: i64,
+) -> StorageResult<Pending<Option<RunInspection>>> {
     catalog.submit(move |connection| load_run(connection, run_id))
 }
 
@@ -3013,6 +3310,7 @@ fn load_run(
     let mut intent = None;
     let mut reviewed_items = Vec::new();
     let mut warnings = Vec::new();
+    let mut destination_evidence = None;
     let mut result = None;
     let mut detail_error = None;
     match detail {
@@ -3026,6 +3324,7 @@ fn load_run(
                 intent = Some(envelope.intent);
                 reviewed_items = envelope.items;
                 warnings = envelope.warnings;
+                destination_evidence = envelope.destination_evidence;
                 result = envelope.result;
             }
             Ok(envelope) => {
@@ -3055,6 +3354,8 @@ fn load_run(
         intent,
         reviewed_items,
         warnings,
+        destination_evidence,
+        destination_evidence_missing: false,
         result,
         detail_error,
         items,
@@ -3183,6 +3484,12 @@ fn check_inspection(run: &mut RunInspection) {
             "journal item count disagrees with reviewed actions".into(),
         );
     }
+    if run.destination_evidence.is_none() {
+        // Reported as its own flag, never as corruption: a journal written before
+        // review-time evidence existed stays inspectable, finalizable and
+        // interruptible, and only `mark_run_running` refuses to execute it.
+        run.destination_evidence_missing = true;
+    }
     let mut counts = RunCounts::empty();
     for (index, item) in run.items.iter_mut().enumerate() {
         counts.add(item.state, 1);
@@ -3233,12 +3540,18 @@ fn check_inspection(run: &mut RunInspection) {
             );
         }
         let mut previous = ItemState::Pending;
+        let mut last_checkpoint: Option<ItemCheckpoint> = None;
         for event in &item.events {
-            let checked = item_transition(previous, event.state, reviewed.effect).and_then(|()| {
-                event.committed_bytes.map_or(Ok(()), |bytes| {
-                    check_committed_bytes(reviewed, event.state, bytes)
-                })
-            });
+            let checked = item_transition(previous, event.state, reviewed.effect, event.checkpoint)
+                .and_then(|()| check_event(reviewed, event))
+                .and_then(|()| match (last_checkpoint, event.checkpoint) {
+                    (Some(previous), Some(next)) if next <= previous => Err(format!(
+                        "checkpoint {} was appended after {}; progress checkpoints only move forward",
+                        next.as_str(),
+                        previous.as_str()
+                    )),
+                    _ => Ok(()),
+                });
             if let Err(error) = checked {
                 append_issue(
                     &mut item.message_error,
@@ -3247,6 +3560,9 @@ fn check_inspection(run: &mut RunInspection) {
                 break;
             }
             previous = event.state;
+            if event.checkpoint.is_some() {
+                last_checkpoint = event.checkpoint;
+            }
         }
         if item.state.is_terminal() && !terminals_for(reviewed.effect).contains(&item.state) {
             append_issue(

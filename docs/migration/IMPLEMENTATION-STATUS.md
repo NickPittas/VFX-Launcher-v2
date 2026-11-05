@@ -1432,3 +1432,278 @@ initial widths and trailing free space; columns stay resizable. The native build
 passed and a disposable-data manual session confirmed 003→001 selection and
 Information showing comp_v001.nk, plus normal exit. Actual screenshots and limits
 are in NATIVE-PROJECTS-WORKFLOW.md. No tests or DCC/reveal launches occurred.
+
+## Packet X1b prerequisites — destination evidence, checkpoints, honest accounting (2026-11-05)
+
+Prerequisite work only. No filesystem executor, no UI, no copy/rename/delete loop, no
+journal replay was added. `rust/src/transfers.rs` and `rust/src/storage.rs` were
+the only code touched; `docs/migration/CONTRACTS.md` sections 3 and 6 record the
+resulting contract.
+
+### 1. Destination root and ancestor evidence
+
+- New `DirectoryEvidence { path: StoredPath, identity: Option<NativeIdentity> }`
+  and `DestinationEvidence { observed_at: String, root_identity: Option<NativeIdentity>,
+  ancestors: Vec<DirectoryEvidence> }`. Directory modification time is deliberately
+  not recorded: creating children changes it without changing the directory.
+- `validate_plan` now stats the destination root once (after the existing
+  `paths::inspect_root` proof) and refuses the plan with a readable cause when the
+  root identity cannot be inspected, instead of journaling a plan whose destination
+  cannot be revalidated later.
+- `Validator::record_ancestor` captures the identity of each *existing* ancestor an
+  item needs, deduplicated by `PathKey`, from the `symlink_metadata` that
+  `check_parent_chain` already performed, and again for an existing directory
+  accepted by add-to-existing. No extra stat was added on any item path, and nothing
+  is stat-ed inside the catalog worker: capture happens on the validating caller
+  thread only.
+- Unchanged shape rule kept: directories the plan creates remain ordinary
+  `CreateDirectory` actions (identity at execution time is a later packet's job).
+- `ValidatedPlan` carries the evidence privately and exposes
+  `destination_evidence()` read-only for the future executor; `ValidationReport`
+  also reports it so review can show partial evidence.
+- Persistence: `RunEnvelope` gained `#[serde(default)] destination_evidence:
+  Option<DestinationEvidence>` and `insert_intent` writes it. Version stays
+  `RUN_ENVELOPE_VERSION = 1`, so an envelope written before this packet still
+  deserializes with `None`, and inspection reports that explicitly instead of
+  treating it as agreement:
+  `RunInspection.destination_evidence`, plus a `detail_error` in `check_inspection`
+  ("reviewed destination root/ancestor evidence is missing ...") when the field is
+  absent.
+- `mark_run_running` refuses any run whose envelope has no destination evidence, so
+  no older journal can become executable or be replayed; finalization and
+  interruption marking stay lenient so existing rows remain inspectable.
+- Warning (not a silent gap): ancestors or a root whose snapshot carries no
+  comparable identity produce an explicit review warning that their continuity
+  cannot be proven, and unknown is never read as agreement.
+
+### 2. Append-only `Running -> Running` checkpoints
+
+- New `ItemCheckpoint { Staging, Staged, Displacing, Installed, RemovingSource }`
+  with declaration-order monotonicity and `as_str`.
+- `ItemEvent` gained `#[serde(default)] checkpoint: Option<ItemCheckpoint>`.
+- New `append_item_checkpoint(catalog, run, ordinal, checkpoint, message, recovery)`
+  appends a `Running` event with no committed bytes. `update_item_outcome` keeps its
+  signature and now rejects `ItemState::Running` ("a running update must name the
+  checkpoint it records"), so the two paths cannot be confused.
+- `item_transition(current, next, effect, checkpoint)` accepts
+  `Pending|Running -> Running` only with a checkpoint, refuses a checkpoint on any
+  outcome, keeps per-effect terminal whitelists, and keeps terminal states immutable.
+- Readback (`check_inspection`) verifies the same rules per event, that a checkpoint
+  event carries zero bytes, that no checkpoint follows a terminal state, and that
+  checkpoints only move forward. Recovery paths stay append-only; nothing rewrites
+  earlier events.
+
+### 3. Honest totals for failed/cancelled items
+
+- `check_event` accepts, for `Failed`/`Cancelled`, committed bytes of either `0` or
+  exactly the reviewed byte count (a complete install followed by a flush or cleanup
+  failure), rejects any other number with a message naming both numbers, and
+  requires a non-empty message or at least one recovery path whenever the recorded
+  count is nonzero. Partial staging bytes are never accepted as committed.
+- `RunCounts::add_bytes` now totals committed bytes for every terminal outcome, not
+  only the successful ones. A recorded event without a byte count keeps the total
+  unknown (`None`) rather than turning it into zero, so old data stays unknown.
+- No table or schema change: `CopiedSourceRetained` is still Move-only
+  (`terminals_for`) and a run whose items are all retained sources can still finish
+  Failed, so `SCHEMA_VERSION` stays 1 and the existing columns carry the new data.
+
+### 4. SQLite WAL with `synchronous = FULL`
+
+- `open_catalog` sets `synchronous = FULL` (2) on the single writable connection
+  after the `journal_mode = WAL` switch that is only applied to a provably local
+  target, verifies the effective level, and fails with a `StorageError` if the level
+  cannot be confirmed.
+- `CatalogInfo` exposes `synchronous: i64` next to `journal_mode`, documented as
+  per-connection configuration evidence for a local file, not a network or
+  power-loss guarantee. Read-only-first recognition of an existing catalog is
+  unchanged.
+
+### 5. Limits recorded, not new approval flows
+
+Contract text in `CONTRACTS.md` section 6 now states, for the executor that follows:
+request-only single-worker/single-connection catalog access (never UI queue,
+UI transaction or coercion delegation, no admission/shutdown/UI API),
+handle-anchored no-follow operations with immediate revalidation and atomic
+no-clobber install, no claim against a hostile privileged namespace or mount change,
+nested mounts failing closed below the explicitly selected destination root (the
+root itself may be a mount), namespace durability as platform/filesystem-conditional
+with source retention when it cannot be established, POSIX permission bits and mtime
+preserved with Windows ACL preservation explicitly not claimed, detectable failures
+surfaced before commit, and SQLite plus filesystem treated as non-atomic with
+interrupted-state inspection only and no automatic replay or cleanup.
+
+### Exact API surface added or changed
+
+- `transfers::DirectoryEvidence`, `transfers::DestinationEvidence`
+  (both `Serialize + Deserialize`, the latter with `#[serde(default)]` in storage).
+- `ValidatedPlan::destination_evidence() -> &DestinationEvidence` (read-only).
+- `ValidationReport.destination_evidence: Option<DestinationEvidence>`.
+- `transfers::ItemCheckpoint` + `ItemCheckpoint::as_str`.
+- `ItemEvent.checkpoint: Option<ItemCheckpoint>` (public field, serde default).
+- `transfers::append_item_checkpoint(catalog, run, ordinal, checkpoint, message, recovery)`.
+- `RunInspection.destination_evidence: Option<DestinationEvidence>`.
+- `storage::CatalogInfo.synchronous: i64`.
+- Unchanged public signatures: `update_item_outcome`, `mark_run_running`,
+  `finalize_run`, `persist_validated_intent`, `read_run`, `read_incomplete_runs`,
+  `mark_unfinished_interrupted`, `validate_plan`, `persist_validated_intent`.
+
+### Verification actually performed
+
+- `cargo check --offline --locked --lib --bin vfx-launcher` with
+  `CARGO_HOME=artifacts/verification/cargo-home`, `CARGO_TARGET_DIR=rust/target`,
+  `TMPDIR=artifacts/verification/tmp`, hard 30s process limit: passes, no warnings
+  (1.01s, then 0.56s after formatting).
+- `cargo fmt -- --check` then `cargo fmt` on the same workspace: clean; the only
+  reformatted hunk was one line of the new `record_ancestor`.
+- Source readback of every changed hunk: evidence dedup and ordering, the
+  `add_to_existing` capture, the `Pending|Running -> Running` whitelist, forward-only
+  checkpoint ordering, failed/cancelled byte rules, byte totals over all terminal
+  states, the `mark_run_running` evidence gate, and the `CatalogInfo` pragma read.
+- Nothing was run against a real catalog, no database was opened, no filesystem
+  copy/rename/delete was performed, and no tests were written or executed.
+
+### Unsolved limits from this packet
+
+- Windows directory identity comes from `symlink_metadata`, which does not populate
+  `volume_serial_number`/`file_index`; on Windows the ancestor and destination-root
+  evidence is therefore usually `None` and reported as unknown. Handle-based
+  identity belongs to the executor packet, not this one.
+- The evidence is a snapshot, not a reservation: between review and execution the
+  root can be remounted or replaced, and only a future executor's immediate
+  revalidation can detect it.
+- `DestinationEvidence` records no filesystem type or mount identity, so a
+  different filesystem mounted at the same spelling with identical identity evidence
+  would not be distinguishable; that is the platform limit the contract states.
+- Checkpoint completeness is enforced when events are read, not by the filesystem
+  steps themselves (there are none yet), and no automatic compaction of the event
+  list exists.
+- No executor, no UI display of the new evidence or checkpoints, and no code path
+  yet consumes `append_item_checkpoint` or `destination_evidence()`.
+
+## Packet X1b-2 — request-only catalog handle, worker-only wait, lenient legacy runs (2026-11-05)
+
+Completion of the X1b prerequisites. Still no executor, no UI work, no copy/rename/
+delete loop and no journal replay. `rust/src/storage.rs` and `rust/src/transfers.rs`
+were the only code touched; `docs/migration/CONTRACTS.md` §3 and §6 record the
+durability and admission wording. The prerequisite work in the previous packet
+(`synchronous = FULL`/`EXTRA`, the checkpoint regression guard, destination
+evidence, honest totals) is preserved, not rewritten.
+
+### 1. Cloneable request-only `CatalogClient` sharing the one worker
+
+- `Catalog` now owns `{ client: CatalogClient, worker: Option<JoinHandle<()>> }`.
+  `CatalogClient` is `Clone` over one `Arc<ClientShared>` that holds the path, the
+  *single* `SyncSender` behind `Mutex<Option<...>>`, and the completion notifier.
+  Cloning therefore shares the same bounded queue, the same notifier and the same
+  `rusqlite::Connection`; it never starts a second worker and never opens a second
+  connection.
+- The request API moved to the handle: `path`, `set_completion_notifier`, `info`,
+  `submit`, `transaction`, `transaction_or_rollback`. `impl Deref for Catalog
+  { type Target = CatalogClient }` keeps every existing `&Catalog` caller
+  (`projects`, `project_workspace`, `app`, `config`) source-identical; the owner's
+  user-record methods still call `self.submit(...)` through that deref, and
+  `Catalog::client() -> CatalogClient` hands the future executor a request-only
+  handle.
+- Admission is the owner's alone. `close_admission` takes the single sender out
+  under the lock, called by `Catalog::shutdown` and by `impl Drop for Catalog`.
+  After that every live clone's `submit` returns
+  `StorageCategory::WorkerGone` ("the catalog is closed…") instead of queueing,
+  reopening the channel or blocking; the worker answers what it already accepted
+  and exits. A dropped `Catalog` does not join (a drop on the UI thread must not
+  wait); `shutdown` remains the pollable/joinable exit. If the worker itself
+  vanished, `submit`'s `Disconnected` case also closes admission, so clones stop
+  accreting requests nothing will answer.
+- Bound kept: the queue is untouched (`REQUEST_QUEUE_BOUND`, `try_send` only); the
+  admission lock is held only for that immediate `try_send`, so UI submission
+  still never waits, and a full queue still reports `QueueFull`.
+
+### 2. `Pending::wait` for worker threads only
+
+- Consuming `wait(self) -> StorageResult<T>` blocks on the reply channel and
+  cannot deliver a reply twice; a disconnected channel is reported as the worker
+  having stopped, never as an invented value. It is documented as worker-only —
+  never an egui frame and never a catalog worker (that would deadlock) — with
+  `try_poll` as the UI/catalog path. Nothing in the app calls it yet.
+
+### 3. Transfer journal APIs take the request-only handle
+
+- `persist_validated_intent`, `mark_run_running`, `update_item_outcome`,
+  `append_item_checkpoint`, `finalize_run`, `mark_unfinished_interrupted`,
+  `read_incomplete_runs` and `read_run` now take `&CatalogClient`. `&Catalog`
+  coerces through the deref, so existing callers (and any future `Catalog`-based
+  one) are unchanged, while the executor can call them with a cloned handle and no
+  UI queue or transaction delegation.
+
+### 4. Legacy runs: missing destination evidence is a warning, not corruption
+
+This corrects a contradiction in the previous packet, which claimed "inspectable
+and finalizable but never startable" while `check_inspection` wrote
+`detail_error` for a missing evidence field and `verify_reviewed_items` refuses
+any `detail_error` — so `finalize_run` and `mark_unfinished_interrupted` both
+rejected exactly the old runs they claimed to accept.
+
+- `RunInspection` gained `destination_evidence_missing: bool`, set by
+  `check_inspection` from `destination_evidence.is_none()`. Nothing else is
+  appended to `detail_error`, so a pre-evidence journal keeps a clean inspection.
+- `mark_run_running` keeps its own explicit gate on the envelope, so a legacy run
+  still can never start. `finalize_run` and `mark_unfinished_interrupted` now
+  succeed for it, and corruption diagnostics are unchanged for genuinely corrupt
+  journals (broken envelope, item count mismatch, impossible transitions).
+
+### 5. Checkpoint write guard now matches the readback rule
+
+`write_item_event` rejected only `next < previous`, while inspection rejects
+`next <= previous`; appending the same checkpoint twice was therefore accepted on
+write and then reported as an inconsistent journal on read. The write guard is
+strict (`next <= previous`) with a message naming the repeated step. The forward-
+only rule, append-only events and retained recovery paths are otherwise unchanged.
+
+### Correcting the previous packet's §4
+
+`open_catalog` does not set `FULL` unconditionally: it sets `FULL` (2) when the
+connection is in WAL (only ever on a provably local target) and `EXTRA` (3) when
+it stays in rollback mode so journal removal is synced too, verifies the effective
+level, and re-reads it into `CatalogInfo.synchronous`. The contract now says that.
+
+### Exact API surface added or changed
+
+- `storage::CatalogClient` (`Clone`) with `path`, `set_completion_notifier`,
+  `info`, `submit`, `transaction`, `transaction_or_rollback`.
+- `Catalog::client() -> CatalogClient`; `impl Deref for Catalog`; `impl Drop for
+  Catalog` (closes admission only, never joins).
+- `storage::Pending::wait(self) -> StorageResult<T>`.
+- `transfers::RunInspection.destination_evidence_missing: bool`.
+- Signature change: the eight journal functions above take `&CatalogClient`.
+- Unchanged: `validate_plan`, `ValidatedPlan`, `DestinationEvidence`,
+  `ItemCheckpoint`, `ItemEvent`, the run/item states, every `Catalog` method
+  outside the request API, and every schema object (`SCHEMA_VERSION` stays 1,
+  `RUN_ENVELOPE_VERSION` stays 1).
+
+### Verification actually performed
+
+- `cargo check --offline --locked --lib --bin vfx-launcher` with
+  `CARGO_HOME=artifacts/verification/cargo-home`,
+  `CARGO_TARGET_DIR=rust/target`, `TMPDIR=artifacts/verification/tmp`, hard 30s
+  process limit: passes, no warnings (0.49s after formatting).
+- `rustfmt --edition 2024 src/storage.rs src/transfers.rs`, then
+  `rustfmt --check` on both: clean (two functions rewrapped to the width rule).
+- Source readback of every changed hunk: the single-sender admission `Option` and
+  its lock scope around `try_send`, `close_admission` callers (`shutdown`, `Drop`,
+  `Disconnected`), `Deref` keeping `self.submit` resolution in the owner, `wait`'s
+  closed-channel error, the eight `&CatalogClient` signatures, the
+  `destination_evidence_missing` set/init pair, `mark_run_running`'s separate gate,
+  and the strict `next <= previous` guard against the readback rule.
+- Nothing was run against a real catalog, no database was opened, no filesystem
+  operation was performed, and no tests were written or executed.
+
+### Unsolved limits from this packet
+
+- Admission close is one-way per opened catalog: a clone that lost admission
+  cannot be revived, and the app must reopen the catalog (as `project_workspace`
+  already does for a failed open).
+- `Pending::wait` cannot detect misuse on the UI thread or inside the catalog
+  worker; that is documented, not enforced.
+- The old-journal path is lenient by design, so a finished-but-inconsistent legacy
+  run remains visible as inconsistent rather than being repaired.
+- `RunInspection.destination_evidence_missing` has no UI surface yet, and no code
+  path consumes `Catalog::client()`.

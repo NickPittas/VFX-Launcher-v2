@@ -29,18 +29,23 @@
 //! - the recognized schema is compared against the canonical schema built from
 //!   the migration steps, so objects, columns, constraints and indexes are all
 //!   checked, not just table names;
-//! - the worker's thread handle is retained. [`Catalog::shutdown`] closes the
-//!   request queue and returns a pollable handle, so accepted work drains and the
-//!   join happens off the UI thread;
+//! - the worker's thread handle is retained and admission belongs to it:
+//!   [`Catalog::shutdown`], or dropping the owner, clears the single queue handle
+//!   and returns a pollable handle, so accepted work drains, the worker exits and
+//!   the join happens off the UI thread;
+//! - [`CatalogClient`] is a cloneable, request-only handle to that same worker and
+//!   connection. It queues work and polls or waits for owned replies; it cannot
+//!   open a second worker, cannot touch the connection, and cannot admit work once
+//!   the owner closed admission, so a live clone never keeps the queue open;
 //! - replies can wake an idle UI through a framework-neutral completion notifier
-//!   ([`Catalog::set_completion_notifier`]) instead of requiring a poll loop;
+//!   ([`CatalogClient::set_completion_notifier`]) instead of requiring a poll loop;
 //! - paths are stored as native tagged bytes plus a separate UTF-8 display
 //!   spelling, keyed by [`PathKey::storage_bytes`]. Foreign or unresolved
 //!   spellings keep their source bytes and no key ([`PathColumns::unresolved`]).
 //!
 //! Not implemented here (later packets): legacy import (F3), transfer execution
 //! (X1). Project registration and scan reconciliation are implemented in
-//! [`crate::projects`] on top of [`Catalog::transaction`]. No
+//! [`crate::projects`] on top of [`CatalogClient::transaction`]. No
 //! provider credentials, tokens or secrets are stored in this catalog.
 
 use std::ffi::{OsStr, OsString};
@@ -48,6 +53,7 @@ use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -170,13 +176,17 @@ impl fmt::Display for StorageError {
 impl std::error::Error for StorageError {}
 
 /// Immutable description of an opened catalog, reported by
-/// [`Catalog::info`] after the worker opened it.
+/// [`CatalogClient::info`] after the worker opened it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogInfo {
     pub path: PathBuf,
     pub schema_version: i64,
     /// Effective `journal_mode` (`"wal"` only on a provably local target).
     pub journal_mode: String,
+    /// Effective `synchronous` level of the writable connection; `2` is `FULL`, the
+    /// level this build requests. Reported per connection, so it describes the one
+    /// catalog connection rather than the file.
+    pub synchronous: i64,
     pub foreign_keys: bool,
 }
 
@@ -250,6 +260,31 @@ impl<T> Pending<T> {
     pub fn is_finished(&self) -> bool {
         self.finished
     }
+
+    /// Blocks the calling thread until the worker answers and consumes the reply,
+    /// so a reply is never delivered twice.
+    ///
+    /// This is for worker threads only: never an egui frame and never a catalog
+    /// worker (a request answered by the worker that is waiting deadlocks). UI and
+    /// catalog code poll with [`Pending::try_poll`] instead. A closed channel is
+    /// reported as the worker having stopped; no value is invented.
+    pub fn wait(self) -> StorageResult<T> {
+        if self.finished {
+            return Err(StorageError::new(
+                StorageCategory::InvalidInput,
+                None,
+                "this reply was already delivered to a poll and cannot be waited on again",
+            ));
+        }
+        match self.reply.recv() {
+            Ok(outcome) => outcome,
+            Err(_) => Err(StorageError::new(
+                StorageCategory::WorkerGone,
+                None,
+                "the catalog worker stopped while this request waited for its answer",
+            )),
+        }
+    }
 }
 
 /// How a transaction closure wants its transaction to end.
@@ -262,19 +297,44 @@ pub enum TransactionOutcome<T> {
     Rollback(T),
 }
 
+/// Cloneable, request-only handle to the one catalog worker and the connection it
+/// owns. Every clone shares the same bounded queue, completion notifier and
+/// connection: cloning never starts a second worker and never opens a second
+/// [`rusqlite::Connection`], so one UI path and a future executor both submit to
+/// the single worker that owns the catalog.
+///
+/// The handle only queues work and hands back owned [`Pending`] replies; it never
+/// touches the connection. Admission is decided by the owning [`Catalog`], never
+/// by this handle and never by a clone, so a live clone cannot keep the queue open
+/// after the owner shut down or was dropped.
+#[derive(Clone)]
+pub struct CatalogClient {
+    shared: Arc<ClientShared>,
+}
+
+struct ClientShared {
+    path: PathBuf,
+    /// The only queue sender, cleared exactly once when admission closes. Keeping
+    /// one sender here instead of one per clone is what makes the close final
+    /// rather than "closed until some clone is dropped".
+    admission: Mutex<Option<SyncSender<Request>>>,
+    completion: Arc<Mutex<Option<CompletionNotifier>>>,
+}
+
 /// Handle to the catalog worker. Cheap to keep in application state; every
 /// method either queues work or opens a reply channel, never blocks on SQLite.
 ///
-/// The worker thread handle is retained: [`Catalog::shutdown`] closes the request
-/// queue, lets accepted requests finish and hands back a pollable
-/// [`CatalogShutdown`], so no UI frame ever joins a thread. Dropping the handle
-/// without calling `shutdown` still closes the queue (the worker drains what it
-/// accepted and exits), but only `shutdown` gives a joined exit.
+/// The worker thread handle is retained: [`Catalog::shutdown`] stops admission,
+/// lets accepted requests finish and hands back a pollable [`CatalogShutdown`],
+/// so no UI frame ever joins a thread. Dropping the owner stops admission too,
+/// even while clones are alive: the worker drains what it accepted and exits.
+///
+/// The request-only methods (`submit`, `transaction`, `transaction_or_rollback`,
+/// `info`, `path`, `set_completion_notifier`) live on [`CatalogClient`] and are
+/// reached through this deref, so existing `&Catalog` callers are unchanged.
 pub struct Catalog {
-    path: PathBuf,
-    requests: SyncSender<Request>,
+    client: CatalogClient,
     worker: Option<JoinHandle<()>>,
-    completion: Arc<Mutex<Option<CompletionNotifier>>>,
 }
 
 /// Framework-neutral "a reply is available" callback. The UI installs one that
@@ -286,7 +346,7 @@ type Request = Box<dyn for<'a> FnOnce(StorageResult<&'a mut Connection>) + Send 
 impl Catalog {
     /// Starts the worker for `path`. Opening, validating, migrating and
     /// configuring the database happen on the worker thread; the caller gets
-    /// only a queue handle. The open result arrives through [`Catalog::info`],
+    /// only a queue handle. The open result arrives through [`CatalogClient::info`],
     /// which is answered after the open attempt, and as the same readable error
     /// for every other queued request when the open failed.
     pub fn open(path: impl Into<PathBuf>) -> StorageResult<Self> {
@@ -306,48 +366,41 @@ impl Catalog {
                 )
             })?;
         Ok(Self {
-            path,
-            requests,
+            client: CatalogClient {
+                shared: Arc::new(ClientShared {
+                    path,
+                    admission: Mutex::new(Some(requests)),
+                    completion,
+                }),
+            },
             worker: Some(worker),
-            completion,
         })
     }
+}
 
+impl CatalogClient {
     /// Installs (or with `None` clears) the callback fired after every delivered
     /// reply and once when the worker stops, so an idle UI can be woken instead
     /// of polling. The callback runs on the catalog worker thread and must not
     /// block or call back into this catalog.
     pub fn set_completion_notifier(&self, notifier: Option<CompletionNotifier>) {
-        *lock(&self.completion) = notifier;
-    }
-
-    /// Consuming graceful shutdown: closes the request queue, so the worker
-    /// answers every already-accepted request and then exits, and returns a
-    /// handle the caller can poll ([`CatalogShutdown::try_finish`]) or join from a
-    /// non-UI thread ([`CatalogShutdown::join`]).
-    pub fn shutdown(mut self) -> CatalogShutdown {
-        // Dropping the sender ends the worker's receive loop after the requests
-        // it already accepted are answered.
-        let worker = self.worker.take();
-        CatalogShutdown {
-            path: self.path.clone(),
-            worker,
-        }
+        *lock(&self.shared.completion) = notifier;
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.shared.path
     }
 
     /// Reports the catalog the worker opened, including the effective journal
     /// mode and schema version.
     pub fn info(&self) -> StorageResult<Pending<CatalogInfo>> {
-        let path = self.path.clone();
+        let path = self.shared.path.clone();
         self.submit(move |connection| {
             Ok(CatalogInfo {
                 path: path.clone(),
                 schema_version: pragma_i64(connection, "user_version")?,
                 journal_mode: pragma_text(connection, "journal_mode")?,
+                synchronous: pragma_i64(connection, "synchronous")?,
                 foreign_keys: pragma_i64(connection, "foreign_keys")? != 0,
             })
         })
@@ -355,36 +408,55 @@ impl Catalog {
 
     /// Queues one request. `f` runs on the worker thread with the catalog
     /// connection; the result is delivered through the returned [`Pending`].
+    ///
+    /// Queueing never blocks: the admission lock is held only for an immediate
+    /// `try_send`, so a bounded queue reports [`StorageCategory::QueueFull`]
+    /// instead of stalling a UI frame. A closed catalog reports
+    /// [`StorageCategory::WorkerGone`] and invents no value.
     pub fn submit<T, F>(&self, f: F) -> StorageResult<Pending<T>>
     where
         T: Send + 'static,
         F: for<'a> FnOnce(&'a mut Connection) -> StorageResult<T> + Send + 'static,
     {
         let (reply, pending) = mpsc::channel::<StorageResult<T>>();
-        let completion = Arc::clone(&self.completion);
+        let completion = Arc::clone(&self.shared.completion);
         let request: Request = Box::new(move |connection| {
             let outcome = connection.and_then(f);
             // A dropped Pending is a cancelled read, not a worker failure.
             let _ = reply.send(outcome);
             notify_completion(&completion);
         });
-        match self.requests.try_send(request) {
+        let mut admission = lock(&self.shared.admission);
+        let Some(requests) = admission.as_ref() else {
+            return Err(StorageError::new(
+                StorageCategory::WorkerGone,
+                Some(&self.shared.path),
+                "the catalog is closed; its owner shut it down, so it must be opened again",
+            ));
+        };
+        let sent = requests.try_send(request);
+        match sent {
             Ok(()) => Ok(Pending {
                 reply: pending,
                 finished: false,
             }),
             Err(TrySendError::Full(_)) => Err(StorageError::new(
                 StorageCategory::QueueFull,
-                Some(&self.path),
+                Some(&self.shared.path),
                 format!(
                     "the catalog worker already has {REQUEST_QUEUE_BOUND} requests queued; try again once it catches up"
                 ),
             )),
-            Err(TrySendError::Disconnected(_)) => Err(StorageError::new(
-                StorageCategory::WorkerGone,
-                Some(&self.path),
-                "the catalog worker stopped; the catalog must be opened again",
-            )),
+            // The worker dropped its receiver, so it is gone. Closing admission
+            // here keeps every clone from accreting requests nothing will answer.
+            Err(TrySendError::Disconnected(_)) => {
+                admission.take();
+                Err(StorageError::new(
+                    StorageCategory::WorkerGone,
+                    Some(&self.shared.path),
+                    "the catalog worker stopped; the catalog must be opened again",
+                ))
+            }
         }
     }
 
@@ -410,7 +482,7 @@ impl Catalog {
     }
 
     /// Transaction entry point for work that must be able to report "nothing was
-    /// kept" as a value: same guarantees as [`Catalog::transaction`], but the
+    /// kept" as a value: same guarantees as [`CatalogClient::transaction`], but the
     /// closure decides whether the transaction commits or rolls back. A
     /// cancellation then stays a result state instead of becoming an I/O error.
     pub fn transaction_or_rollback<T, F>(&self, f: F) -> StorageResult<Pending<T>>
@@ -437,6 +509,37 @@ impl Catalog {
                 }
             }
         })
+    }
+
+    /// Closes admission for every clone. Only the owning [`Catalog`] calls this:
+    /// the single queue handle is dropped here, so the worker answers the requests
+    /// it already accepted and then exits, and a later submission from any clone is
+    /// refused instead of reopening the queue or waiting for a clone to be dropped.
+    fn close_admission(&self) {
+        lock(&self.shared.admission).take();
+    }
+}
+
+impl Catalog {
+    /// Consuming graceful shutdown: closes admission, so no submission from the
+    /// owner or any live clone is accepted, the worker answers every
+    /// already-accepted request and then exits, and the returned handle can be
+    /// polled ([`CatalogShutdown::try_finish`]) or joined from a non-UI thread
+    /// ([`CatalogShutdown::join`]).
+    pub fn shutdown(mut self) -> CatalogShutdown {
+        self.client.close_admission();
+        let worker = self.worker.take();
+        CatalogShutdown {
+            path: self.client.path().to_path_buf(),
+            worker,
+        }
+    }
+
+    /// A cloneable, request-only handle to this catalog. It shares the worker, the
+    /// bounded queue and the connection, so nothing is duplicated; it cannot admit
+    /// work after this owner closes admission.
+    pub fn client(&self) -> CatalogClient {
+        self.client.clone()
     }
 
     pub fn list_users(&self) -> StorageResult<Pending<Vec<UserRecord>>> {
@@ -556,6 +659,25 @@ impl Catalog {
             }
             Ok(())
         })
+    }
+}
+
+impl Deref for Catalog {
+    type Target = CatalogClient;
+
+    fn deref(&self) -> &CatalogClient {
+        &self.client
+    }
+}
+
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        // Dropping the owner closes admission even while clones are alive, so the
+        // worker drains what it accepted and exits instead of waiting for a clone
+        // that may never submit again. The join is deliberately not awaited here:
+        // `shutdown` is the API that gives a pollable or joinable exit, and a drop
+        // on the UI thread must never wait for a worker.
+        self.client.close_admission();
     }
 }
 
@@ -1190,6 +1312,26 @@ fn open_catalog(path: &Path) -> StorageResult<Connection> {
                 format!("the local catalog could not be switched to WAL (journal_mode = {mode})"),
             ));
         }
+    }
+    // The catalog is the only record of what a run intended and what it already
+    // committed, so a commit must reach the filesystem before it is reported: WAL
+    // with `synchronous = FULL` (2) on this one writable connection. This is a
+    // configuration choice for a provably local file, not a network or power-loss
+    // guarantee, and no other connection inherits it.
+    let synchronous = if pragma_text(&connection, "journal_mode")?.eq_ignore_ascii_case("wal") {
+        2_i64 // FULL for WAL.
+    } else {
+        3_i64 // EXTRA also syncs journal removal in rollback mode.
+    };
+    connection
+        .pragma_update(None, "synchronous", synchronous)
+        .map_err(|err| db_error("could not set catalog durability", Some(path), err))?;
+    if pragma_i64(&connection, "synchronous")? != synchronous {
+        return Err(StorageError::new(
+            StorageCategory::Database,
+            Some(path),
+            "the catalog connection could not retain its required durability setting",
+        ));
     }
     Ok(connection)
 }
