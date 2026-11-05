@@ -37,3 +37,28 @@ and registration still completed.
 Not exercised: DCC spawning, reveal, concurrent launches, user switching during a
 launch, favorites failure, close during active work, version selection, Windows
 or macOS, real media/network roots, or any transfers. No tests or suites ran.
+
+## Version selector follow-up — 2026-11-05 22:44
+
+The corrected native build now renders one row per FileGroup and a version
+dropdown beside Launch. Its initial file column is 360 points, with trailing
+space after the data columns rather than between the filename and its controls.
+Columns remain resizable. Picks are scoped by project, timeline/shot, base and
+file type; unavailable picks fall back to the latest visible version.
+
+Actual manual observations with the same disposable catalog:
+
+- `native-version-groups.png`: TimelineA/SH010 and TimelineB/SH020 each have one
+  row, initially showing versions 003 and 002 respectively.
+- `native-version-dropdown.png`: the first group offers 003 and 001.
+- `native-version-context.png`: choosing 001 updates the row; the context menu opens.
+- `native-version-information-detail.png`: Information identifies
+  `Projects/Nuke/TimelineA/SH010/comp_v001.nk`, Version 001. Thus the file action
+  targets the selected version, not the latest file.
+- File → Quit exited normally (code 0).
+
+The earlier separate-row/version-selector limitation is fixed. This follow-up
+did not exercise launching, reveal, clipboard contents, keyboard-only selection,
+rescan invalidation, or all window sizes. Build completed without warnings under
+`timeout 30s`; input/screenshot commands used `timeout 20s`; the GUI was capped at
+180 seconds. No tests or real project data were used.

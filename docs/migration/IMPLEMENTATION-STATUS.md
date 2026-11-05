@@ -1423,3 +1423,12 @@ terminal inspection. No runtime transfer/journal exercise or tests were performe
 These small corrections have not received another independent review. The next
 packet establishes X1b native primitives and implements the executor separately;
 X1a itself still makes no filesystem writes or race-safety claim.
+
+## Projects version selector restored and exercised
+
+`app.rs` now renders one row per FileGroup, keyed version choice, latest-visible
+fallback, and selected-version file actions. File/Version/Launch have compact
+initial widths and trailing free space; columns stay resizable. The native build
+passed and a disposable-data manual session confirmed 003→001 selection and
+Information showing comp_v001.nk, plus normal exit. Actual screenshots and limits
+are in NATIVE-PROJECTS-WORKFLOW.md. No tests or DCC/reveal launches occurred.

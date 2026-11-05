@@ -9,6 +9,7 @@
 //! [`crate::project_workspace`]. The remaining views keep their explicit
 //! placeholders until their packets land; nothing here invents data.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -17,7 +18,7 @@ use crate::jobs::{JobId, JobStatus, Jobs, LIVE_POLL_INTERVAL};
 use crate::launch::Tool;
 use crate::project_workspace::{ProjectWorkspace, RegistrationStatus};
 use crate::projects::{FileGroup, FileKind, ProjectFile, ProjectList};
-use crate::storage::ProjectId;
+use crate::storage::{FileId, ProjectId};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
 const PANEL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x24, 0x25, 0x28);
@@ -158,6 +159,9 @@ pub struct VfxLauncherApp {
     /// Nuke / After Effects tab and the file filter beside it.
     file_tab: FileKind,
     file_filter: String,
+    /// Version picked per file group, so one row can stand for every version of a
+    /// group. A pick that the current view no longer offers falls back to latest.
+    version_choice: HashMap<GroupKey, FileId>,
     incoming_source: String,
     incoming_destination: String,
     incoming_move: bool,
@@ -187,6 +191,7 @@ impl VfxLauncherApp {
             project_filter: String::new(),
             file_tab: FileKind::Nuke,
             file_filter: String::new(),
+            version_choice: HashMap::new(),
             incoming_source: String::new(),
             incoming_destination: String::new(),
             incoming_move: false,
@@ -451,6 +456,7 @@ impl VfxLauncherApp {
                 &mut actions,
                 &mut self.file_tab,
                 &mut self.file_filter,
+                &mut self.version_choice,
             )
         });
 
@@ -1242,6 +1248,7 @@ fn project_files_pane(
     actions: &mut Vec<Action>,
     tab: &mut FileKind,
     filter: &mut String,
+    choices: &mut HashMap<GroupKey, FileId>,
 ) {
     let Some(project) = workspace.selected_project() else {
         empty_state(
@@ -1302,13 +1309,19 @@ fn project_files_pane(
     }
 
     let actions_enabled = workspace.actions_enabled();
+    let project_id = project.id;
+    let extension = file_kind_extension(*tab);
     let mut previous_bucket: Option<(Option<String>, Option<String>)> = None;
 
     egui_extras::TableBuilder::new(ui)
         .id_salt("project_files_table")
         .resizable(true)
-        .column(egui_extras::Column::remainder().at_least(180.0).clip(true))
-        .column(egui_extras::Column::initial(70.0).at_least(52.0).clip(true))
+        .column(
+            egui_extras::Column::initial(360.0)
+                .at_least(180.0)
+                .clip(true),
+        )
+        .column(egui_extras::Column::initial(92.0).at_least(72.0).clip(true))
         .column(egui_extras::Column::initial(78.0).at_least(66.0))
         .column(
             egui_extras::Column::initial(120.0)
@@ -1321,8 +1334,19 @@ fn project_files_pane(
                 .clip(true),
         )
         .column(egui_extras::Column::initial(90.0).at_least(60.0).clip(true))
+        // The file column keeps a fixed starting width so file, version and Launch
+        // stay together on wide windows; the free space trails the columns instead.
+        .column(egui_extras::Column::remainder())
         .header(20.0, |mut header| {
-            for title in ["File", "Version", "Launch", "Modified", "Last opened", "By"] {
+            for title in [
+                "File",
+                "Version",
+                "Launch",
+                "Modified",
+                "Last opened",
+                "By",
+                "",
+            ] {
                 header.col(|ui| {
                     ui.label(title);
                 });
@@ -1338,61 +1362,77 @@ fn project_files_pane(
                         row.col(|ui| {
                             ui.label(egui::RichText::new(label).small().weak());
                         });
-                        for _ in 0..5 {
+                        for _ in 0..6 {
                             row.col(|_ui| {});
                         }
                     });
                 }
-                for file in files.iter().copied() {
-                    body.row(22.0, |mut row| {
-                        row.col(|ui| {
-                            let name = file_name(file);
-                            let response = ui.selectable_label(false, name);
-                            let response = response.on_hover_text(file_path(file));
-                            if response.clicked() {
-                                // A single click only focuses the row; launching is the
-                                // explicit Launch control on the same line.
-                            }
-                            file_menu(ui, &response, workspace, file, actions);
-                        });
-                        row.col(|ui| {
-                            ui.label(
-                                file.version
-                                    .as_ref()
-                                    .map(|version| version.text.clone())
-                                    .unwrap_or_else(|| UNKNOWN.to_string()),
-                            );
-                        });
-                        row.col(|ui| {
-                            let tool = file.filetype.as_deref().and_then(Tool::from_filetype);
-                            let ready = actions_enabled && tool.is_some() && file.path.is_some();
-                            let button = ui.add_enabled(ready, egui::Button::new("Launch").small());
-                            if button.clicked() {
-                                actions.push(Action::Launch(file.clone()));
-                            }
-                            if !ready {
-                                let reason = if tool.is_none() {
-                                    "This file type has no configured application."
-                                } else if file.path.is_none() {
-                                    "This file has no usable path on this machine."
-                                } else {
-                                    "The catalog is not ready yet."
-                                };
-                                button.on_hover_text(reason);
-                            }
-                        });
-                        row.col(|ui| {
-                            ui.label(modified_text(file));
-                        });
-                        row.col(|ui| {
-                            ui.label(UNKNOWN)
-                                .on_hover_text("Opening history is not recorded in this build.");
-                        });
-                        row.col(|ui| {
-                            ui.label(UNKNOWN)
-                                .on_hover_text("Attribution is not recorded in this build.");
-                        });
+                let key = GroupKey::of(project_id, group, extension);
+                let Some(file) = chosen_file(choices.get(&key).copied(), group.latest, files)
+                else {
+                    continue;
+                };
+                let mut picked: Option<FileId> = None;
+                body.row(22.0, |mut row| {
+                    row.col(|ui| {
+                        let name = group.base_name.clone().unwrap_or_else(|| file_name(file));
+                        let response = ui.selectable_label(false, name);
+                        let response = response.on_hover_text(file_path(file));
+                        file_menu(ui, &response, workspace, file, actions);
                     });
+                    row.col(|ui| {
+                        if files.len() > 1 || file.version.is_some() {
+                            egui::ComboBox::from_id_salt(ui.make_persistent_id(&key))
+                                .selected_text(version_text(file))
+                                .width(70.0)
+                                .show_ui(ui, |ui| {
+                                    for candidate in files.iter().copied() {
+                                        let selected = candidate.file == file.file;
+                                        if ui
+                                            .selectable_label(selected, version_text(candidate))
+                                            .clicked()
+                                        {
+                                            picked = Some(candidate.file);
+                                        }
+                                    }
+                                });
+                        } else {
+                            ui.label(version_text(file));
+                        }
+                    });
+                    row.col(|ui| {
+                        let tool = file.filetype.as_deref().and_then(Tool::from_filetype);
+                        let ready = actions_enabled && tool.is_some() && file.path.is_some();
+                        let button = ui.add_enabled(ready, egui::Button::new("Launch").small());
+                        if button.clicked() {
+                            actions.push(Action::Launch(file.clone()));
+                        }
+                        if !ready {
+                            let reason = if tool.is_none() {
+                                "This file type has no configured application."
+                            } else if file.path.is_none() {
+                                "This file has no usable path on this machine."
+                            } else {
+                                "The catalog is not ready yet."
+                            };
+                            button.on_hover_text(reason);
+                        }
+                    });
+                    row.col(|ui| {
+                        ui.label(modified_text(file));
+                    });
+                    row.col(|ui| {
+                        ui.label(UNKNOWN)
+                            .on_hover_text("Opening history is not recorded in this build.");
+                    });
+                    row.col(|ui| {
+                        ui.label(UNKNOWN)
+                            .on_hover_text("Attribution is not recorded in this build.");
+                    });
+                    row.col(|_ui| {});
+                });
+                if let Some(picked) = picked {
+                    choices.insert(key, picked);
                 }
             }
         });
@@ -1592,9 +1632,61 @@ fn file_kind_extension(kind: FileKind) -> &'static str {
     }
 }
 
+/// Identity of one version list: a project's file group inside one file-type tab.
+/// Timeline and shot are part of it so a version picked in one bucket never
+/// shows up in another, and the project keeps picks per project.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GroupKey {
+    project: ProjectId,
+    timeline: Option<String>,
+    shot: Option<String>,
+    base: Option<String>,
+    extension: &'static str,
+}
+
+impl GroupKey {
+    fn of(project: ProjectId, group: &FileGroup, extension: &'static str) -> Self {
+        Self {
+            project,
+            timeline: group.timeline.clone(),
+            shot: group.shot.clone(),
+            base: group.base_name.clone(),
+            extension,
+        }
+    }
+}
+
+/// The version a group row shows: the stored pick while the current tab and file
+/// filter still offer it, otherwise the group's latest visible file. A pick that a
+/// rescan or refresh removed therefore falls back instead of blocking the row.
+fn chosen_file<'a>(
+    chosen: Option<FileId>,
+    latest: Option<FileId>,
+    files: &[&'a ProjectFile],
+) -> Option<&'a ProjectFile> {
+    if let Some(chosen) = chosen {
+        if let Some(file) = files.iter().copied().find(|file| file.file == chosen) {
+            return Some(file);
+        }
+    }
+    files
+        .iter()
+        .copied()
+        .find(|file| Some(file.file) == latest)
+        .or_else(|| files.first().copied())
+}
+
+fn version_text(file: &ProjectFile) -> String {
+    file.version
+        .as_ref()
+        .map(|version| version.text.clone())
+        .unwrap_or_else(|| UNKNOWN.to_string())
+}
+
 /// The rows one tab and the file filter keep. Buckets are filtered, never merged
 /// or re-grouped: each surviving group keeps its own timeline/shot label, its row
-/// order and its context menu, and an emptied group is dropped.
+/// order and its context menu, and an emptied group is dropped. The returned files
+/// are the versions the group's version selector offers.
 fn visible_groups<'a>(
     groups: &'a [FileGroup],
     kind: FileKind,

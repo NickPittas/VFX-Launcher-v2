@@ -50,7 +50,10 @@ This is the short live queue; IMPLEMENTATION-STATUS.md retains packet history.
    project, registered it, scanned it, inspected separate timeline/shot buckets,
    switched to After Effects and quit through File. Screenshots and limits are in
    NATIVE-PROJECTS-WORKFLOW.md. Native versions currently appear as separate rows;
-   restore the approved version selector before calling Projects UI complete.
+   The approved version selector has since been implemented and exercised live:
+   choosing 001 updates Information to comp_v001.nk; latest defaults and compact
+   adjacent columns were observed. See that report's follow-up. Launch/reveal and
+   the broader lifecycle cases remain unverified.
 5. Continue remaining port: legacy import, settings editing, structure/Nuke
    generation, incoming patterns/routing, extension-copy UI, backup/scheduling,
    external AI harness and final packaging/integration.
