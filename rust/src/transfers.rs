@@ -2760,6 +2760,9 @@ fn record_item_event(
             || destination.as_deref() != reviewed.destination.as_ref().map(StoredPath::spelling) {
             return Err(invalid("item path rows disagree with the journaled review"));
         }
+        if state == ItemState::Running && checkpoint.is_none() {
+            return Err(invalid("new running events require a checkpoint"));
+        }
         item_transition(current, state, reviewed.effect, checkpoint).map_err(invalid)?;
         let event = ItemEvent {
             recorded_at: utc_timestamp_now(),
@@ -2791,11 +2794,6 @@ fn item_transition(
     if next == ItemState::Running {
         if effect == ItemEffect::Skip {
             return Err("a skipped item is never executed, so it never runs".to_string());
-        }
-        if checkpoint.is_none() {
-            return Err(format!(
-                "a running update must name the checkpoint it records; use append_item_checkpoint"
-            ));
         }
     } else if checkpoint.is_some() {
         return Err(format!(
@@ -2871,11 +2869,24 @@ fn check_committed_bytes(
     Ok(())
 }
 
+fn check_install_evidence(
+    event: &ItemEvent,
+    previous: Option<ItemCheckpoint>,
+) -> Result<(), String> {
+    if matches!(event.state, ItemState::Failed | ItemState::Cancelled)
+        && event.committed_bytes.is_some_and(|bytes| bytes > 0)
+        && !matches!(
+            previous,
+            Some(ItemCheckpoint::Installed | ItemCheckpoint::RemovingSource)
+        )
+    {
+        return Err("committed bytes require an earlier installation checkpoint".into());
+    }
+    Ok(())
+}
+
 /// One journal event must be consistent with the reviewed item it belongs to.
 fn check_event(reviewed: &ItemValidation, event: &ItemEvent) -> Result<(), String> {
-    if event.state == ItemState::Running && event.checkpoint.is_none() {
-        return Err("a running item event must name the checkpoint it records".to_string());
-    }
     if event.state != ItemState::Running && event.checkpoint.is_some() {
         return Err(format!(
             "a {} item event cannot carry a progress checkpoint",
@@ -3023,6 +3034,15 @@ fn write_item_event(
     event: ItemEvent,
 ) -> StorageResult<()> {
     let mut envelope = parse_item_envelope(existing_message, run_id, ordinal)?;
+    check_install_evidence(
+        &event,
+        envelope
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| event.checkpoint),
+    )
+    .map_err(invalid)?;
     if let (Some(previous), Some(next)) = (
         envelope
             .events
@@ -3185,6 +3205,17 @@ fn cancel_unfinished_items(tx: &Transaction<'_>, run_id: i64) -> StorageResult<(
                 |row| row.get(0),
             )
             .map_err(|error| db_error("could not read the item message", error))?;
+        let history = parse_item_envelope(message.clone(), run_id, ordinal)?;
+        if history.events.iter().any(|event| {
+            matches!(
+                event.checkpoint,
+                Some(ItemCheckpoint::Installed | ItemCheckpoint::RemovingSource)
+            )
+        }) {
+            return Err(invalid(
+                "an installed item requires an explicit post-install outcome before cancellation",
+            ));
+        }
         write_item_event(
             tx,
             run_id,
@@ -3546,6 +3577,7 @@ fn check_inspection(run: &mut RunInspection) {
         for event in &item.events {
             let checked = item_transition(previous, event.state, reviewed.effect, event.checkpoint)
                 .and_then(|()| check_event(reviewed, event))
+                .and_then(|()| check_install_evidence(event, last_checkpoint))
                 .and_then(|()| match (last_checkpoint, event.checkpoint) {
                     (Some(previous), Some(next)) if next <= previous => Err(format!(
                         "checkpoint {} was appended after {}; progress checkpoints only move forward",

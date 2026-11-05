@@ -1268,6 +1268,17 @@ fn open_catalog(path: &Path) -> StorageResult<Connection> {
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut connection = Connection::open_with_flags(path, flags)
         .map_err(|err| db_error("could not open the catalog", Some(path), err))?;
+    // Configure recovery durability before the first schema read can recover a hot journal.
+    connection
+        .pragma_update(None, "synchronous", 3_i64)
+        .map_err(|err| db_error("could not configure recovery durability", Some(path), err))?;
+    if pragma_i64(&connection, "synchronous")? != 3 {
+        return Err(StorageError::new(
+            StorageCategory::Database,
+            Some(path),
+            "recovery requires synchronous=EXTRA",
+        ));
+    }
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|err| db_error("could not apply the 5 second busy timeout", Some(path), err))?;

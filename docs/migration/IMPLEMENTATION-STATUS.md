@@ -1,5 +1,17 @@
 # Implementation status
 
+## Executor prerequisite review corrections
+
+Coordinator corrected Kimi's four findings: legacy Running events without a
+checkpoint remain valid persisted history while new writes require a checkpoint;
+EXTRA durability is set and verified immediately after writable open, before
+schema reads/recovery; automatic cancellation refuses installed unfinished items
+until an explicit outcome records their actual bytes; and nonzero Failed/Cancelled
+bytes require a preceding Installed/RemovingSource checkpoint on write and read.
+Compilation passes without warnings under the 30s ceiling; rustfmt/diff checks
+pass. No tests, databases or filesystem operations were exercised. The Linux
+primitive layer compiles separately; executor orchestration is next.
+
 ## Coordinator review corrections and X1a integration check
 
 Latest Linux `cargo check --offline --locked --lib --bin vfx-launcher` passes
