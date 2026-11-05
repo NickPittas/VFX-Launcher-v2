@@ -215,6 +215,15 @@ pub fn analyze_entries(entries: &[FileEntry]) -> IncomingAnalysis {
         };
         let extension = last_extension(name.as_encoded_bytes());
         let kind = single_kind(extension);
+        let Some(name_text) = name.to_str() else {
+            unsupported.push(entry.path.clone());
+            singles.push(SingleFile {
+                file: entry.clone(),
+                kind,
+                unsupported_name: true,
+            });
+            continue;
+        };
         let Some(extension) = extension else {
             singles.push(SingleFile {
                 file: entry.clone(),
@@ -231,18 +240,6 @@ pub fn analyze_entries(entries: &[FileEntry]) -> IncomingAnalysis {
             });
             continue;
         }
-        // The gate matched a known extension, so the frame patterns would run
-        // on the name: without valid UTF-8 the name is reported unsupported
-        // instead of being analyzed through a lossy spelling.
-        let Some(name_text) = name.to_str() else {
-            unsupported.push(entry.path.clone());
-            singles.push(SingleFile {
-                file: entry.clone(),
-                kind,
-                unsupported_name: true,
-            });
-            continue;
-        };
         match extract_frame_info(name_text) {
             Some(info) => {
                 let key = GroupKey {

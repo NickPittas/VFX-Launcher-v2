@@ -9,9 +9,10 @@ historical packet reports and their superseding corrections.
    excluded an unmatched extension. See NATIVE-COPY-EVIDENCE.md. Other policies,
    cancellation and active-close cases remain unverified. Live-user gating exists;
    run actor attribution is missing from the journal schema.
-2. **Review Incoming analysis.** Exact frame grouping and file analysis are
-   integrated; source inspection corrected the middle-suffix delimiter. Routing,
-   mapping/editing and Incoming UI remain to implement. No runtime grouping pass.
+2. **Implement Incoming routing and UI.** Exact frame grouping and file analysis
+   are integrated and source-reviewed. The unsupported-name reporting finding
+   is corrected; no sequence correctness blocker was found. Mapping/editing and
+   Incoming UI remain to implement. No runtime grouping pass.
 3. **Wire Shots & Sequences and New project.** Structure planning and the Nuke
    content provider are integrated with legacy parity findings corrected.
    Preserve the approved tree editor and existing-project-only additions page.

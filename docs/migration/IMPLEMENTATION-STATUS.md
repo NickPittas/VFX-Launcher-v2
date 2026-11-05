@@ -1,5 +1,13 @@
 # Implementation status
 
+## Incoming source review correction
+
+Kimi's source review found no sequence-grouping correctness blocker and one
+unsupported-name reporting gap. Coordinator moved the UTF-8 filename check ahead
+of extension filtering, retaining native paths, stamps and extension-derived
+categories while consistently flagging all unrepresentable names. Compilation
+and formatting pass; runtime grouping, routing and Incoming UI remain unverified.
+
 ## Native Copy by File Type and Incoming analysis integration
 
 Copy by File Type now scans, selects, validates and executes through tracked jobs,
