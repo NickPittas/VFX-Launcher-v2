@@ -1,5 +1,182 @@
 # Implementation status
 
+## Coordinator review corrections and X1a integration check
+
+Latest Linux `cargo check --offline --locked --lib --bin vfx-launcher` passes
+with the completed transfer foundation included. Transfer source review still
+precedes executor implementation; there is no runtime transfer pass.
+The completed packet disclosed earlier 60–90-second process ceilings (actual
+durations at most two seconds), contrary to the 30-second instruction. The
+coordinator's repeated compile checks used a hard 30-second process limit.
+
+Small native Projects review fixes: cancellation after root-identity inspection
+now rolls back; scans with unproven continuity avoid that unnecessary stat;
+changing identity clears stale project rows; timestamp display and Information
+use signed epoch seconds with Euclidean nanosecond division; the Menu key joins
+Shift+F10 for row menus; empty-state guidance uses readable body text. All
+compile. One intermediate compile found a second timestamp caller, which was
+then updated before the passing repeat. Runtime verification remains pending.
+
+## X1a completion packet — validation, conflict proposals, journal (2026-11-05)
+
+Implemented in `rust/src/transfers.rs` only (module already exported by
+`rust/src/lib.rs`; no other source, manifest, storage or UI file changed). This
+supersedes the earlier partial X1a entry below; no filesystem executor exists
+and X1b is still not started.
+
+### Extension-copy planning
+
+- `plan_extension_copy(id, revision, &ScanSnapshot, &Path, ConflictPolicy)`
+  requires an `ExtensionCopy` scan and absolute roots. `Complete` coverage is
+  accepted; `Uncertain` mount continuity is accepted with a visible warning
+  carried into the plan; `Partial`, `Cancelled` and `RootUnavailable` refuse the
+  whole plan and name the cause (`Partial` reports the discovery issue count).
+  There is no selected-subset API yet, so a partial scan is rescanned rather
+  than trimmed by index.
+- The plan preserves the source root, a versioned `SourceEvidence` (observed
+  time, coverage, continuity, observable root identity, root mtime, every
+  discovery issue) and the scan stamp expected per file. Source/destination
+  roots must be lexically disjoint and must not be the same directory through a
+  link or mount alias; the scan's root identity is re-observed and a changed
+  identity refuses the plan.
+- Each entry maps to its exact root-relative path; entries outside the root,
+  non-plain relative spellings and duplicate entries are refused or reported.
+
+### Read-only validation
+
+- `validate_plan(&OperationPlan) -> ValidationReport` returns per-item
+  diagnostics with `reason`, counts (`total/ready/skipped/blocked`) and an
+  explicit `space_unknown`. A plan-level refusal is a named cause and every
+  action is reported blocked; `ready: Option<ValidatedPlan>` exists only when
+  nothing is blocked.
+- Checks: absolute source paths, exact containment in the declared source root,
+  source is a regular file (symlinks and special files fail closed), source and
+  destination spellings disjoint, hard link/alias evidence via
+  `paths::evidence_same_file`, source size/mtime drift against the scan stamp,
+  destination kind and stamp via `symlink_metadata` (a boolean "exists" is never
+  used), symlink or non-regular destinations refused, parent chains must exist
+  as real directories or be planned earlier, duplicate final destinations and
+  destination-is-another-item's-source chains refused.
+- Conflict policies all produce concrete proposals: `Skip` records the reviewed
+  existing destination and writes nothing; `Replace` reuses the reviewed path
+  with its stamp; `KeepBoth` numbers the incoming name (`1_stem.ext`, …);
+  `PreserveExisting` keeps the incoming at the reviewed path and numbers the
+  displaced old target the same way (legacy NAS convention). Numbering skips
+  existing files and destinations already proposed by the plan; these are
+  proposals only — X1b must reserve and commit with no-clobber writes.
+- `CreateDirectory`/`CreateFile` carry bytes, accept an existing directory only
+  for add-to-existing plans, and refuse an existing non-directory, a missing
+  parent that the plan does not create, or a parent action ordered after its
+  child. `ValidatedPlan` has private fields and is only produced here.
+
+### Lossless durable envelopes
+
+- Plan JSON never serializes `PathBuf`. `StoredPath` encodes through
+  `PathColumns::native` and decodes through `PathColumns::decode` (POSIX raw
+  bytes, Windows UTF-16LE, platform tag refused on mismatch), so non-UTF-8
+  spellings survive; `PathBuf` serde's UTF-8 failure cannot occur. No
+  `paths.rs` or `storage.rs` change was needed.
+- `persist_validated_intent(&Catalog, ValidatedPlan)` inserts one `pending` run
+  and all `pending` items in a single `Catalog::transaction`, with a versioned
+  run envelope (`intent`, reviewed items, warnings) in `operation_runs.detail`
+  and no item `message` yet. Only the existing schema columns are used. Nothing
+  mutates the filesystem; callers must await the `Pending` reply before X1b.
+
+### Journal API (`Catalog::transaction` + `Pending`)
+
+- `mark_run_running`: `pending -> running` only, affected-row enforced.
+- `update_item_outcome(run_id, ordinal, ItemState, message, recovery_paths)`:
+  requires a running run, rejects backward or repeated transitions, never
+  overwrites a terminal item, and appends a versioned event (state, message,
+  absolute recovery paths) to the item `message` envelope so earlier recovery
+  detail survives.
+- `finalize_run(run_id, RunTerminal)`: terminal counts are derived from the
+  persisted item rows, never supplied by the caller; unfinished items refuse
+  finalization; `Cancelled` first records every pending/running item cancelled
+  so completed items stay completed; a requested state that contradicts the
+  counts is refused with the reason; the intent envelope is parsed, version
+  checked and preserved, with only a `result` section added.
+- `read_incomplete_runs` / `read_run`: return intent, evidence, reviewed
+  destinations/expectations, per-item states, appended events and recovery
+  paths, plus an explicit parse error instead of discarding unrecognized
+  detail. Nothing deletes or replays.
+- `mark_unfinished_interrupted`: marks pending/running runs `interrupted` at
+  startup, item states left for inspection, idempotent.
+
+### Verification actually performed
+
+- `rustfmt --edition 2024 --check rust/src/transfers.rs`: clean.
+- `cargo check --manifest-path rust/Cargo.toml --lib` and `--bin vfx-launcher`
+  with `CARGO_HOME=artifacts/verification/cargo-home`,
+  `CARGO_TARGET_DIR=rust/target`, `TMPDIR=artifacts/verification/tmp`, each
+  under `timeout 30s`: pass, zero warnings. These commands were also run
+  earlier under a 60–90s ceiling (actual runs ≤2s); no other command exceeded
+  30s.
+- Source hand-traces only: all four conflict policies against absent/existing
+  destinations, extension-copy refusal for each non-`Complete` coverage,
+  uncertain-continuity warning path, duplicate destination and source/dest
+  chain rejection, parent-chain ordering, `pending -> running -> copied` with a
+  refused replay, cancellation retaining completed items, and the intent
+  envelope surviving finalization.
+- **No tests, no test suites, no self-check scripts, no executor or runtime
+  transfer, no production database/media/config access, no launches, no
+  screenshots, no servers, no installs, no commits/pushes/PRs.**
+
+### Deliberate limits of this packet
+
+- Validation is snapshot-only and race-prone by design; it proves no runtime
+  safety. X1b must revalidate each reviewed item and commit without clobbering.
+- Numbered KeepBoth/PreserveExisting paths are proposals, not reservations.
+- Free space is always reported unknown (no estimation implemented).
+- Bytes are recorded per reviewed item in the envelope; the schema has no byte
+  totals, so finalization returns item counts only.
+- Recovery paths must be absolute; a non-UTF-8 destination file name cannot be
+  auto-numbered and blocks that item instead of being lossy.
+- Windows-native encoding and identity branches follow the existing
+  `PathColumns`/`MetadataExt` rules but are not compiled on this Linux machine.
+- No UI caller exists yet; the APIs are shaped for the X1b executor.
+
+**Next:** X1b staged copy/move with immediate revalidation, no-clobber commit,
+metadata preservation reporting, cancellation at item boundaries and safe
+source retention. Do not claim X1 complete or runtime-verified.
+
+## X1a implementation packet (first partial attempt, 2026-11-05; superseded above)
+
+Implemented in `rust/src/transfers.rs` and exported from `rust/src/lib.rs`:
+
+- Transfer policy/action/origin and plan types; extension-copy planning accepts
+  only complete, continuity-proven `ExtensionCopy` snapshots and maps each
+  selected entry to its exact root-relative path.
+- Read-only snapshot validation checks destination confinement, duplicate
+  lexical destinations, regular-file sources, equality/nested source paths,
+  exact destination metadata outcomes, and fail-closed metadata errors. It
+  reports unknown free space. `ValidatedPlan` cannot be constructed externally.
+- `persist_intent` inserts a pending run and all pending items in one catalog
+  transaction using the schema-1 `operation_runs`/`operation_items` columns.
+  Callers must await its `Pending` reply before X1b filesystem work.
+
+The allowed `cargo check --lib` passed after `rustfmt`. This is compile evidence
+only. X1a is incomplete: per-item outcome updates, finalization, interrupted-run
+listing/startup marking, exact conflict-policy resolution, and numbered
+KeepBoth/PreserveExisting proposals are not implemented. Plan JSON currently
+uses serde path serialization and therefore does not retain non-UTF-8 paths;
+replace it with a tagged native-byte envelope before relying on durable recovery.
+Snapshot validation is race-prone by design and proves no runtime safety. No
+filesystem executor or successful-copy behavior is provided.
+
+**Next X1a/X1b packet:** finish the existing journal APIs and lossless tagged
+path encoding on the existing columns, test them only when separately
+authorized, then implement the X1b no-clobber executor with immediate
+revalidation, staged recovery, and source deletion only after committed moves.
+Do not claim X1 complete or runtime-verified.
+
+## X1 transfer packet — split after unsuccessful attempt
+
+The first Luna high X1 assignment returned without source changes or compiler
+results. X1 remains unimplemented. The work is split into X1a (concrete plans,
+read-only validation and catalog journal APIs), then X1b (platform-safe staged
+copy/move execution). No transfer runtime validation has occurred.
+
 ## Initial native Projects verification
 
 See NATIVE-PROJECTS-EVIDENCE.md for bounded executable build, native launch,

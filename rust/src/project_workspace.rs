@@ -503,6 +503,8 @@ impl ProjectWorkspace {
         let changed = self.user.as_ref().map(|current| current.id) != Some(user.id);
         self.user = Some(user);
         if changed {
+            self.projects.clear();
+            self.projects_error = None;
             self.selected = None;
             self.files.clear();
             self.files_error = None;

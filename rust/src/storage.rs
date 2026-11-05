@@ -754,6 +754,18 @@ pub fn utc_timestamp_now() -> String {
 pub fn utc_timestamp(unix_seconds: u64) -> String {
     let days = (unix_seconds / 86_400) as i64;
     let remainder = unix_seconds % 86_400;
+    timestamp_parts(days, remainder)
+}
+
+/// Formats signed UNIX seconds, including dates before 1970.
+pub fn utc_timestamp_signed(unix_seconds: i64) -> String {
+    timestamp_parts(
+        unix_seconds.div_euclid(86_400),
+        unix_seconds.rem_euclid(86_400) as u64,
+    )
+}
+
+fn timestamp_parts(days: i64, remainder: u64) -> String {
     let (year, month, day) = civil_from_days(days);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",

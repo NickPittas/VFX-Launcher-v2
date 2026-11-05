@@ -842,9 +842,15 @@ fn reconcile_scan_tx(
 
     // `RootContinuity::Proven` is a claim made by the caller; pruning also needs the
     // continuity to still hold right now, re-proven from the live filesystem.
-    let continuity_verified = snapshot.root_identity.as_ref().is_some_and(|identity| {
-        inspect_root(scope).is_ok_and(|current| current.compare_identity(identity) == Some(true))
-    });
+    let continuity_verified = snapshot.coverage == Coverage::Complete
+        && snapshot.continuity == RootContinuity::Proven
+        && snapshot.root_identity.as_ref().is_some_and(|identity| {
+            inspect_root(scope)
+                .is_ok_and(|current| current.compare_identity(identity) == Some(true))
+        });
+    if control.is_cancelled() {
+        return Ok((cancelled_summary(summary, ROLLED_BACK_REASON), false));
+    }
     let prune_allowed = snapshot.coverage == Coverage::Complete
         && snapshot.continuity == RootContinuity::Proven
         && continuity_verified;

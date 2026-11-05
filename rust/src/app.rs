@@ -721,8 +721,9 @@ impl VfxLauncherApp {
                 lines.push(format!(
                     "Modified: {}",
                     file.modified_unix_ns
-                        .and_then(unix_seconds)
-                        .map(|seconds| crate::storage::utc_timestamp(seconds))
+                        .map(|nanos| crate::storage::utc_timestamp_signed(
+                            nanos.div_euclid(1_000_000_000)
+                        ))
                         .unwrap_or_else(|| UNKNOWN.to_string())
                 ));
                 // The catalog records when a scan last saw the file; opening
@@ -1374,7 +1375,10 @@ fn file_menu(
 /// so the same actions are reachable without a mouse.
 fn row_menu(ui: &mut egui::Ui, response: &egui::Response, contents: impl FnOnce(&mut egui::Ui)) {
     let keyboard = response.has_focus()
-        && ui.input(|input| input.key_pressed(egui::Key::F10) && input.modifiers.shift);
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Menu)
+                || (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
+        });
     let open = if response.secondary_clicked() || keyboard {
         Some(egui::SetOpenCommand::Bool(true))
     } else if response.clicked() {
@@ -1430,10 +1434,10 @@ fn bucket_label(bucket: &(Option<String>, Option<String>)) -> String {
 }
 
 fn modified_text(file: &ProjectFile) -> String {
-    match file.modified_unix_ns.and_then(unix_seconds) {
-        Some(seconds) => {
+    match file.modified_unix_ns {
+        Some(nanos) => {
             // `YYYY-MM-DDTHH:MM:SSZ` -> `YYYY-MM-DD HH:MM`, still UTC.
-            let stamp = crate::storage::utc_timestamp(seconds);
+            let stamp = crate::storage::utc_timestamp_signed(nanos.div_euclid(1_000_000_000));
             stamp
                 .get(0..16)
                 .map(|text| text.replace('T', " "))
@@ -1441,10 +1445,6 @@ fn modified_text(file: &ProjectFile) -> String {
         }
         None => UNKNOWN.to_string(),
     }
-}
-
-fn unix_seconds(nanos: i64) -> Option<u64> {
-    u64::try_from(nanos / 1_000_000_000).ok()
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1509,7 +1509,7 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
         ui.add_space(14.0);
         ui.label(title);
         ui.add_space(2.0);
-        ui.label(egui::RichText::new(hint).small().weak());
+        ui.label(egui::RichText::new(hint).color(egui::Color32::from_gray(180)));
     });
 }
 
