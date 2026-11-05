@@ -331,6 +331,28 @@ fn root_block(file_name: &str, options: &NukeScriptOptions) -> String {
     )
 }
 
+/// Concrete content provider used by structure plans that request Nuke scripts.
+pub struct ScriptGenerator;
+
+impl crate::structure::ScriptContentSource for ScriptGenerator {
+    fn script_contents(
+        &self,
+        request: &crate::structure::ScriptContentRequest<'_>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let options = NukeScriptOptions {
+            fps: request.settings.fps,
+            width: request.settings.width,
+            height: request.settings.height,
+            proxy: request.settings.proxy,
+            aces: request.settings.aces,
+        };
+        let target = ScriptTarget::new(Path::new(""), request.sequence, request.shot);
+        script_bytes(&target, &options)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Serialize one literal Tcl scalar without substitutions or token splitting.
 fn quote_scalar(value: &str) -> String {
     let mut quoted = String::from("\"");
@@ -350,7 +372,7 @@ fn viewer_block(fps: f64) -> String {
     )
 }
 
-fn validate_options(options: &NukeScriptOptions) -> Result<(), NukeError> {
+pub(crate) fn validate_options(options: &NukeScriptOptions) -> Result<(), NukeError> {
     if !options.fps.is_finite() || options.fps <= 0.0 || format!("{:.2}", options.fps) == "0.00" {
         return Err(NukeError::InvalidFps { fps: options.fps });
     }

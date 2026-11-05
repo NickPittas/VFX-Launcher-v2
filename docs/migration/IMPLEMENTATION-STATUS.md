@@ -1,5 +1,20 @@
 # Implementation status
 
+## Structure review corrections and Nuke provider
+
+Coordinator corrected the nine structure review findings: checked-tree comp
+gating requires Nuke enabled and a comp target; template paths/markers/extensions
+are validated at planner boundaries before inspection; checked targets must be
+existing directories; blank UI shot rows are ignored; generated script names
+never use lossy native spelling; repeated directories deduplicate while file
+conflicts remain errors; FolderStructurer numbering matches legacy width and
+overflow refuses; structure and Nuke option validation share one routine.
+`nuke::ScriptGenerator` now implements the structure content hook using the
+reviewed Nuke generator. Existing marker-driven new-project layout semantics
+remain separate from checked-target comp gating. Compilation/format/diff checks
+pass; no tests, filesystem writes or Nuke launches ran. Native structure UI and
+actual generated-script acceptance remain unverified.
+
 ## Executor fresh review and reporting corrections
 
 Kimi's fresh review found no remaining original data-safety blocker under the

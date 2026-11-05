@@ -353,7 +353,10 @@ pub fn next_launcher_code(root: &Path) -> Result<String, TransferError> {
             best = best.max(value);
         }
     }
-    Ok(format!("{:0>5}", best.saturating_add(1)))
+    let next = best
+        .checked_add(1)
+        .ok_or_else(|| invalid("project numbering is exhausted"))?;
+    Ok(format!("{next:0>5}"))
 }
 
 /// Next FolderStructurer number: highest `^\d{5,}_` immediate directory plus
@@ -361,16 +364,16 @@ pub fn next_launcher_code(root: &Path) -> Result<String, TransferError> {
 /// (`backend_api.compute_next_project_number`).
 pub fn next_folder_structurer_number(root: &Path) -> Result<String, TransferError> {
     let mut best: u64 = 0;
-    let mut width = 5usize;
     for name in immediate_directory_names(root)? {
-        if let Some((value, digits)) = strict_number_prefix(&name) {
-            if value > best {
-                best = value;
-                width = width.max(digits);
-            }
+        if let Some((value, _)) = strict_number_prefix(&name) {
+            best = best.max(value);
         }
     }
-    Ok(format!("{:0width$}", best.saturating_add(1), width = width))
+    let width = best.to_string().len().max(5);
+    let next = best
+        .checked_add(1)
+        .ok_or_else(|| invalid("project numbering is exhausted"))?;
+    Ok(format!("{next:0width$}"))
 }
 
 fn auto_number(parent: &Path, preset: NamingPreset) -> Result<String, TransferError> {
@@ -428,6 +431,9 @@ impl SequenceShotTree {
         }
         let mut validated = Vec::with_capacity(shots.len());
         for shot in shots {
+            if shot.trim().is_empty() {
+                continue;
+            }
             let shot = validate_sequence_or_shot(shot, "shot name")?;
             if validated.contains(&shot) {
                 return Err(invalid(format!(
@@ -445,6 +451,9 @@ impl SequenceShotTree {
 
     fn push_independent(&mut self, shots: &[String]) -> Result<(), TransferError> {
         for shot in shots {
+            if shot.trim().is_empty() {
+                continue;
+            }
             let shot = validate_sequence_or_shot(shot, "shot name")?;
             if self.independent_shots.contains(&shot) {
                 return Err(invalid(format!(
@@ -633,6 +642,32 @@ pub struct StructureTemplate {
 }
 
 impl StructureTemplate {
+    fn validate(&self) -> Result<(), TransferError> {
+        let mut seen = HashSet::new();
+        for entry in &self.entries {
+            validate_relative_components(&entry.relative)?;
+            if !seen.insert(&entry.relative) {
+                return Err(invalid("template contains duplicate entry paths"));
+            }
+            if !matches!(entry.kind, TemplateEntryKind::Directory { .. }) {
+                let name = entry.relative.file_name().unwrap_or_default();
+                if name.eq_ignore_ascii_case(OsStr::new(SEQUENCE_MARKER_FILE))
+                    || name.eq_ignore_ascii_case(OsStr::new(SHOT_MARKER_FILE))
+                {
+                    return Err(invalid(
+                        "template marker files must be represented as directory markers",
+                    ));
+                }
+            }
+            if let TemplateEntryKind::ProjectTemplateFile { extension, .. } = &entry.kind {
+                let extension = validate_relative_components(Path::new(extension))?;
+                if extension.components().count() != 1 {
+                    return Err(invalid("template extension must be a single component"));
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -993,13 +1028,14 @@ pub struct NukeSettings {
 }
 
 fn validate_nuke_settings(settings: &NukeSettings) -> Result<(), TransferError> {
-    if !settings.fps.is_finite() || settings.fps <= 0.0 {
-        return Err(invalid("Nuke fps must be a positive finite number"));
-    }
-    if settings.width == 0 || settings.height == 0 {
-        return Err(invalid("Nuke resolution must be non-zero"));
-    }
-    Ok(())
+    crate::nuke::validate_options(&crate::nuke::NukeScriptOptions {
+        fps: settings.fps,
+        width: settings.width,
+        height: settings.height,
+        proxy: settings.proxy,
+        aces: settings.aces,
+    })
+    .map_err(|error| invalid(error.to_string()))
 }
 
 /// What the content source needs to render one script's bytes.
@@ -1152,6 +1188,9 @@ impl PlanAccumulator {
 
     fn dir(&mut self, relative: PathBuf) -> Result<(), TransferError> {
         if !self.seen.insert(relative.clone()) {
+            if self.directories.contains(&relative) {
+                return Ok(());
+            }
             return Err(invalid(format!(
                 "plan builds the destination {} twice",
                 relative.display()
@@ -1225,6 +1264,7 @@ pub fn plan_structure(
     template: &StructureTemplate,
     scripts: Option<&dyn ScriptContentSource>,
 ) -> Result<OperationPlan, TransferError> {
+    template.validate()?;
     let parent = absolute_existing_dir(&input.parent, "destination parent")?;
     let date = input.date.as_deref().ok_or_else(|| {
         invalid("a captured project date is required so preview and execution share one name")
@@ -1386,17 +1426,14 @@ fn shot_block(
 ) -> Result<(), TransferError> {
     let shot_dir = parent_relative.join(shot);
     acc.dir(shot_dir.clone())?;
-    let Some(settings) = nuke else {
-        if create_script_dirs {
-            // New-project template semantics create project/render regardless;
-            // add-to-existing sources created them only with scripts.
-            acc.dir(shot_dir.join(SHOT_PROJECT_DIR))?;
-            acc.dir(shot_dir.join(SHOT_RENDER_DIR))?;
-        }
+    if !create_script_dirs {
         return Ok(());
-    };
+    }
     acc.dir(shot_dir.join(SHOT_PROJECT_DIR))?;
     acc.dir(shot_dir.join(SHOT_RENDER_DIR))?;
+    let Some(settings) = nuke else {
+        return Ok(());
+    };
     let Some(source) = scripts else {
         return Err(invalid(
             "a Nuke script content source is required when Nuke generation is requested; \
@@ -1440,6 +1477,7 @@ pub fn plan_add_shots(
     nuke: Option<&NukeSettings>,
     scripts: Option<&dyn ScriptContentSource>,
 ) -> Result<OperationPlan, TransferError> {
+    template.validate()?;
     let project = absolute_existing_dir(project, "project")?;
     let tree = SequenceShotTree::from_groups(shots)?;
     if tree.is_empty() {
@@ -1524,13 +1562,14 @@ fn confine_target(project: &Path, target: &Path) -> Result<PathBuf, TransferErro
             "target folder must be a plain path under the project",
         ));
     }
-    paths::validate_destination(project, relative).map_err(|error| {
+    let confined = paths::validate_destination(project, relative).map_err(|error| {
         TransferError::new(
             TransferCategory::Refused,
             Some(target),
             format!("target folder cannot be used: {error}"),
         )
-    })
+    })?;
+    absolute_existing_dir(&confined, "checked target")
 }
 
 /// The source's `folder_or_parents_has_comp`: "comp" appears (case-insensitive
@@ -1602,17 +1641,22 @@ pub fn plan_add_to_targets(
                     &sequence_dir,
                     Some(&sequence.name),
                     shot,
-                    is_comp,
+                    is_comp && nuke.is_some(),
                     nuke,
                     scripts,
                     &mut warnings,
                 )?;
             }
         }
-        let script_sequence: Option<String> = if parent_as_sequence {
+        let script_sequence: Option<String> = if parent_as_sequence && is_comp && nuke.is_some() {
             target
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
+                .map(|name| {
+                    name.to_str().map(str::to_owned).ok_or_else(|| {
+                        invalid("target name cannot be represented in a Nuke script")
+                    })
+                })
+                .transpose()?
         } else {
             None
         };
@@ -1622,7 +1666,7 @@ pub fn plan_add_to_targets(
                 relative,
                 script_sequence.as_deref(),
                 shot,
-                is_comp,
+                is_comp && nuke.is_some(),
                 nuke,
                 scripts,
                 &mut warnings,
