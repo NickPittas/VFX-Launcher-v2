@@ -29,6 +29,11 @@ use std::{
 
 mod native;
 
+// X1b executor; see `executor.rs`.
+mod executor;
+
+pub use executor::{ItemOutcome, RunReport, execute};
+
 const RUN_ENVELOPE_VERSION: u32 = 1;
 const ITEM_ENVELOPE_VERSION: u32 = 1;
 const MAX_NUMBERED_ATTEMPTS: u32 = 9_999;

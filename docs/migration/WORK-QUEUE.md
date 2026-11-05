@@ -20,12 +20,18 @@ This is the short live queue; IMPLEMENTATION-STATUS.md retains packet history.
    tagged-envelope-only row path decoding, journal consistency checks, and refusal
    of unknown envelopes during interruption marking. See IMPLEMENTATION-STATUS.md.
    These last five small fixes have source/compile verification, not a new review
-   or runtime pass. No executor work exists yet.
-2. **X1b is next: establish native execution primitives before writing it.**
-   The user's priority of validation and journal completion has been handled.
-   X1b is: platform-safe staged copy/move that revalidates each reviewed item,
-   commits without clobbering, records durable outcomes and cancellation, and
-   retains the source when removal fails.
+   or runtime pass.
+2. **X1b executor implemented; review and runtime pass open.**
+   `rust/src/transfers/executor/linux.rs` now executes validated plans:
+   intent persisted before the first mutation, destination root/ancestor
+   identities revalidated by handle, per-item source revalidation, staged
+   no-clobber copy with metadata preservation and post-copy stability check,
+   same-device `renameat2` move with `CopiedSourceRetained` fallback, and the
+   single displacement/restore window for Replace/PreserveExisting. Compiles
+   without warnings under the offline prepared CARGO_HOME and is rustfmt-clean;
+   no database, catalog row, filesystem operation or test ran, so behavior is
+   unverified. Still open: transfer concurrency (currently sequential), UI/app
+   wiring, and the live transfer pass on disposable folders.
 3. **Projects review items implemented, interactive verification open.** Each
    launch now keeps its own reply, worker handle, file and captured identity, so
    concurrent launches neither replace each other nor re-attribute access records;

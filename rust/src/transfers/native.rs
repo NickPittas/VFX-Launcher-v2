@@ -1,5 +1,4 @@
 //! Native transfer filesystem operations. Linux is currently the only supported backend.
-#![allow(dead_code)] // The executor will consume these primitives in the next migration step.
 
 #[cfg(target_os = "linux")]
 #[path = "native/linux.rs"]

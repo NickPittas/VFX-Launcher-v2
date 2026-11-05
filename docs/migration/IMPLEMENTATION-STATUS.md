@@ -1,5 +1,69 @@
 # Implementation status
 
+## Packet X1b — Linux transfer executor (2026-11-05)
+
+Implemented a real executor in `rust/src/transfers/executor/linux.rs` (wired
+through `rust/src/transfers/executor.rs` and `transfers.rs`), plus the primitive
+additions it needs in `transfers/native/linux.rs`. No UI, no app, no storage or
+path module changes.
+
+Order of work per run: build/validate the plan (caller), persist the reviewed
+intent, mark the run running, reopen the reviewed destination root by handle,
+revalidate the recorded root and ancestor identities, then execute items in
+reviewed order and finalize. A refused root/evidence refuses the whole run: every
+item is recorded `Failed` with the reason and the run is finalized `Failed`, so
+nothing is left half-executable.
+
+Per item:
+
+- `Skip`: recorded `Skipped`, no filesystem change.
+- `CreateDirectory`: exclusive `mkdirat` for a new folder, or identity agreement
+  for the reviewed add-to-existing folder. Children of a folder that failed are
+  failed with "prerequisite folder" without being attempted.
+- `CreateFile`: staged write of the reviewed contents, `Staging`/`Staged`
+  checkpoints, no-clobber commit.
+- `Copy`: source reopened handle-relative (`O_NOFOLLOW`, regular-file check),
+  size/mtime/identity compared to the reviewed stamp, 1 MiB staged copy with
+  cooperative cancel between chunks, `fchmod`/`futimens` from the source (a
+  failure becomes a visible outcome note), `fsync`, byte-count check,
+  post-copy source revalidation, then commit.
+- `Move`: no-clobber `renameat2` when the source is in the reviewed order and
+the destination is absent and the filesystem allows a same-device rename;
+  `EXDEV` falls back to the staged copy. Source identity is re-checked and
+  unlinked only after a successful install. A changed or unremovable source is
+  reported `CopiedSourceRetained` with the source path as recovery path.
+- `Replace` / `PreserveExisting`: the reviewed existing destination is
+  re-statted no-follow and must still match its reviewed size, mtime and
+  identity. The only displacement/restore window in the code: the old file is
+  renamed to its reserved sibling with `RENAME_NOREPLACE`, the staged file is
+  committed with `RENAME_NOREPLACE`, and a failed commit renames the old file
+  straight back (restore failure reports the sibling as a recovery path).
+  Replace removes its own backup afterwards; PreserveExisting keeps the reviewed
+  numbered name.
+- `renameat2(RENAME_NOREPLACE)` unavailability (`ENOSYS`/`EINVAL`/`EOPNOTSUPP`)
+  refuses the item instead of degrading to a replacing rename.
+
+Journal use is unchanged policy: intent is persisted before mutation, terminal
+item outcomes are appended after it, checkpoints only move forward, committed
+bytes are 0 for a failure or cancellation before install and exactly the
+reviewed count when the destination was installed. Cancellation stops the run at
+the next item/chunk boundary, records that item `Cancelled`, and lets
+`finalize_run` cancel the untouched pending items.
+
+Deliberate limits (also recorded in the module header): execution is sequential
+(the contract's 4/NAS concurrency setting is not implemented, so there is no
+per-run worker pool); Linux-only, other platforms keep the API and refuse;
+identity checks around name-based rename/unlink are fresh checks, not atomic;
+no staging-prefix cleanup or replay. The executor is library-only: no caller
+wires it to the UI yet, and `JobEvents` is created by `Jobs::start`.
+
+Verification: `cargo check --offline --locked --lib --bin vfx-launcher` passes
+without warnings under a 30s hard process limit (CARGO_HOME is the prepared
+`artifacts/verification/cargo-home`); `rustfmt --edition 2024 --check` is clean
+on every touched file. No database was opened, no catalog row written, no
+filesystem operation performed, and no tests were written or run; runtime
+transfer behavior is unverified until it is wired and exercised.
+
 ## Executor prerequisite review corrections
 
 Coordinator corrected Kimi's four findings: legacy Running events without a
