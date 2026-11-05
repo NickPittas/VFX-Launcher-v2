@@ -1707,3 +1707,20 @@ level, and re-reads it into `CatalogInfo.synchronous`. The contract now says tha
   run remains visible as inconsistent rather than being repaired.
 - `RunInspection.destination_evidence_missing` has no UI surface yet, and no code
   path consumes `Catalog::client()`.
+
+### Linux native transfer backend (executor primitives)
+
+- Added `transfers::native` Linux primitives backed by rustix 1.1.6: selected-root directory handle, descendant `openat2` with `BENEATH | NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV`, regular-file open with identity, restrictive exclusive sibling staging creation, `mkdirat` followed by verified handle open, `renameat2(NOREPLACE)` via rustix, checked owned-entry unlink, and file/directory fsync.
+- Paths remain `OsStr`; no shell or UTF-8 path conversion is used. Non-Linux has an unsupported-operation error boundary; the rest of the app is not deliberately prevented from compiling.
+- Limits: Linux unlink and rename operate by name; identity comparison cannot be atomic with either operation. Correctness assumes cooperating writers in the selected directories; no hostile-race guarantee. No prefix cleanup, replay, executor/UI wiring, or filesystem operation was performed.
+- Verification status: rustix source API was inspected from the permitted cached 1.1.6 source. The initial offline Cargo check found Rust `io::Error` versus rustix `Errno` result mismatches in the new module; this backend is not compile-verified yet. The required `--locked` check also reported that `Cargo.lock` needs updating after promoting rustix to a direct Linux dependency.
+
+Coordinator follow-up: fixed all eight Errno/result conversions, let Cargo update
+the lockfile offline, removed unsafe raw-descriptor conversion in favor of
+`File::from(OwnedFd)`, required single native basenames for mutation/entry APIs,
+and used NONBLOCK when opening an unknown source kind so FIFOs cannot block before
+the regular-file check. `cargo check --offline --locked --lib --bin vfx-launcher`
+now passes without warnings (1.03s, 30s hard limit); rustfmt is clean. No runtime
+filesystem checks or tests ran. Directory opens verify directory kind and resolver
+constraints; reviewed identity comparison and journal orchestration still belong
+to the future executor. This is a compiled primitive layer, not working transfers.

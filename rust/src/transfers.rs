@@ -27,6 +27,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod native;
+
 const RUN_ENVELOPE_VERSION: u32 = 1;
 const ITEM_ENVELOPE_VERSION: u32 = 1;
 const MAX_NUMBERED_ATTEMPTS: u32 = 9_999;

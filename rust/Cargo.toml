@@ -46,6 +46,7 @@ shlex = "=2.0.1"
 # packaging must ship GTK3 3.24.
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "=0.17.2", default-features = false, features = ["gtk3"] }
+rustix = { version = "=1.1.6", features = ["fs"] }
 
 # Windows and macOS use rfd's native dialogs, which need no feature flag;
 # `default-features = false` drops the Linux-only portal and wayland features.
