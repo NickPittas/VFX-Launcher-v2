@@ -382,6 +382,17 @@ struct InstallOutcome {
     durable: bool,
 }
 
+/// The single staging file one item created, with the identity read from the
+/// handle that created it. Cleanup uses that held identity only, and never
+/// touches the name after it has been published.
+struct Stage {
+    file: File,
+    name: OsString,
+    path: PathBuf,
+    identity: EntryIdentity,
+    published: bool,
+}
+
 fn problem(message: impl Into<String>) -> Flow {
     Flow::Problem(message.into(), Vec::new())
 }
@@ -461,6 +472,7 @@ impl Executor<'_> {
         item: &ItemValidation,
         step: ItemCheckpoint,
         message: Option<String>,
+        recovery: &[PathBuf],
     ) -> Result<(), TransferError> {
         awaited(append_item_checkpoint(
             self.catalog,
@@ -468,7 +480,7 @@ impl Executor<'_> {
             item.index as i64,
             step,
             message,
-            &[],
+            recovery,
         ))
     }
 
@@ -605,6 +617,22 @@ impl Executor<'_> {
     /// verified, so an item never mutates a folder swapped in after that check.
     /// A folder this run has not proven is refused instead of trusted by name.
     fn open_parent(&self, parent_relative: &Path) -> io::Result<OwnedFd> {
+        let mut handle = self.verified_folder(Path::new(""))?;
+        let mut prefix = PathBuf::new();
+        for component in parent_relative.components() {
+            if !matches!(component, Component::Normal(_)) {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "destination parent must be relative",
+                ));
+            }
+            prefix.push(component.as_os_str());
+            handle = self.verified_folder(&prefix)?;
+        }
+        Ok(handle)
+    }
+
+    fn verified_folder(&self, parent_relative: &Path) -> io::Result<OwnedFd> {
         let handle = if parent_relative.as_os_str().is_empty() {
             self.root.duplicate()
         } else {
@@ -686,54 +714,77 @@ impl Executor<'_> {
         Ok((parent, name))
     }
 
-    /// Removes this run's own staging file. Returns a visible note when the file
-    /// cannot be shown to be gone: a failed item must not hide junk it left.
-    fn discard_staging(
-        &self,
-        parent: &OwnedFd,
-        stage_name: &OsStr,
-        destination: &Path,
-    ) -> Option<String> {
-        let identity = match self.root.entry_identity(parent, stage_name) {
-            Ok(identity) => identity,
-            Err(error) if error.kind() == ErrorKind::NotFound => return None,
-            Err(error) => {
-                return Some(format!(
-                    "the staging file beside {} could not be inspected and may remain: {error}",
-                    destination.display()
-                ));
-            }
-        };
-        match self.root.remove_owned(parent, stage_name, identity) {
+    /// Removes the one staging file this item created, closing the held handle
+    /// first. The only identity ever used is the one captured when that handle
+    /// was created: a name that now points elsewhere is a mismatch to report, not
+    /// an entry to adopt. A published stage name is never touched again.
+    ///
+    /// Returns a visible note when the file cannot be shown to be gone: a failed
+    /// item must not hide junk it left.
+    fn discard_stage(&self, parent: &OwnedFd, stage: Stage) -> Option<String> {
+        let Stage {
+            file,
+            name,
+            path,
+            identity,
+            published,
+        } = stage;
+        drop(file);
+        if published {
+            return None;
+        }
+        match self.root.remove_owned(parent, &name, identity) {
             Ok(()) => None,
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => Some(format!(
-                "the staging file {} may remain: {error}",
-                destination.with_file_name(stage_name).display()
+                "the staging file {} was retained: {error}",
+                path.display()
             )),
         }
     }
 
     /// Discards the staging file of a step that failed, keeping the reason
     /// visible: appended to a diagnostic outcome, or emitted when the journal
-    /// cannot carry it.
-    fn abandon_staging(
-        &self,
-        parent: &OwnedFd,
-        stage_name: &OsStr,
-        destination: &Path,
-        flow: Flow,
-    ) -> Flow {
-        match self.discard_staging(parent, stage_name, destination) {
-            Some(note) => match flow {
-                Flow::Problem(message, recovery) => {
-                    Flow::Problem(format!("{message}; {note}"), recovery)
-                }
-                other => {
-                    self.events.diagnostic(JobPhase::Copying, note);
-                    other
-                }
+    /// cannot carry it. A journal failure mutates nothing and names the exact
+    /// path that was left behind.
+    fn abandon_stage(&self, parent: &OwnedFd, stage: Stage, flow: Flow) -> Flow {
+        if let Flow::Abort(error) = flow {
+            if !stage.published {
+                self.events.diagnostic(
+                    JobPhase::Copying,
+                    format!(
+                        "the journal failed, so the staging file {} was retained",
+                        stage.path.display()
+                    ),
+                );
+            }
+            return Flow::Abort(error);
+        }
+        let stage_path = stage.path.clone();
+        let note = match self.discard_stage(parent, stage) {
+            Some(note) => note,
+            None => return flow,
+        };
+        let retain = |recovery: Vec<PathBuf>| {
+            let mut recovery = recovery;
+            if !recovery.contains(&stage_path) {
+                recovery.push(stage_path.clone());
+            }
+            recovery
+        };
+        match flow {
+            Flow::Problem(message, recovery) => {
+                Flow::Problem(format!("{message}; {note}"), retain(recovery))
+            }
+            Flow::PostInstall { message, recovery } => Flow::PostInstall {
+                message: format!("{message}; {note}"),
+                recovery: retain(recovery),
             },
-            None => flow,
+            Flow::Cancelled(recovery) => {
+                self.events.diagnostic(JobPhase::Copying, note);
+                Flow::Cancelled(retain(recovery))
+            }
+            Flow::Abort(error) => Flow::Abort(error),
         }
     }
 
@@ -817,28 +868,24 @@ impl Executor<'_> {
             .open_parent(&parent_relative)
             .map_err(|error| io_problem("the destination folder", &destination, error))?;
 
-        self.checkpoint(item, ItemCheckpoint::Staging, None)?;
-        let (mut staged, stage_name) = self.create_staging(&parent, &name, &destination)?;
-        if let Err(error) = staged.write_all(&contents) {
-            let flow = io_problem("the staging file", &destination, error);
-            return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
+        let mut stage = self.begin_staging(item, &parent, &name, &destination)?;
+        if let Err(error) = stage.file.write_all(&contents) {
+            let flow = io_problem("the staging file", &stage.path, error);
+            return Err(self.abandon_stage(&parent, stage, flow));
         }
-        if let Err(error) = staged.sync_all() {
-            let flow = io_problem("the staging file", &destination, error);
-            return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
+        if let Err(error) = stage.file.sync_all() {
+            let flow = io_problem("the staging file", &stage.path, error);
+            return Err(self.abandon_stage(&parent, stage, flow));
         }
-        if let Err(error) = self.checkpoint(item, ItemCheckpoint::Staged, None) {
-            return Err(self.abandon_staging(
-                &parent,
-                &stage_name,
-                &destination,
-                Flow::Abort(error),
-            ));
+        if let Err(error) =
+            self.checkpoint(item, ItemCheckpoint::Staged, None, &[stage.path.clone()])
+        {
+            return Err(self.abandon_stage(&parent, stage, Flow::Abort(error)));
         }
 
-        match self.install(item, &parent, &name, &stage_name, &destination) {
+        match self.install(item, &parent, &name, &mut stage, &destination) {
             Ok(installed) => Ok(Done::Succeeded(installed.note)),
-            Err(flow) => Err(self.abandon_staging(&parent, &stage_name, &destination, flow)),
+            Err(flow) => Err(self.abandon_stage(&parent, stage, flow)),
         }
     }
 
@@ -874,10 +921,9 @@ impl Executor<'_> {
         verify_stamp(&source_meta, &reviewed, &source)
             .map_err(|message| Flow::Problem(message, Vec::new()))?;
 
-        self.checkpoint(item, ItemCheckpoint::Staging, None)?;
-        let (mut staged, stage_name) = self.create_staging(&parent, &name, &destination)?;
+        let mut stage = self.begin_staging(item, &parent, &name, &destination)?;
         let metadata_note = match self.fill_staging(
-            &mut staged,
+            &mut stage,
             &mut source_file,
             &source_meta,
             &reviewed,
@@ -886,22 +932,19 @@ impl Executor<'_> {
         ) {
             Ok(note) => note,
             Err(flow) => {
-                return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
+                return Err(self.abandon_stage(&parent, stage, flow));
             }
         };
-        if let Err(error) = self.checkpoint(item, ItemCheckpoint::Staged, None) {
-            return Err(self.abandon_staging(
-                &parent,
-                &stage_name,
-                &destination,
-                Flow::Abort(error),
-            ));
+        if let Err(error) =
+            self.checkpoint(item, ItemCheckpoint::Staged, None, &[stage.path.clone()])
+        {
+            return Err(self.abandon_stage(&parent, stage, Flow::Abort(error)));
         }
 
-        let installed = match self.install(item, &parent, &name, &stage_name, &destination) {
+        let installed = match self.install(item, &parent, &name, &mut stage, &destination) {
             Ok(installed) => installed,
             Err(flow) => {
-                return Err(self.abandon_staging(&parent, &stage_name, &destination, flow));
+                return Err(self.abandon_stage(&parent, stage, flow));
             }
         };
         let mut note = combine_notes(metadata_note, installed.note);
@@ -922,7 +965,7 @@ impl Executor<'_> {
                     source,
                 });
             }
-            self.checkpoint(item, ItemCheckpoint::RemovingSource, None)?;
+            self.checkpoint(item, ItemCheckpoint::RemovingSource, None, &[])?;
             let current = match self.recheck_source(
                 &source_parent,
                 &source_name,
@@ -1021,7 +1064,7 @@ impl Executor<'_> {
     /// flushes it, and revalidates the source afterwards.
     fn fill_staging(
         &mut self,
-        staged: &mut File,
+        stage: &mut Stage,
         source_file: &mut File,
         source_meta: &fs::Metadata,
         reviewed: &SourceStamp,
@@ -1040,9 +1083,10 @@ impl Executor<'_> {
             if read == 0 {
                 break;
             }
-            staged
+            stage
+                .file
                 .write_all(&buffer[..read])
-                .map_err(|error| io_problem("the staging file", destination, error))?;
+                .map_err(|error| io_problem("the staging file", &stage.path, error))?;
             written += read as u64;
             if written > reviewed.size {
                 return Err(problem(format!(
@@ -1072,14 +1116,15 @@ impl Executor<'_> {
         // Metadata preservation is best effort but never silent: the outcome
         // carries the reason when it fails.
         let mut note = None;
-        if let Err(error) =
-            rustix::fs::fchmod(&*staged, Mode::from_raw_mode(source_meta_mode(source_meta)))
-        {
+        if let Err(error) = rustix::fs::fchmod(
+            &stage.file,
+            Mode::from_raw_mode(source_meta_mode(source_meta)),
+        ) {
             note = Some(format!(
                 "copied, but the source permissions could not be preserved: {error}"
             ));
         }
-        if let Err(error) = rustix::fs::futimens(&*staged, &source_times(source_meta)) {
+        if let Err(error) = rustix::fs::futimens(&stage.file, &source_times(source_meta)) {
             let message =
                 format!("copied, but the source modification time could not be preserved: {error}");
             note = Some(match note {
@@ -1087,9 +1132,10 @@ impl Executor<'_> {
                 None => message,
             });
         }
-        staged
+        stage
+            .file
             .sync_all()
-            .map_err(|error| io_problem("the staging file", destination, error))?;
+            .map_err(|error| io_problem("the staging file", &stage.path, error))?;
 
         let after = source_file
             .metadata()
@@ -1107,17 +1153,18 @@ impl Executor<'_> {
         item: &ItemValidation,
         parent: &OwnedFd,
         name: &OsStr,
-        stage_name: &OsStr,
+        stage: &mut Stage,
         destination: &Path,
     ) -> Result<InstallOutcome, Flow> {
         match item.expectation.as_ref() {
             Some(DestinationExpectation::Absent) => {
-                match self.root.publish_noreplace(parent, stage_name, name) {
+                match self.root.publish_noreplace(parent, &stage.name, name) {
                     Ok(()) => {
+                        stage.published = true;
                         // Journal evidence follows the namespace sync, so the record
                         // never claims a durability the filesystem refused.
                         let (note, durable) = self.namespace_sync(parent);
-                        self.checkpoint(item, ItemCheckpoint::Installed, None)?;
+                        self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?;
                         Ok(InstallOutcome { note, durable })
                     }
                     Err(error) if error.kind() == ErrorKind::AlreadyExists => {
@@ -1162,7 +1209,7 @@ impl Executor<'_> {
                 // Displacement/restore critical section: the reviewed destination
                 // is renamed aside without clobbering, the staged file is committed
                 // without clobbering, and a failed commit renames it straight back.
-                self.checkpoint(item, ItemCheckpoint::Displacing, None)?;
+                self.checkpoint(item, ItemCheckpoint::Displacing, None, &[])?;
                 if let Err(error) = self.root.rename_between(parent, name, parent, &backup) {
                     return Err(if error.kind() == ErrorKind::AlreadyExists {
                         problem(format!(
@@ -1173,13 +1220,14 @@ impl Executor<'_> {
                         io_problem("the existing destination", destination, error)
                     });
                 }
-                match self.root.publish_noreplace(parent, stage_name, name) {
+                match self.root.publish_noreplace(parent, &stage.name, name) {
                     Ok(()) => {
+                        stage.published = true;
                         // The displaced original is deleted only once the install is
                         // both durable and journaled, so an interrupted or unsynced
                         // window keeps a copy of the file instead of losing it.
                         let (mut note, durable) = self.namespace_sync(parent);
-                        self.checkpoint(item, ItemCheckpoint::Installed, None)?;
+                        self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?;
                         if !keep {
                             let backup_path = destination.with_file_name(&backup);
                             if durable {
@@ -1292,20 +1340,82 @@ impl Executor<'_> {
         }
     }
 
-    /// Exclusive app-owned staging file beside the destination. A leftover from an
-    /// interrupted run is never reused; the counter moves past it.
-    fn create_staging(
+    /// Reserves one concrete staging basename beside the destination, journals
+    /// that exact absolute path and the destination as the intent, and only then
+    /// creates the file exclusively. A name taken between the intent and the
+    /// create fails the item instead of retrying: a second checkpoint would
+    /// describe a file this run never made, and the entry that won the race is
+    /// not this run's to adopt or delete.
+    fn begin_staging(
+        &mut self,
+        item: &ItemValidation,
+        parent: &OwnedFd,
+        name: &OsStr,
+        destination: &Path,
+    ) -> Result<Stage, Flow> {
+        let stage_name = self.free_staging_name(parent, name, destination)?;
+        let stage_path = destination.with_file_name(&stage_name);
+        self.checkpoint(
+            item,
+            ItemCheckpoint::Staging,
+            None,
+            &[stage_path.clone(), destination.to_path_buf()],
+        )
+        .map_err(Flow::Abort)?;
+        let file = match self.root.create_staging(parent, &stage_name) {
+            Ok(staging) => staging.into_file(),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                return Err(problem(format!(
+                    "{} appeared beside the destination after this item recorded its staging intent; it was left untouched",
+                    stage_path.display()
+                )));
+            }
+            Err(error) => return Err(io_problem("the staging file", &stage_path, error)),
+        };
+        // The identity of the file this handle created is the only one any later
+        // cleanup may use; a name that came to mean something else is reported.
+        let identity = match rustix::fs::fstat(&file) {
+            Ok(stat) => EntryIdentity::from(stat),
+            Err(error) => {
+                drop(file);
+                return Err(Flow::Problem(
+                    format!(
+                        "the staging file {} was created but its identity could not be read, so it is retained: {error}",
+                        stage_path.display()
+                    ),
+                    vec![stage_path],
+                ));
+            }
+        };
+        Ok(Stage {
+            file,
+            name: stage_name,
+            path: stage_path,
+            identity,
+            published: false,
+        })
+    }
+
+    /// Smallest unused app-owned staging basename beside the destination. A
+    /// leftover from an interrupted run is never reused; the counter moves past
+    /// it.
+    fn free_staging_name(
         &mut self,
         parent: &OwnedFd,
         name: &OsStr,
         destination: &Path,
-    ) -> Result<(File, OsString), Flow> {
+    ) -> Result<OsString, Flow> {
         for _ in 0..MAX_BACKUP_ATTEMPTS {
-            let stage_name = self.staging_name(name);
-            match self.root.create_staging(parent, &stage_name) {
-                Ok(staging) => return Ok((staging.into_file(), stage_name)),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(io_problem("the staging file", destination, error)),
+            let candidate = self.staging_name(name);
+            match self.root.entry_identity(parent, &candidate) {
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(candidate),
+                Ok(_) => continue,
+                Err(error) => {
+                    return Err(problem(format!(
+                        "the staging name beside {} could not be inspected: {error}",
+                        destination.display()
+                    )));
+                }
             }
         }
         Err(problem(format!(

@@ -1,5 +1,19 @@
 # Implementation status
 
+## Executor staging integration and destination ancestor checks
+
+Integrated held staging identity and publication tracking; exact staging path is
+journaled before exclusive creation, and pre-publish cleanup uses only the identity
+from the creating handle. Collisions fail without adopting another file. Cleanup
+failures retain structured recovery paths; journal failure causes no cleanup
+mutation. Published stage names are never deleted by staging cleanup. These
+address the staging portions of original findings 5 and 8; backup portions remain.
+Coordinator also checks each destination parent prefix against reviewed or newly
+created directory identity on every parent open (finding 6's directory part).
+Replace still needs its post-checkpoint stamp recheck. Compilation passes without
+warnings; no runtime filesystem operations or tests ran. Original findings 1, 7
+and backup/replacement portions of 5, 6, 8 remain open.
+
 ## S2 review input corrections
 
 Coordinator fixed all five Nuke review findings: sequence/shot whitespace is
