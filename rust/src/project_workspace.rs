@@ -1549,6 +1549,18 @@ impl ProjectWorkspace {
         &self.scan.lines
     }
 
+    pub fn dismiss_scan_summary(&mut self) {
+        if !self.scan.running {
+            self.scan.lines.clear();
+        }
+    }
+
+    pub fn dismiss_registration_summary(&mut self) {
+        if !self.registration_busy() {
+            self.registration = Registration::Idle;
+        }
+    }
+
     // ------------------------------------------------------------------ launch
 
     pub fn begin_launch(&mut self, file: &ProjectFile) {
@@ -2075,7 +2087,10 @@ fn start_walk(
                 .as_ref()
                 .map(|snapshot| snapshot.entries.len() as u64)
                 .unwrap_or(0),
-            total: None,
+            total: result
+                .as_ref()
+                .ok()
+                .map(|snapshot| snapshot.entries.len() as u64),
             bytes_done: 0,
             bytes_total: None,
             current: None,

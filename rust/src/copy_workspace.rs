@@ -1439,12 +1439,13 @@ impl CopyByFileTypeState {
                     },
                 };
                 let scan_fraction = match scan_job {
-                    Some(job) => job.progress.fraction(),
+                    Some(job) if !job.is_terminal() && job.progress.total.is_none() => None,
+                    Some(job) => Some(job.progress.fraction()),
                     None => {
                         if self.scanned.is_some() {
-                            1.0
+                            Some(1.0)
                         } else {
-                            0.0
+                            Some(0.0)
                         }
                     }
                 };
@@ -1478,9 +1479,10 @@ impl CopyByFileTypeState {
                     },
                 };
                 let copy_fraction = match copy_job {
-                    Some(job) => job.progress.fraction(),
+                    Some(job) if !job.is_terminal() && job.progress.total.is_none() => None,
+                    Some(job) => Some(job.progress.fraction()),
                     None => {
-                        self.report.as_ref().map(|report| report.progress.fraction()).unwrap_or(0.0)
+                        Some(self.report.as_ref().map(|report| report.progress.fraction()).unwrap_or(0.0))
                     }
                 };
                 progress_block(
@@ -1596,18 +1598,31 @@ fn explain(response: &egui::Response, reason: &str) {
     let _ = response.clone().on_hover_text(reason);
 }
 
-fn progress_block(ui: &mut egui::Ui, label: &str, count: &str, fraction: f32, current: String) {
+fn progress_block(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: &str,
+    fraction: Option<f32>,
+    current: String,
+) {
     ui.horizontal(|ui| {
         ui.label(label);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(egui::RichText::new(count).small().weak());
         });
     });
-    ui.add(
-        egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-            .desired_height(8.0)
-            .show_percentage(),
-    );
+    if let Some(fraction) = fraction {
+        ui.add(
+            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                .desired_height(8.0)
+                .show_percentage(),
+        );
+    } else {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Scanning folders…");
+        });
+    }
     ui.label(egui::RichText::new(current).small().weak());
 }
 

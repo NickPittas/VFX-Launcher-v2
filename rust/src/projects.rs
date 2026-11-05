@@ -1230,6 +1230,12 @@ pub fn list_project_files(
     catalog.submit(move |connection| {
         require_live_project(connection, project)?;
         let mut files = read_project_files(connection, project)?;
+        files.retain(|file| {
+            !file
+                .path
+                .as_deref()
+                .is_some_and(crate::discovery::is_project_autosave)
+        });
         if let Some(kind) = kind {
             files.retain(|file| kind.matches(file.filetype.as_deref()));
         }

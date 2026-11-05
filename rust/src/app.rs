@@ -352,11 +352,18 @@ impl VfxLauncherApp {
         egui::Panel::bottom("action_status_strip").show(ui, |ui| {
             ui.add_space(3.0);
             if let Some(job) = &job {
-                ui.add(
-                    egui::ProgressBar::new(job.progress.fraction())
-                        .text(progress_label(job))
-                        .desired_height(13.0),
-                );
+                if !job.is_terminal() && job.progress.total.is_none() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(progress_label(job));
+                    });
+                } else {
+                    ui.add(
+                        egui::ProgressBar::new(job.progress.fraction())
+                            .text(progress_label(job))
+                            .desired_height(13.0),
+                    );
+                }
                 if let Some(current) = &job.progress.current {
                     ui.label(
                         egui::RichText::new(current.display().to_string())
@@ -636,12 +643,23 @@ impl VfxLauncherApp {
             notice_row(ui, "The project list could not be read.", Some(error), true);
         }
 
+        let mut dismiss_registration = false;
         match self.workspace.registration_status() {
             Some(status) => {
                 let line = status.summary_line();
                 let error = matches!(status, RegistrationStatus::Failed(_));
                 let details = status.detail_lines();
-                notice_row(ui, &line, None, error);
+                ui.horizontal(|ui| {
+                    if matches!(status, RegistrationStatus::Busy(_)) {
+                        ui.spinner();
+                    }
+                    notice_row(ui, &line, None, error);
+                    if !matches!(status, RegistrationStatus::Busy(_))
+                        && ui.small_button("Dismiss").clicked()
+                    {
+                        dismiss_registration = true;
+                    }
+                });
                 if !details.is_empty() {
                     ui.collapsing("Folder details", |ui| {
                         for line in details {
@@ -651,6 +669,9 @@ impl VfxLauncherApp {
                 }
             }
             None => {}
+        }
+        if dismiss_registration {
+            self.workspace.dismiss_registration_summary();
         }
 
         if !self.workspace.scan_lines().is_empty() {
@@ -663,11 +684,20 @@ impl VfxLauncherApp {
                     "s"
                 }
             );
-            ui.collapsing(summary, |ui| {
-                for line in self.workspace.scan_lines() {
-                    ui.label(egui::RichText::new(line).small());
+            let mut dismiss_scan = false;
+            ui.horizontal(|ui| {
+                ui.collapsing(summary, |ui| {
+                    for line in self.workspace.scan_lines() {
+                        ui.label(egui::RichText::new(line).small());
+                    }
+                });
+                if !self.workspace.scan_running() && ui.small_button("Dismiss").clicked() {
+                    dismiss_scan = true;
                 }
             });
+            if dismiss_scan {
+                self.workspace.dismiss_scan_summary();
+            }
         }
 
         let notices: Vec<(String, Option<String>, bool)> = self

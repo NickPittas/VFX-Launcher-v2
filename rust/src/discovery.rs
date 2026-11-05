@@ -354,6 +354,9 @@ pub fn walk(
                 break 'outer;
             }
             let child_relative = pending.relative.join(entry.file_name());
+            if request.purpose == ScanPurpose::Projects && is_project_autosave(&child_relative) {
+                continue;
+            }
             if is_excluded(&child_relative, &excludes) {
                 continue;
             }
@@ -375,6 +378,17 @@ pub fn walk(
                         stack.push(PendingDir { absolute, relative });
                     }
                 }
+            }
+            if index % CHECKPOINT_EVERY == 0 {
+                events.progress(
+                    JobPhase::Scanning,
+                    JobProgress {
+                        completed: entries.len() as u64,
+                        total: None,
+                        current: Some(entry.path()),
+                        ..JobProgress::default()
+                    },
+                );
             }
         }
     }
@@ -576,6 +590,31 @@ fn follow_link(path: &Path) -> EntryShape {
         Ok(_) => EntryShape::Special,
         Err(error) => EntryShape::Unreadable(error),
     }
+}
+
+/// AE saves normal `.aep` files in its Auto-Save folder, so extension filtering
+/// alone cannot distinguish them. Also hide explicitly named autosave projects.
+pub fn is_project_autosave(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().as_encoded_bytes();
+        let normalized: Vec<u8> = name
+            .iter()
+            .filter(|byte| !matches!(**byte, b' ' | b'-' | b'_'))
+            .map(u8::to_ascii_lowercase)
+            .collect();
+        normalized == b"adobeaftereffectsautosave" || normalized == b"autosave"
+    }) || path.file_name().is_some_and(|name| {
+        let name = name.as_encoded_bytes().to_ascii_lowercase();
+        name.ends_with(b".aep")
+            && [
+                b"auto-save".as_slice(),
+                b"auto_save",
+                b"auto save",
+                b"autosave",
+            ]
+            .iter()
+            .any(|word| name.windows(word.len()).any(|part| part == *word))
+    })
 }
 
 fn visit_entry(entry: &std::fs::DirEntry, parent_relative: &Path, filters: &ScanFilters) -> Visit {
