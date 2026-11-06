@@ -1,13 +1,13 @@
 //! X1b: the transfer executor.
 //!
-//! Linux is currently the only supported transfer backend; the other-platform
-//! module keeps the public API and refuses execution.
+//! Linux and Windows share one journal-first algorithm over the frozen native
+//! seam; any other platform keeps the public API and refuses execution.
 
-#[cfg(target_os = "linux")]
-#[path = "executor/linux.rs"]
+#[cfg(any(target_os = "linux", windows))]
+#[path = "executor/shared.rs"]
 mod platform;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 #[path = "executor/unsupported.rs"]
 mod platform;
 

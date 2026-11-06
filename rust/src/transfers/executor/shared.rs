@@ -1,10 +1,10 @@
-//! X1b: the Linux transfer executor.
+//! X1b: the native transfer executor shared by every supported platform.
 //!
 //! Execution is journal-first. The reviewed intent is persisted before the
 //! first mutation, every step is revalidated against the reviewed evidence, and
 //! outcomes are appended afterwards. Installs are staged in an app-owned
-//! sibling file that is flushed and checked, then committed with
-//! `renameat2(NOREPLACE)`, so a destination that appeared after review is never
+//! sibling file that is flushed and checked, then committed with the platform's
+//! no-clobber rename, so a destination that appeared after review is never
 //! clobbered and an interrupted run never leaves a half-written destination
 //! under its reviewed name.
 //!
@@ -19,8 +19,14 @@
 //! recovery path. A failed commit restores the old file only while the held
 //! identity proves it, with a no-clobber rename that is synced afterwards.
 //!
+//! Every filesystem step goes through the frozen native seam, so this algorithm
+//! is the same on Linux and Windows and only the primitives differ.
+//!
 //! Deliberate limits of this packet:
-//! - Linux only; other platforms keep the unsupported-operation boundary.
+//! - Linux and Windows. Any other platform keeps the unsupported-operation
+//!   boundary.
+//! - Namespace durability is reported, never assumed: a platform that cannot
+//!   confirm a folder sync says so in the outcome instead of claiming it.
 //! - Directory prerequisites run in order, then up to 16 scoped file workers
 //!   share the one catalog queue and aggregate progress. Every worker is joined
 //!   before finalization or failure returns; reports retain reviewed ordinals.
@@ -37,22 +43,19 @@
 //!   removal leaves both files; the run is then interrupted and inspectable,
 //!   never replayed automatically.
 
-use super::super::native::{EntryIdentity, Root};
+use super::super::native::{
+    AsDirectory, Directory, EntryIdentity, EntryInfo, EntryKind, NamespaceDurability,
+    RemovalOutcome, Root, handle_info, no_clobber_unavailable, preserve_metadata,
+};
 use super::super::{
     DestinationEvidence, DestinationExpectation, ItemCheckpoint, ItemEffect, ItemState,
     ItemValidation, JournaledPlan, NativeIdentity, PlannedAction, RunSummary, RunTerminal,
     SourceStamp, StoredPath, TransferCategory, TransferError, ValidatedPlan,
-    append_item_checkpoint, finalize_run, mark_run_running, nanos_from_time,
-    persist_validated_intent, update_item_outcome,
+    append_item_checkpoint, finalize_run, mark_run_running, persist_validated_intent,
+    update_item_outcome,
 };
 use crate::jobs::{Checkpoint, JobControl, JobEvents, JobPhase, JobProgress};
 use crate::storage::{CatalogClient, StorageError};
-use rustix::{
-    fd::{AsFd, OwnedFd},
-    fs::{FileType, Mode, Timestamps},
-    io::Errno,
-    time::Timespec,
-};
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
@@ -412,11 +415,11 @@ fn io_problem(what: &str, path: &Path, error: io::Error) -> Flow {
     )
 }
 
-/// Identity without the permission bits, matching the device/inode identity the
-/// review and every later proof use. Staged files are chmodded after creation, so
-/// their held identity's mode no longer describes the installed entry.
+/// The whole reviewed identity: device, inode and entry kind. Kind is a file type,
+/// not permissions, so preserved metadata cannot make a staged file look like a
+/// different entry.
 fn same_entry(left: EntryIdentity, right: EntryIdentity) -> bool {
-    left.device == right.device && left.inode == right.inode
+    left == right
 }
 
 #[derive(Default)]
@@ -849,7 +852,7 @@ impl<'run> Executor<'run> {
     /// Opens one destination folder and proves it is the very folder this run
     /// verified, so an item never mutates a folder swapped in after that check.
     /// A folder this run has not proven is refused instead of trusted by name.
-    fn open_parent(&self, parent_relative: &Path) -> io::Result<OwnedFd> {
+    fn open_parent(&self, parent_relative: &Path) -> io::Result<Directory> {
         let mut handle = self.verified_folder(Path::new(""))?;
         let mut prefix = PathBuf::new();
         for component in parent_relative.components() {
@@ -865,7 +868,7 @@ impl<'run> Executor<'run> {
         Ok(handle)
     }
 
-    fn verified_folder(&self, parent_relative: &Path) -> io::Result<OwnedFd> {
+    fn verified_folder(&self, parent_relative: &Path) -> io::Result<Directory> {
         let handle = if parent_relative.as_os_str().is_empty() {
             self.root.duplicate()
         } else {
@@ -895,7 +898,7 @@ impl<'run> Executor<'run> {
     /// trustworthy, so a source is never reopened by its absolute path; every
     /// folder is reached through the held handle with the native no-follow,
     /// beneath-root, no-cross-device resolver.
-    fn source_entry(&self, source: &Path) -> Result<(OwnedFd, OsString), Flow> {
+    fn source_entry(&self, source: &Path) -> Result<(Directory, OsString), Flow> {
         let root_path = self.source_root_path.as_deref().ok_or_else(|| {
             problem(format!(
                 "source {} has no reviewed source root",
@@ -954,33 +957,34 @@ impl<'run> Executor<'run> {
     ///
     /// Returns a visible note when the file cannot be shown to be gone: a failed
     /// item must not hide junk it left.
-    fn discard_stage(&self, parent: &OwnedFd, stage: Stage) -> Option<String> {
+    fn discard_stage(&self, parent: &Directory, stage: Stage) -> Option<String> {
         let Stage {
             file,
             name,
             path,
-            mut identity,
+            identity,
             published,
         } = stage;
         if published {
             return None;
         }
-        // Permission preservation changes mode, not ownership. Read mode only
-        // from our still-held creating handle, never from the cleanup pathname.
-        match rustix::fs::fstat(&file) {
-            Ok(stat) if same_entry(EntryIdentity::from(stat), identity) => {
-                identity.mode = stat.st_mode
-            }
-            _ => {
-                return Some(format!(
-                    "The staging file {} was retained because its creating handle could not be verified.",
-                    path.display()
-                ));
-            }
+        // The held creating handle is the only source of identity; the cleanup
+        // name is never trusted. It stays open across the proof and the deletion
+        // and is closed only afterwards.
+        if !handle_info(&file).is_ok_and(|info| same_entry(EntryIdentity::from(info), identity)) {
+            return Some(format!(
+                "The staging file {} was retained because its creating handle could not be verified.",
+                path.display()
+            ));
         }
+        let removed = self.root.remove_owned(parent, &name, identity);
         drop(file);
-        match self.root.remove_owned(parent, &name, identity) {
-            Ok(()) => None,
+        match removed {
+            Ok(RemovalOutcome::Removed) => None,
+            Ok(RemovalOutcome::Pending) => Some(format!(
+                "the staging file {} was retained: its name could not be shown to be gone",
+                path.display()
+            )),
             Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => Some(format!(
                 "the staging file {} was retained: {error}",
@@ -993,7 +997,7 @@ impl<'run> Executor<'run> {
     /// visible: appended to a diagnostic outcome, or emitted when the journal
     /// cannot carry it. A journal failure mutates nothing and names the exact
     /// path that was left behind.
-    fn abandon_stage(&self, parent: &OwnedFd, stage: Stage, flow: Flow) -> Flow {
+    fn abandon_stage(&self, parent: &Directory, stage: Stage, flow: Flow) -> Flow {
         if let Flow::Abort(error) = flow {
             if !stage.published {
                 self.events.diagnostic(
@@ -1062,11 +1066,11 @@ impl<'run> Executor<'run> {
                     let identity = identity_of_handle(&created).map_err(&created_error)?;
                     // The new folder's own entry set becomes durable only when it is
                     // synced, so its children cannot outlive it after a crash.
-                    self.root.sync_dir(&created).map_err(&created_error)?;
-                    self.root.sync_dir(&parent).map_err(created_error)?;
+                    let own = self.root.sync_dir(&created).map_err(&created_error)?;
+                    let parent_sync = self.root.sync_dir(&parent).map_err(created_error)?;
                     Arc::make_mut(&mut self.verified_folders).insert(relative, identity);
                     Ok(Done::Succeeded {
-                        note: None,
+                        note: unconfirmed_durability([own, parent_sync]),
                         recovery: Vec::new(),
                     })
                 }
@@ -1176,7 +1180,11 @@ impl<'run> Executor<'run> {
         let source_meta = source_file
             .metadata()
             .map_err(|error| io_problem("the source file", &source, error))?;
-        verify_stamp(&source_meta, &reviewed, &source)
+        // The reviewed stamp is proved against the held handle, never against a
+        // pathname or a metadata-only identity guess.
+        let source_info = handle_info(&source_file)
+            .map_err(|error| io_problem("the source file", &source, error))?;
+        verify_stamp("source", &source_info, &reviewed, &source)
             .map_err(|message| Flow::Problem(message, Vec::new()))?;
 
         let mut stage = self.begin_staging(item, &parent, &name, &destination)?;
@@ -1205,7 +1213,7 @@ impl<'run> Executor<'run> {
                 return Err(self.abandon_stage(&parent, stage, flow));
             }
         };
-        let note = combine_notes(metadata_note, installed.note);
+        let mut note = combine_notes(metadata_note, installed.note);
         let recovery = installed.recovery;
 
         if item.effect == ItemEffect::Move {
@@ -1245,7 +1253,7 @@ impl<'run> Executor<'run> {
                 SourceCheck::Unknown(message) => {
                     return Err(Flow::PostInstall {
                         message: with_note(format!(
-                            "{message}; the installed copy at {} was kept and the source {} was left in place",
+                            "{message}; the installed copy at {} was kept; this run did not remove the source {}, whose current state could not be confirmed",
                             destination.display(),
                             source.display()
                         )),
@@ -1253,37 +1261,56 @@ impl<'run> Executor<'run> {
                     });
                 }
             };
-            if let Err(error) = self
+            // The copied handle is closed only after its full reviewed stamp has
+            // just been re-proved: a platform that cannot delete an open file gets
+            // a closed one, and nothing after this point reads the source.
+            drop(source_file);
+            match self
                 .root
                 .remove_owned(&source_parent, &source_name, current)
             {
-                return Ok(Done::SourceRetained {
-                    message: with_note(format!(
-                        "the copy is installed, but the source {} could not be removed: {error}",
-                        source.display()
-                    )),
-                    recovery: move_recovery,
-                });
+                Ok(RemovalOutcome::Removed) => {}
+                Ok(RemovalOutcome::Pending) => {
+                    return Err(Flow::PostInstall {
+                        message: with_note(format!(
+                            "the copy is installed, but the source {} could not be shown to be removed",
+                            source.display()
+                        )),
+                        recovery: move_recovery,
+                    });
+                }
+                Err(error) => {
+                    return Err(Flow::PostInstall {
+                        message: with_note(format!(
+                            "the copy is installed, but source removal at {} could not be confirmed: {error}",
+                            source.display()
+                        )),
+                        recovery: move_recovery,
+                    });
+                }
             }
-            if let Err(message) = self.sync_move_directories(&source_parent, &parent) {
-                return Err(Flow::PostInstall {
-                    message: with_note(format!(
-                        "the destination is installed and the source was removed, but {message}"
-                    )),
-                    recovery: move_recovery,
-                });
+            match self.sync_move_directories(&source_parent, &parent) {
+                Ok(limitation) => note = combine_notes(note, limitation),
+                Err(message) => {
+                    return Err(Flow::PostInstall {
+                        message: with_note(format!(
+                            "the destination is installed and the source was removed, but {message}"
+                        )),
+                        recovery: move_recovery,
+                    });
+                }
             }
         }
         Ok(Done::Succeeded { note, recovery })
     }
 
     /// Re-proves the source between the acknowledged `RemovingSource` checkpoint
-    /// and the unlink. A no-follow stat of the directory entry and the metadata of
-    /// the very handle that was copied must both still be the reviewed regular
-    /// file, and must be the same file; a Move deletes nothing it cannot re-prove.
+    /// and the deletion. A no-follow stat of the directory entry and the held
+    /// handle that was copied must both still be the reviewed regular file, and
+    /// must be the same file; a Move deletes nothing it cannot re-prove.
     fn recheck_source(
         &self,
-        source_parent: &OwnedFd,
+        source_parent: &Directory,
         source_name: &OsStr,
         source: &Path,
         reviewed: &SourceStamp,
@@ -1299,11 +1326,11 @@ impl<'run> Executor<'run> {
                 ));
             }
         };
-        if let Err(message) = verify_stamp_stat(&entry, reviewed, source) {
+        if let Err(message) = verify_stamp("source", &entry, reviewed, source) {
             return SourceCheck::Changed(message);
         }
-        let meta = match copied.metadata() {
-            Ok(meta) => meta,
+        let copied_info = match handle_info(copied) {
+            Ok(info) => info,
             Err(error) => {
                 return SourceCheck::Unknown(format!(
                     "the copied source {} could no longer be inspected after the install: {error}",
@@ -1311,7 +1338,7 @@ impl<'run> Executor<'run> {
                 ));
             }
         };
-        if let Err(message) = verify_stamp(&meta, reviewed, source) {
+        if let Err(message) = verify_stamp("source", &copied_info, reviewed, source) {
             return SourceCheck::Changed(message);
         }
         let entry_identity = EntryIdentity::from(entry);
@@ -1373,34 +1400,18 @@ impl<'run> Executor<'run> {
             )));
         }
 
-        // Metadata preservation is best effort but never silent: the outcome
-        // carries the reason when it fails.
-        let mut note = None;
-        if let Err(error) = rustix::fs::fchmod(
-            &stage.file,
-            Mode::from_raw_mode(source_meta_mode(source_meta)),
-        ) {
-            note = Some(format!(
-                "copied, but the source permissions could not be preserved: {error}"
-            ));
-        }
-        if let Err(error) = rustix::fs::futimens(&stage.file, &source_times(source_meta)) {
-            let message =
-                format!("copied, but the source modification time could not be preserved: {error}");
-            note = Some(match note {
-                Some(previous) => format!("{previous}; {message}"),
-                None => message,
-            });
-        }
+        // Metadata preservation is best effort but never silent: the platform
+        // returns one warning per attribute it omitted.
+        let warnings = preserve_metadata(&stage.file, source_meta);
+        let note = (!warnings.is_empty()).then(|| warnings.join("; "));
         stage
             .file
             .sync_all()
             .map_err(|error| io_problem("the staging file", &stage.path, error))?;
 
-        let after = source_file
-            .metadata()
+        let after = handle_info(source_file)
             .map_err(|error| io_problem("the source file", source, error))?;
-        verify_stamp(&after, reviewed, source)
+        verify_stamp("source", &after, reviewed, source)
             .map_err(|message| Flow::Problem(message, Vec::new()))?;
 
         Ok(note)
@@ -1411,14 +1422,20 @@ impl<'run> Executor<'run> {
     fn install(
         &mut self,
         item: &ItemValidation,
-        parent: &OwnedFd,
+        parent: &Directory,
         name: &OsStr,
         stage: &mut Stage,
         destination: &Path,
     ) -> Result<InstallOutcome, Flow> {
         match item.expectation.as_ref() {
             Some(DestinationExpectation::Absent) => {
-                match self.root.publish_noreplace(parent, &stage.name, name) {
+                match self.root.publish_noreplace(
+                    parent,
+                    &stage.file,
+                    &stage.name,
+                    name,
+                    stage.identity,
+                ) {
                     Ok(()) => {
                         stage.published = true;
                         if let Err(message) =
@@ -1438,10 +1455,15 @@ impl<'run> Executor<'run> {
                         // Journal evidence follows the namespace sync, so the record
                         // never claims a durability the filesystem refused.
                         match self.namespace_sync(parent) {
-                            Ok(()) => {
-                                self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?;
+                            Ok(limitation) => {
+                                self.checkpoint(
+                                    item,
+                                    ItemCheckpoint::Installed,
+                                    limitation.clone(),
+                                    &[],
+                                )?;
                                 Ok(InstallOutcome {
-                                    note: None,
+                                    note: limitation,
                                     recovery: Vec::new(),
                                 })
                             }
@@ -1483,7 +1505,7 @@ impl<'run> Executor<'run> {
                     .root
                     .entry_stat(parent, name)
                     .map_err(|error| io_problem("the existing destination", destination, error))?;
-                verify_existing_destination(&current, stamp, destination)
+                verify_stamp("destination", &current, stamp, destination)
                     .map_err(|message| Flow::Problem(message, Vec::new()))?;
                 // Held for every later proof: only the entry this item read is ever
                 // restored or deleted, never whatever the name means afterwards.
@@ -1533,7 +1555,7 @@ impl<'run> Executor<'run> {
                     .root
                     .entry_stat(parent, name)
                     .map_err(|error| io_problem("the existing destination", destination, error))?;
-                verify_existing_destination(&fresh, stamp, destination)
+                verify_stamp("destination", &fresh, stamp, destination)
                     .map_err(|message| Flow::Problem(message, Vec::new()))?;
                 if !same_entry(EntryIdentity::from(fresh), old_identity) {
                     return Err(problem(format!(
@@ -1542,7 +1564,10 @@ impl<'run> Executor<'run> {
                     )));
                 }
 
-                if let Err(error) = self.root.rename_between(parent, name, parent, &backup) {
+                if let Err(error) =
+                    self.root
+                        .rename_between(parent, name, parent, &backup, old_identity)
+                {
                     return Err(if error.kind() == ErrorKind::AlreadyExists {
                         problem(format!(
                             "the reviewed preservation target for {} appeared after review; the destination was left untouched",
@@ -1587,7 +1612,13 @@ impl<'run> Executor<'run> {
                         retained(&backup_path),
                     ));
                 }
-                match self.root.publish_noreplace(parent, &stage.name, name) {
+                match self.root.publish_noreplace(
+                    parent,
+                    &stage.file,
+                    &stage.name,
+                    name,
+                    stage.identity,
+                ) {
                     Ok(()) => {
                         stage.published = true;
                         if let Err(message) =
@@ -1607,9 +1638,15 @@ impl<'run> Executor<'run> {
                         // Evidence follows the folder sync while the displaced
                         // original is still beside the destination. A refused sync
                         // is recorded as content installed, not as durability.
-                        match self.namespace_sync(parent) {
-                            Ok(()) => {
-                                self.checkpoint(item, ItemCheckpoint::Installed, None, &[])?
+                        let limitation = match self.namespace_sync(parent) {
+                            Ok(limitation) => {
+                                self.checkpoint(
+                                    item,
+                                    ItemCheckpoint::Installed,
+                                    limitation.clone(),
+                                    &[],
+                                )?;
+                                limitation
                             }
                             Err(reason) => {
                                 self.checkpoint(
@@ -1630,15 +1667,18 @@ impl<'run> Executor<'run> {
                                     recovery: retained(&backup_path),
                                 });
                             }
-                        }
+                        };
                         if keep {
                             // PreserveExisting keeps the reviewed original at its
                             // numbered name and reports exactly where it stayed.
                             return Ok(InstallOutcome {
-                                note: Some(format!(
-                                    "installed; the previous destination was kept at {}",
-                                    backup_path.display()
-                                )),
+                                note: combine_notes(
+                                    Some(format!(
+                                        "installed; the previous destination was kept at {}",
+                                        backup_path.display()
+                                    )),
+                                    limitation,
+                                ),
                                 recovery: vec![backup_path.clone()],
                             });
                         }
@@ -1651,8 +1691,20 @@ impl<'run> Executor<'run> {
                             None,
                             &[backup_path.clone()],
                         )?;
-                        if let Err(error) = self.root.remove_owned(parent, &backup, old_identity) {
-                            if error.kind() != ErrorKind::NotFound {
+                        match self.root.remove_owned(parent, &backup, old_identity) {
+                            Ok(RemovalOutcome::Removed) => {}
+                            Ok(RemovalOutcome::Pending) => {
+                                return Err(Flow::PostInstall {
+                                    message: format!(
+                                        "the reviewed bytes were installed at {}, but the replaced file {} could not be shown to be gone",
+                                        destination.display(),
+                                        backup_path.display()
+                                    ),
+                                    recovery: retained(&backup_path),
+                                });
+                            }
+                            Err(error) if error.kind() == ErrorKind::NotFound => {}
+                            Err(error) => {
                                 return Err(Flow::PostInstall {
                                     message: format!(
                                         "the reviewed bytes were installed at {}, but the replaced file {} could not be removed or shown to be the file this item displaced: {error}",
@@ -1663,18 +1715,23 @@ impl<'run> Executor<'run> {
                                 });
                             }
                         }
-                        if let Err(reason) = self.namespace_sync(parent) {
-                            return Err(Flow::PostInstall {
-                                message: format!(
-                                    "the reviewed bytes were installed at {}, and the replaced file {} was removed, but {reason}",
-                                    destination.display(),
-                                    backup_path.display()
-                                ),
-                                recovery: retained(&backup_path),
-                            });
+                        // A durability limit was already recorded above, so only a
+                        // refused sync fails here.
+                        match self.namespace_sync(parent) {
+                            Ok(_) => {}
+                            Err(reason) => {
+                                return Err(Flow::PostInstall {
+                                    message: format!(
+                                        "the reviewed bytes were installed at {}, and the replaced file {} was removed, but {reason}",
+                                        destination.display(),
+                                        backup_path.display()
+                                    ),
+                                    recovery: vec![destination.to_path_buf()],
+                                });
+                            }
                         }
                         Ok(InstallOutcome {
-                            note: None,
+                            note: limitation,
                             recovery: Vec::new(),
                         })
                     }
@@ -1695,18 +1752,28 @@ impl<'run> Executor<'run> {
                                 retained(&backup_path),
                             ));
                         }
-                        match self.root.rename_between(parent, &backup, parent, name) {
+                        match self
+                            .root
+                            .rename_between(parent, &backup, parent, name, old_identity)
+                        {
                             Ok(()) => match self.namespace_sync(parent) {
-                                Ok(()) => Err(problem(format!(
+                                Ok(None) => Err(problem(format!(
                                     "the staged file could not be installed at {} ({error}); the previous destination was restored",
                                     destination.display()
                                 ))),
+                                Ok(Some(limitation)) => Err(Flow::Problem(
+                                    format!(
+                                        "the staged file could not be installed at {} ({error}); the previous destination was restored to that name, but {limitation}",
+                                        destination.display()
+                                    ),
+                                    vec![destination.to_path_buf()],
+                                )),
                                 Err(reason) => Err(Flow::Problem(
                                     format!(
                                         "the staged file could not be installed at {} ({error}); the previous destination was restored to that name, but {reason}",
                                         destination.display()
                                     ),
-                                    retained(&backup_path),
+                                    vec![destination.to_path_buf()],
                                 )),
                             },
                             Err(restore_error) => Err(Flow::Problem(
@@ -1733,7 +1800,7 @@ impl<'run> Executor<'run> {
     /// raced file is never overwritten.
     fn unique_backup_name(
         &self,
-        parent: &OwnedFd,
+        parent: &Directory,
         name: &OsStr,
         destination: &Path,
     ) -> Result<OsString, Flow> {
@@ -1769,7 +1836,7 @@ impl<'run> Executor<'run> {
     /// created, using the identity held from the creating handle.
     fn verify_installed(
         &self,
-        parent: &OwnedFd,
+        parent: &Directory,
         name: &OsStr,
         stage: &Stage,
         destination: &Path,
@@ -1789,24 +1856,28 @@ impl<'run> Executor<'run> {
         Ok(())
     }
 
-    /// Syncs the folder that now holds a committed file. Some network and FUSE
-    /// filesystems refuse a directory fsync; that is reported, never assumed.
-    fn namespace_sync(&self, parent: &OwnedFd) -> Result<(), String> {
-        self.root
+    /// Syncs the folder that now holds a committed file. A refused sync is
+    /// reported to the caller, which turns it into a post-install failure; a
+    /// platform that cannot confirm namespace durability at all returns that limit
+    /// instead of claiming it.
+    fn namespace_sync(&self, parent: &Directory) -> Result<Option<String>, String> {
+        let durability = self
+            .root
             .sync_dir(parent)
-            .map_err(|error| format!("the destination folder could not be synced: {error}"))
+            .map_err(|error| format!("the destination folder could not be synced: {error}"))?;
+        Ok(unconfirmed_durability([durability]))
     }
 
     fn sync_move_directories(
         &self,
-        source_parent: &OwnedFd,
-        destination_parent: &OwnedFd,
-    ) -> Result<(), String> {
+        source_parent: &Directory,
+        destination_parent: &Directory,
+    ) -> Result<Option<String>, String> {
         match (
             self.root.sync_dir(source_parent),
             self.root.sync_dir(destination_parent),
         ) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(source), Ok(destination)) => Ok(unconfirmed_durability([source, destination])),
             (Err(error), _) | (_, Err(error)) => Err(format!(
                 "moved, but the affected folders could not be synced: {error}"
             )),
@@ -1822,7 +1893,7 @@ impl<'run> Executor<'run> {
     fn begin_staging(
         &mut self,
         item: &ItemValidation,
-        parent: &OwnedFd,
+        parent: &Directory,
         name: &OsStr,
         destination: &Path,
     ) -> Result<Stage, Flow> {
@@ -1847,8 +1918,8 @@ impl<'run> Executor<'run> {
         };
         // The identity of the file this handle created is the only one any later
         // cleanup may use; a name that came to mean something else is reported.
-        let identity = match rustix::fs::fstat(&file) {
-            Ok(stat) => EntryIdentity::from(stat),
+        let identity = match handle_info(&file) {
+            Ok(info) => EntryIdentity::from(info),
             Err(error) => {
                 drop(file);
                 return Err(Flow::Problem(
@@ -1874,7 +1945,7 @@ impl<'run> Executor<'run> {
     /// it.
     fn free_staging_name(
         &mut self,
-        parent: &OwnedFd,
+        parent: &Directory,
         name: &OsStr,
         destination: &Path,
     ) -> Result<OsString, Flow> {
@@ -1920,23 +1991,17 @@ fn combine_notes(first: Option<String>, second: Option<String>) -> Option<String
     }
 }
 
-fn source_meta_mode(meta: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::MetadataExt;
-    meta.mode()
-}
-
-fn source_times(meta: &fs::Metadata) -> Timestamps {
-    use std::os::unix::fs::MetadataExt;
-    Timestamps {
-        last_access: Timespec {
-            tv_sec: meta.atime(),
-            tv_nsec: meta.atime_nsec(),
-        },
-        last_modification: Timespec {
-            tv_sec: meta.mtime(),
-            tv_nsec: meta.mtime_nsec(),
-        },
-    }
+/// One visible note when a platform cannot confirm that a folder entry survives a
+/// power loss. A confirmed sync says nothing.
+fn unconfirmed_durability(
+    observed: impl IntoIterator<Item = NamespaceDurability>,
+) -> Option<String> {
+    observed
+        .into_iter()
+        .any(|durability| durability == NamespaceDurability::Unconfirmed)
+        .then(|| {
+            "this platform cannot confirm that the folder change survives a power loss".to_string()
+        })
 }
 
 /// Opens the declared source root once per run and refuses unless its recorded
@@ -1976,15 +2041,18 @@ fn hold_source_root(validated: &ValidatedPlan) -> Result<(Root, PathBuf), String
     Ok((root, path))
 }
 
-fn identity_of_handle(handle: &impl AsFd) -> io::Result<NativeIdentity> {
-    let stat = rustix::fs::fstat(handle)?;
-    Ok(native_identity(EntryIdentity::from(stat)))
+fn identity_of_handle(handle: &impl AsDirectory) -> io::Result<NativeIdentity> {
+    Ok(native_identity(EntryIdentity::from(handle_info(handle)?)))
 }
 
+/// Handle identities carry one platform's own evidence: a unix device/inode pair
+/// or a Windows volume serial/file index. The durable type keeps them apart, so a
+/// review recorded on one platform is never compared against the other.
 fn native_identity(identity: EntryIdentity) -> NativeIdentity {
+    let pair = Some((identity.device, identity.inode));
     NativeIdentity {
-        unix: Some((identity.device, identity.inode)),
-        windows: None,
+        unix: if cfg!(windows) { None } else { pair },
+        windows: if cfg!(windows) { pair } else { None },
     }
 }
 
@@ -2010,141 +2078,56 @@ fn require_same_identity(
     }
 }
 
-/// The source must still be exactly the file the review recorded.
-fn verify_stamp(meta: &fs::Metadata, reviewed: &SourceStamp, path: &Path) -> Result<(), String> {
-    if meta.len() != reviewed.size {
+/// The reviewed entry must still be exactly the regular file the review recorded:
+/// kind, size, modification time and identity. `what` names the reviewed side in
+/// every message. Evidence comes from a held handle or a no-follow stat of the
+/// reviewed name, never from a path-guessed identity.
+fn verify_stamp(
+    what: &str,
+    info: &EntryInfo,
+    reviewed: &SourceStamp,
+    path: &Path,
+) -> Result<(), String> {
+    if info.identity.kind != EntryKind::Regular {
         return Err(format!(
-            "source {} is {} bytes; the review recorded {}",
+            "{what} {} is no longer a regular file",
+            path.display()
+        ));
+    }
+    if info.size != reviewed.size {
+        return Err(format!(
+            "{what} {} is {} bytes; the review recorded {}",
             path.display(),
-            meta.len(),
+            info.size,
             reviewed.size
         ));
     }
     if let Some(expected) = reviewed.modified_ns {
-        let observed = meta
-            .modified()
-            .map_err(|error| {
-                format!(
-                    "source {} modification time is unavailable: {error}",
-                    path.display()
-                )
-            })
-            .and_then(nanos_from_time)?;
-        if observed != expected {
+        let observed = info
+            .modified_ns
+            .ok_or_else(|| format!("{what} {} modification time is unavailable", path.display()))?;
+        if u64::try_from(observed).ok() != Some(expected) {
             return Err(format!(
-                "source {} changed after review: its modification time moved",
+                "{what} {} changed after review: its modification time moved",
                 path.display()
             ));
         }
     }
-    match (
-        reviewed.identity,
-        crate::paths::FileIdentity::from_metadata(meta).map(super::super::native_identity_of),
-    ) {
-        (Some(before), Some(now)) => match before.same(&now) {
+    match reviewed.identity {
+        Some(before) => match before.same(&native_identity(EntryIdentity::from(*info))) {
             Some(true) => Ok(()),
             Some(false) => Err(format!(
-                "source {} is no longer the file the review recorded",
+                "{what} {} is no longer the file the review recorded",
                 path.display()
             )),
             None => Err(format!(
-                "source {} shares no comparable identity evidence with the review",
+                "{what} {} shares no comparable identity evidence with the review",
                 path.display()
             )),
         },
-        (Some(_), None) => Err(format!(
-            "source {} identity can no longer be read",
-            path.display()
-        )),
-        (None, _) => Err(format!(
-            "the review recorded no identity evidence for source {}",
+        None => Err(format!(
+            "the review recorded no identity evidence for {what} {}",
             path.display()
         )),
     }
-}
-
-/// The reviewed existing destination must still be the same regular file with the
-/// same size and modification time before Replace or PreserveExisting displaces
-/// it. Only that displaced entry is ever mutated.
-fn verify_existing_destination(
-    stat: &rustix::fs::Stat,
-    reviewed: &SourceStamp,
-    path: &Path,
-) -> Result<(), String> {
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(format!(
-            "destination {} is no longer a regular file; it was left untouched",
-            path.display()
-        ));
-    }
-    let size = u64::try_from(stat.st_size)
-        .map_err(|_| format!("destination {} reports an unusable size", path.display()))?;
-    if size != reviewed.size {
-        return Err(format!(
-            "destination {} changed size after review; it was left untouched",
-            path.display()
-        ));
-    }
-    if let Some(expected) = reviewed.modified_ns {
-        let observed = i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec);
-        if observed != i128::from(expected) {
-            return Err(format!(
-                "destination {} changed after review: its modification time moved",
-                path.display()
-            ));
-        }
-    }
-    require_same_identity(
-        reviewed.identity,
-        Some(native_identity(EntryIdentity::from(*stat))),
-        &format!("the existing destination {}", path.display()),
-    )
-}
-
-/// The directory entry a Move is about to unlink must still be the reviewed
-/// regular file: type, size, modification time and identity all agree.
-fn verify_stamp_stat(
-    stat: &rustix::fs::Stat,
-    reviewed: &SourceStamp,
-    path: &Path,
-) -> Result<(), String> {
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(format!(
-            "source {} is no longer a regular file",
-            path.display()
-        ));
-    }
-    let size = u64::try_from(stat.st_size)
-        .map_err(|_| format!("source {} reports an unusable size", path.display()))?;
-    if size != reviewed.size {
-        return Err(format!(
-            "source {} is {size} bytes; the review recorded {}",
-            path.display(),
-            reviewed.size
-        ));
-    }
-    if let Some(expected) = reviewed.modified_ns {
-        let observed = i128::from(stat.st_mtime) * 1_000_000_000 + i128::from(stat.st_mtime_nsec);
-        if observed != i128::from(expected) {
-            return Err(format!(
-                "source {} changed after review: its modification time moved",
-                path.display()
-            ));
-        }
-    }
-    require_same_identity(
-        reviewed.identity,
-        Some(native_identity(EntryIdentity::from(*stat))),
-        &format!("source {}", path.display()),
-    )
-}
-
-/// `renameat2(RENAME_NOREPLACE)` is the no-clobber commit primitive. When the
-/// kernel or filesystem does not provide it, the item is refused instead of
-/// falling back to a replace-by-rename.
-fn no_clobber_unavailable(error: &io::Error) -> bool {
-    matches!(
-        Errno::from_io_error(error),
-        Some(Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP)
-    )
 }

@@ -1,3 +1,14 @@
+## Windows native execution — 2026-11-06
+
+Native Windows execution now shares the reviewed executor with Linux. Copy,
+Move, Skip/Replace/Keep Both/Preserve Existing, backup and generated Nuke-file
+creation passed disposable native Windows operations. See
+[NATIVE-WINDOWS-EVIDENCE.md](NATIVE-WINDOWS-EVIDENCE.md) for exact counts,
+screenshots, the corrected rename-wrapper failure and unverified limits.
+The user-approved Windows completion policy records unconfirmed sudden-power-loss
+namespace durability; Linux keeps its directory-fsync requirement. Older
+Windows-unsupported statements below describe prior packets and are superseded.
+
 # Implementation status
 
 ## Full-application completion work in progress

@@ -112,7 +112,7 @@ impl TransferError {
         self.run_id
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn with_run_id(mut self, run_id: i64) -> Self {
         self.run_id = Some(run_id);
         self
@@ -1080,6 +1080,9 @@ fn resolved_key(path: &Path, what: &str) -> Result<PathKey, String> {
         .map_err(|error| format!("resolved {what} is unusable: {error}"))
 }
 
+#[cfg(windows)]
+pub(crate) const WINDOWS_NAMESPACE_WARNING: &str = "Windows completes file operations after flushing file contents and a native no-clobber rename. Sudden power-loss durability of folder entries is unconfirmed; this is not Linux directory-fsync durability.";
+
 /// Validates one plan against the filesystem as it is right now.
 ///
 /// Extension-copy plans must carry `Complete` source evidence; `Partial`,
@@ -1092,6 +1095,8 @@ fn resolved_key(path: &Path, what: &str) -> Result<PathKey, String> {
 /// filesystem; X1b must revalidate and use no-clobber writes.
 pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
     let mut warnings = plan.warnings.clone();
+    #[cfg(windows)]
+    warnings.push(WINDOWS_NAMESPACE_WARNING.to_string());
     let destination_root = plan.destination_root_path();
     if !destination_root.is_absolute() {
         return refused_report(plan, "destination root must be an absolute path");

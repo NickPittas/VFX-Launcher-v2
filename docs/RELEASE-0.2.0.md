@@ -1,7 +1,7 @@
 # VFX Launcher 0.2.0
 
 Linux x86_64 AppImage of the Rust/egui merged workspace, plus a Windows x64
-portable preview:
+portable package:
 
 - Projects catalog, version selection, user settings and legacy import.
 - Project templates, clients, named shots/sequences and Nuke script generation.
@@ -13,15 +13,15 @@ portable preview:
 This is a migration preview, not a claim of complete legacy parity or complete
 runtime verification. See `docs/migration/IMPLEMENTATION-STATUS.md` and the native
 evidence documents for remaining work. External Nuke/viewer integrations and
-advanced regex compatibility remain incomplete. The transfer executor is Linux
-only. Schedules run while the desktop application is open.
+advanced regex compatibility remain incomplete. The transfer executor supports Linux and Windows. Schedules run while the desktop application is open.
 
-The Windows preview provides project browsing/scanning, settings and configured
-application launching. File creation, copy/move and backup execution remain
-unavailable on Windows and refuse without performing a transfer. This limitation
-is shown in the application and in `README-Windows.md` inside the zip. It is not
-Windows feature parity. The Windows asset's exact source commit is recorded in
-its `BUILD-INFO.txt`; the existing Linux asset remains the verified AppImage from
+The Windows package includes native file creation, copy/move, all four conflict
+policies and backup execution through the shared journaled executor. Windows
+Move/Replace uses normal Windows completion semantics after file flush and native
+no-clobber rename; sudden power-loss namespace durability is unconfirmed and is
+recorded in the application and journal. ACLs and alternate data streams are not
+copied. The Windows asset's exact source commit is recorded in its
+`BUILD-INFO.txt`; the existing Linux asset remains the verified AppImage from
 the `v0.2.0` tag.
 
 The AppImage bundles GTK3 and its supporting libraries. GPU drivers, the desktop

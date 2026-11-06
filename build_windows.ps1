@@ -34,14 +34,14 @@ if ($check.ExitCode -ne 0 -or (Get-Content (Join-Path $logs "version.out") -Raw)
 $staging = Join-Path $artifacts ("windows-appdir-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory $staging | Out-Null
 Copy-Item $binary (Join-Path $staging "vfx-launcher.exe")
-Copy-Item (Join-Path $repo "docs/WINDOWS-PREVIEW.md") (Join-Path $staging "README-Windows.md")
+Copy-Item (Join-Path $repo "docs/WINDOWS.md") (Join-Path $staging "README-Windows.md")
 Copy-Item (Join-Path $repo "docs/RELEASE-0.2.0.md") (Join-Path $staging "RELEASE.md")
 $source = & git -C $repo rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw "Cannot record the source commit." }
 $dirty = @(& git -C $repo status --porcelain).Count -gt 0
-@("VFX Launcher $version Windows x64 preview", "Source commit: $source", "Uncommitted source changes: $dirty", "CRT: statically linked", "File operation execution: unsupported on Windows") | Set-Content (Join-Path $staging "BUILD-INFO.txt") -Encoding UTF8
-$archive = Join-Path $release "VFX-Launcher-$version-Windows-x86_64-preview.zip"
+@("VFX Launcher $version Windows x64", "Source commit: $source", "Uncommitted source changes: $dirty", "CRT: statically linked", "File operation execution: native Windows shared executor; namespace power-loss durability unconfirmed") | Set-Content (Join-Path $staging "BUILD-INFO.txt") -Encoding UTF8
+$archive = Join-Path $release "VFX-Launcher-$version-Windows-x86_64.zip"
 Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive -Force
 $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 "$hash  $(Split-Path $archive -Leaf)" | Set-Content "$archive.sha256" -Encoding ASCII
-Write-Output ("Windows preview: " + $archive)
+Write-Output ("Windows package: " + $archive)

@@ -354,10 +354,6 @@ impl VfxLauncherApp {
                     self.navigation_button(ui, View::Settings);
                 });
             });
-            #[cfg(windows)]
-            ui.label(egui::RichText::new(
-                "Windows preview: browse and launch projects. File creation, copy/move and backup execution are not available yet."
-            ).small().color(PROBLEM));
         });
     }
 
