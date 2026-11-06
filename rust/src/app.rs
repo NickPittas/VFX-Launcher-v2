@@ -422,7 +422,7 @@ impl VfxLauncherApp {
                         || self.workspace.registration_picker_pending()
                         || self.workspace.settings_browse_pending())
                 {
-                    ui.label("Close the folder chooser to finish quitting.");
+                    ui.label("Close the file chooser to finish quitting.");
                 } else if self.view == View::ShotsAndSequences {
                     ui.label(egui::RichText::new(self.structure.status_line()).small());
                 } else {
@@ -470,7 +470,7 @@ impl VfxLauncherApp {
                             || self.incoming.is_picker_job(job.id)
                             || self.legacy_import.is_picker_job(job.id)
                         {
-                            ui.label("Waiting for folder chooser");
+                            ui.label("Waiting for file chooser");
                         } else {
                             if ui.button("Cancel").clicked() {
                                 cancel = Some(job.id);
