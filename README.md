@@ -1,6 +1,11 @@
 # VFX Project Launcher
 
-A modern, slick Windows application for managing and launching VFX projects (Nuke and After Effects files) from a centralized SQLite database.
+The merged Rust/egui application is now version **0.2.0**, packaged for Linux
+x86_64 as an AppImage. See [Linux installation and build instructions](docs/LINUX-APPIMAGE.md)
+and [0.2.0 release notes](docs/RELEASE-0.2.0.md).
+
+The Python Windows application remains available. The sections below describe
+that legacy application.
 
 ![VFX Launcher](ui_slick/icons/icon_3_512.png)
 
@@ -45,9 +50,8 @@ A Python-based Windows application that helps VFX artists manage and quickly lau
 Configure the database location on first run, then set paths to Nuke and
 After Effects in Settings.
 
-**Linux:** Download `VFX_Launcher-x86_64.AppImage` from the
-[latest release](https://github.com/NickPittas/VFX-Launcher-v2/releases),
-make it executable (`chmod +x`), and run it.
+**Linux:** Use the versioned Rust AppImage described in the
+[Linux instructions](docs/LINUX-APPIMAGE.md).
 
 ### Option 2: Use Installer
 1. Download `VFX_Launcher_Setup.exe` from releases
@@ -92,14 +96,11 @@ The executable will be created at `dist/VFX_Launcher.exe` (~47 MB single file).
 ```bash
 ./build_appimage.sh
 ```
-The AppImage will be created at `dist/VFX_Launcher-x86_64.AppImage`. Requires
-Python 3 with `pyinstaller` and `requirements.txt` installed; `appimagetool`
-is downloaded automatically if missing.
-
-> Note: the `ui_slick/Structure/` preset directory contains only empty folders
-> and is not tracked by git. Builds without it use the committed
-> `ui_slick/structure.txt` manifest instead (the app recreates the folders from
-> it at runtime), so the AppImage is fully functional either way.
+This builds the merged Rust application and creates
+`artifacts/releases/VFX-Launcher-0.2.0-x86_64.AppImage` plus its SHA-256 checksum.
+It requires the Linux build dependencies listed in
+[the packaging guide](docs/LINUX-APPIMAGE.md). Templates are embedded; PyInstaller
+and a Python environment are not used by this build.
 
 ## ⚙️ Configuration
 

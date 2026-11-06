@@ -200,6 +200,7 @@ pub fn suggest(
         return Err("Suggestions cancelled.".into());
     }
     let mut command = Command::new(&config.executable);
+    crate::launch::sanitize_environment(&mut command);
     command.args([
         "--print",
         "--mode",

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+appdir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# Keep the host environment available to Nuke, file managers and external Pi.
+for name in LD_LIBRARY_PATH XDG_DATA_DIRS XLOCALEDIR GSETTINGS_SCHEMA_DIR GTK_PATH \
+    GTK_EXE_PREFIX GTK_DATA_PREFIX GTK_IM_MODULE_FILE GDK_PIXBUF_MODULE_FILE \
+    GDK_PIXBUF_MODULEDIR GIO_MODULE_DIR GTK_MODULES GTK3_MODULES; do
+    unset "VFX_ORIGINAL_$name"
+    if [[ -v $name ]]; then
+        export "VFX_ORIGINAL_$name=${!name}"
+    fi
+done
+export VFX_APPIMAGE=1
+export LD_LIBRARY_PATH="$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$appdir/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export XLOCALEDIR="$appdir/usr/share/X11/locale"
+export GSETTINGS_SCHEMA_DIR="$appdir/usr/share/glib-2.0/schemas"
+export GTK_PATH="$appdir/usr/lib/gtk-3.0"
+export GTK_EXE_PREFIX="$appdir/usr"
+export GTK_DATA_PREFIX="$appdir/usr"
+export GTK_IM_MODULE_FILE="$appdir/usr/lib/gtk-3.0/3.0.0/immodules.cache"
+export GDK_PIXBUF_MODULE_FILE="$appdir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+export GDK_PIXBUF_MODULEDIR="$appdir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+export GIO_MODULE_DIR="$appdir/usr/lib/gio/modules"
+unset GTK_MODULES GTK3_MODULES
+exec "$appdir/usr/bin/vfx-launcher" "$@"

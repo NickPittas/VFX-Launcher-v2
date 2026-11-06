@@ -303,8 +303,40 @@ fn reap_in_background(mut child: std::process::Child) {
 /// `LD_LIBRARY_PATH` / `PYTHONHOME` / `PYTHONPATH` / `QT_PLUGIN_PATH` /
 /// `QT_QPA_PLATFORM_PLUGIN_PATH` entry inside an extracted `_MEI*` bundle
 /// directory. Nothing else is touched, and no variable is dropped wholesale.
-fn sanitize_environment(command: &mut Command) {
+pub(crate) fn sanitize_environment(command: &mut Command) {
     if cfg!(windows) {
+        return;
+    }
+
+    // The AppImage's GTK libraries and schemas must not leak into host tools.
+    if std::env::var_os("VFX_APPIMAGE").as_deref() == Some(OsStr::new("1")) {
+        for name in [
+            "LD_LIBRARY_PATH",
+            "XDG_DATA_DIRS",
+            "XLOCALEDIR",
+            "GSETTINGS_SCHEMA_DIR",
+            "GTK_PATH",
+            "GTK_EXE_PREFIX",
+            "GTK_DATA_PREFIX",
+            "GTK_IM_MODULE_FILE",
+            "GDK_PIXBUF_MODULE_FILE",
+            "GDK_PIXBUF_MODULEDIR",
+            "GIO_MODULE_DIR",
+            "GTK_MODULES",
+            "GTK3_MODULES",
+        ] {
+            let saved = format!("VFX_ORIGINAL_{name}");
+            match std::env::var_os(&saved) {
+                Some(value) => {
+                    command.env(name, value);
+                }
+                None => {
+                    command.env_remove(name);
+                }
+            }
+            command.env_remove(saved);
+        }
+        command.env_remove("VFX_APPIMAGE");
         return;
     }
 

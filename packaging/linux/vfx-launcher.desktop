@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=VFX Launcher
+Comment=Manage VFX projects, incoming files and backups
+Exec=vfx-launcher
+Icon=vfx-launcher
+Terminal=false
+Categories=Graphics;
+StartupWMClass=vfx-launcher

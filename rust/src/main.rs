@@ -22,6 +22,7 @@ Usage:
   vfx-launcher backup --job <JSON> [--dry-run] [--data-dir <PATH>]
   vfx-launcher backup --source <PATH> --destination <PATH> --dry-run
   vfx-launcher --help                 Show this message
+  vfx-launcher --version              Show the application version
 
 --data-dir must be given once, with an absolute path. The default location is the
 platform application data directory. Backup schedules run only in the desktop app.";
@@ -35,6 +36,7 @@ enum Command {
         arguments: Vec<OsString>,
     },
     Help,
+    Version,
     Usage(String),
 }
 
@@ -52,6 +54,10 @@ fn main() -> ExitCode {
         },
         Command::Help => {
             println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Command::Version => {
+            println!("VFX Launcher {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Command::Usage(message) => {
@@ -92,6 +98,9 @@ fn parse(mut args: impl Iterator<Item = OsString>) -> Command {
         }
         if argument == "-h" || argument == "--help" {
             return Command::Help;
+        }
+        if argument == "-V" || argument == "--version" {
+            return Command::Version;
         }
         if argument == "--data-dir" {
             if data_dir.is_some() {
