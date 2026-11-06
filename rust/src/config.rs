@@ -507,7 +507,11 @@ fn read_versioned<T: DeserializeOwned>(
     Ok(Some(parsed))
 }
 
-fn write_versioned<T: Serialize>(path: &Path, kind: &str, value: &T) -> ConfigResult<()> {
+pub(crate) fn write_versioned<T: Serialize>(
+    path: &Path,
+    kind: &str,
+    value: &T,
+) -> ConfigResult<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|err| {
         ConfigError::new(
             ConfigCategory::InvalidValue,

@@ -14,9 +14,13 @@
 
 pub mod ai;
 pub mod app;
+pub mod backup;
+pub mod backup_cli;
+pub mod backup_workspace;
 pub mod config;
 pub mod copy_workspace;
 pub mod discovery;
+pub mod exclusions;
 pub mod history;
 pub mod incoming;
 pub mod jobs;
@@ -26,6 +30,7 @@ pub mod paths;
 pub mod project_discovery;
 pub mod project_workspace;
 pub mod projects;
+pub mod schedule;
 pub mod storage;
 pub mod structure;
 pub mod transfers;

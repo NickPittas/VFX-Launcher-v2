@@ -128,7 +128,7 @@ impl View {
             Self::ShotsAndSequences => Some("Add to project"),
             Self::OrganizeIncoming => Some("Copy selected"),
             Self::CopyByFileType => None,
-            Self::BackUpProjects => Some("Back up now"),
+            Self::BackUpProjects => None,
             Self::Projects | Self::Settings => None,
         }
     }
@@ -170,9 +170,7 @@ pub struct VfxLauncherApp {
     incoming_destination: String,
     incoming_move: bool,
     copy_by_type: CopyByFileTypeState,
-    backup_source: String,
-    backup_destination: String,
-    backup_exclusions: String,
+    backup: crate::backup_workspace::BackupWorkspace,
     about_open: bool,
     history: crate::history::HistoryWindow,
     info_dialog: Option<(String, Vec<String>)>,
@@ -194,7 +192,7 @@ impl VfxLauncherApp {
             ctx: cc.egui_ctx.clone(),
             view: View::Projects,
             jobs: Jobs::new(),
-            workspace: ProjectWorkspace::new(&cc.egui_ctx, data_dir),
+            workspace: ProjectWorkspace::new(&cc.egui_ctx, data_dir.clone()),
             project_filter: String::new(),
             file_tab: FileKind::Nuke,
             file_filter: String::new(),
@@ -203,9 +201,7 @@ impl VfxLauncherApp {
             incoming_destination: String::new(),
             incoming_move: false,
             copy_by_type: CopyByFileTypeState::new(&cc.egui_ctx),
-            backup_source: String::new(),
-            backup_destination: String::new(),
-            backup_exclusions: String::new(),
+            backup: crate::backup_workspace::BackupWorkspace::new(&cc.egui_ctx, &data_dir),
             about_open: false,
             history: crate::history::HistoryWindow::default(),
             info_dialog: None,
@@ -226,6 +222,11 @@ impl eframe::App for VfxLauncherApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.workspace.poll(&mut self.jobs);
         self.history.poll();
+        self.backup.poll(
+            self.workspace.catalog_client().as_ref(),
+            self.workspace.user().map(|user| user.id),
+            &mut self.jobs,
+        );
         self.copy_by_type.poll(
             self.workspace.catalog_client().as_ref(),
             self.workspace.user().map(|user| user.id),
@@ -394,8 +395,12 @@ impl VfxLauncherApp {
                 if self.view == View::CopyByFileType {
                     self.copy_by_type.validate_control(ui, &mut self.jobs);
                 }
+                if self.view == View::BackUpProjects {
+                    self.backup.validate_control(ui, &mut self.jobs);
+                }
                 if closing
-                    && (self.copy_by_type.picker_pending()
+                    && (self.backup.picker_pending()
+                        || self.copy_by_type.picker_pending()
                         || self.workspace.registration_picker_pending()
                         || self.workspace.settings_browse_pending())
                 {
@@ -426,6 +431,9 @@ impl VfxLauncherApp {
                     if self.view == View::CopyByFileType {
                         self.copy_by_type.execution_control(ui, &mut self.jobs);
                     }
+                    if self.view == View::BackUpProjects {
+                        self.backup.execution_control(ui, &mut self.jobs);
+                    }
                     if let Some(action) = action {
                         explain(&primary_button(ui, action, false), UNAVAILABLE);
                     }
@@ -438,7 +446,9 @@ impl VfxLauncherApp {
                             // Reported, still unwinding its own cleanup: the row
                             // stays visible and cannot be dismissed yet.
                             ui.label(egui::RichText::new("Finishing…").small().weak());
-                        } else if self.copy_by_type.is_picker_job(job.id) {
+                        } else if self.copy_by_type.is_picker_job(job.id)
+                            || self.backup.is_picker_job(job.id)
+                        {
                             ui.label("Waiting for folder chooser");
                         } else {
                             if ui.button("Cancel").clicked() {
@@ -969,62 +979,7 @@ impl VfxLauncherApp {
     }
 
     fn backup_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            explain(&primary_button(ui, "Scan folders", false), UNAVAILABLE);
-            ui.separator();
-            folder_field(
-                ui,
-                "Source",
-                &mut self.backup_source,
-                "No source folder chosen",
-            );
-            ui.separator();
-            folder_field(
-                ui,
-                "Destination",
-                &mut self.backup_destination,
-                "No destination folder chosen",
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Exclusions").small().weak());
-            ui.add_enabled(
-                false,
-                egui::TextEdit::singleline(&mut self.backup_exclusions)
-                    .hint_text("Nothing excluded")
-                    .desired_width(260.0),
-            );
-            ui.separator();
-            ui.label(egui::RichText::new("Schedule").small().weak());
-            let _ = pending_button(ui, "Manual only");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let _ = pending_button(ui, "Advanced…");
-            });
-        });
-        ui.separator();
-
-        for (phase, detail) in [
-            ("Scanning", "0 folders"),
-            ("Finding", "0 files"),
-            ("Copying", "0 of 0 files"),
-        ] {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(phase).small().weak());
-                ui.add(
-                    egui::ProgressBar::new(0.0)
-                        .desired_width(190.0)
-                        .desired_height(8.0),
-                );
-                ui.label(egui::RichText::new(detail).small().weak());
-            });
-        }
-        ui.separator();
-
-        empty_state(
-            ui,
-            "No backup run yet.",
-            "Source, destination and backup results appear here.",
-        );
+        self.backup.view(ui, &mut self.jobs);
     }
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {

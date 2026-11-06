@@ -19,19 +19,37 @@ VFX Launcher
 Usage:
   vfx-launcher                        Start the desktop application
   vfx-launcher --data-dir <PATH>      Start with this absolute data directory
+  vfx-launcher backup --job <JSON> [--dry-run] [--data-dir <PATH>]
+  vfx-launcher backup --source <PATH> --destination <PATH> --dry-run
   vfx-launcher --help                 Show this message
 
 --data-dir must be given once, with an absolute path. The default location is the
-platform application data directory. No other command is implemented in this build.";
+platform application data directory. Backup schedules run only in the desktop app.";
 
 enum Command {
-    Gui { data_dir: Option<PathBuf> },
+    Gui {
+        data_dir: Option<PathBuf>,
+    },
+    Backup {
+        data_dir: Option<PathBuf>,
+        arguments: Vec<OsString>,
+    },
     Help,
     Usage(String),
 }
 
 fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
+        Command::Backup {
+            data_dir,
+            arguments,
+        } => match vfx_launcher::backup_cli::run(arguments, data_dir) {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("vfx-launcher backup: {error}");
+                ExitCode::from(1)
+            }
+        },
         Command::Help => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -66,6 +84,12 @@ fn main() -> ExitCode {
 fn parse(mut args: impl Iterator<Item = OsString>) -> Command {
     let mut data_dir: Option<PathBuf> = None;
     while let Some(argument) = args.next() {
+        if argument == "backup" {
+            return Command::Backup {
+                data_dir,
+                arguments: args.collect(),
+            };
+        }
         if argument == "-h" || argument == "--help" {
             return Command::Help;
         }

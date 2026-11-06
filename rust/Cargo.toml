@@ -36,6 +36,7 @@ serde_json = "=1.0.154"
 # `shlex::split`, the POSIX-shell word splitting the legacy `shlex.split` did —
 # not a hand-written quote parser, and never a shell.
 shlex = "=2.0.1"
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 
 # U1 "Add existing folder": native folder picker, always on a worker thread, never
 # in a frame. Linux selects rfd's GTK3 backend because the desktop portal has no

@@ -577,6 +577,48 @@ pub fn plan_extension_copy(
             "only an ExtensionCopy scan can produce an extension-copy plan",
         ));
     }
+    plan_relative_copy(
+        id,
+        revision,
+        snapshot,
+        destination_root,
+        policy,
+        PlanOrigin::ExtensionCopy,
+    )
+}
+
+/// Backup shares the reviewed relative-path manifest, but keeps its source purpose.
+pub fn plan_backup_copy(
+    id: impl Into<String>,
+    revision: u64,
+    snapshot: &ScanSnapshot,
+    destination_root: &Path,
+) -> Result<OperationPlan, TransferError> {
+    if snapshot.purpose != ScanPurpose::Backup {
+        return Err(TransferError::new(
+            TransferCategory::InvalidInput,
+            Some(&snapshot.root),
+            "a backup plan requires a Backup scan",
+        ));
+    }
+    plan_relative_copy(
+        id,
+        revision,
+        snapshot,
+        destination_root,
+        ConflictPolicy::PreserveExisting,
+        PlanOrigin::Backup,
+    )
+}
+
+fn plan_relative_copy(
+    id: impl Into<String>,
+    revision: u64,
+    snapshot: &ScanSnapshot,
+    destination_root: &Path,
+    policy: ConflictPolicy,
+    origin: PlanOrigin,
+) -> Result<OperationPlan, TransferError> {
     if !snapshot.root.is_absolute() || !destination_root.is_absolute() {
         return Err(TransferError::new(
             TransferCategory::InvalidInput,
@@ -776,7 +818,7 @@ pub fn plan_extension_copy(
     Ok(OperationPlan {
         id: id.into(),
         revision,
-        origin: PlanOrigin::ExtensionCopy,
+        origin,
         destination_root: StoredPath::from_native(destination_root, destination_root)?,
         add_to_existing: true,
         policy,

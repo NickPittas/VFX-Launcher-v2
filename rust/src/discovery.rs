@@ -44,10 +44,9 @@
 //!   and degrade coverage to `Partial`.
 //! - Skipped directory links are policy, not failure: they are reported but do
 //!   not by themselves turn `Complete` into `Partial`.
-//! - `excludes` patterns containing wildcards refuse the scan;
-//!   fnmatch-compatible excludes arrive with the
-//!   backup packet. Literal patterns match any single component or the full
-//!   root-relative path, case-insensitively, mirroring the legacy finder.
+//! - Exclusions use the backup application's case-insensitive fnmatch rules:
+//!   component patterns match every component; patterns with slashes match
+//!   the full root-relative path, optionally with a leading slash.
 //! - Repeated observable directory identities are skipped and make coverage partial.
 //! - Case-insensitive suffix and exclude matching folds valid native text with
 //!   [`crate::paths::fold_native_text`] — Unicode lowercase, legacy `lower()`
@@ -69,7 +68,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::jobs::{Checkpoint, JobControl, JobEvents, JobPhase, JobProgress};
@@ -397,7 +396,7 @@ pub(crate) fn count_files(
                 break 'count;
             }
             let relative = pending.relative.join(entry.file_name());
-            if is_excluded(&relative, &excludes)
+            if excludes.prunes(&relative)
                 || (request.purpose == ScanPurpose::Projects && is_project_autosave(&relative))
             {
                 continue;
@@ -422,7 +421,9 @@ pub(crate) fn count_files(
             };
             match shape {
                 None | Some(EntryShape::File(_) | EntryShape::FileLink(_)) => {
-                    if request.filters.matches_name(&entry.file_name()) {
+                    if !excludes.matches(&relative)
+                        && request.filters.matches_name(&entry.file_name())
+                    {
                         total += 1;
                         events.progress(
                             JobPhase::Counting,
@@ -608,7 +609,7 @@ pub(crate) fn walk_pass(
             if request.purpose == ScanPurpose::Projects && is_project_autosave(&child_relative) {
                 continue;
             }
-            if is_excluded(&child_relative, &excludes) {
+            if excludes.prunes(&child_relative) {
                 continue;
             }
             match visit_entry(&entry, &pending.relative, &request.filters) {
@@ -618,6 +619,9 @@ pub(crate) fn walk_pass(
                     degraded = true;
                 }
                 Visit::Keep(file_entry, issue) => {
+                    if excludes.matches(&child_relative) {
+                        continue;
+                    }
                     entries.push(file_entry);
                     events.progress(
                         phase,
@@ -1037,71 +1041,10 @@ fn io_category(error: &std::io::Error) -> PathCategory {
     }
 }
 
-/// Literal-only exclude plan. Unsupported wildcard patterns refuse the scan.
-struct ExcludePlan {
-    components: Vec<Vec<u8>>,
-    full: Vec<Vec<u8>>,
-}
+type ExcludePlan = crate::exclusions::Exclusions;
 
-fn build_excludes(filters: &ScanFilters, events: &JobEvents) -> PathResult<ExcludePlan> {
-    let mut plan = ExcludePlan {
-        components: Vec::new(),
-        full: Vec::new(),
-    };
-    for pattern in &filters.excludes {
-        let bytes = pattern.as_bytes();
-        if bytes.iter().any(|byte| matches!(byte, b'*' | b'?' | b'[')) {
-            return Err(PathError::new(
-                PathCategory::Unsupported,
-                None,
-                format!(
-                    "Wildcard exclusion '{pattern}' requires the backup matcher; scan refused."
-                ),
-            ));
-        }
-        if bytes.iter().all(|byte| *byte == b'/') {
-            events.diagnostic(
-                JobPhase::Scanning,
-                format!("Exclude pattern '{pattern}' has no path content and is ignored."),
-            );
-            continue;
-        }
-        plan.components.push(fold_native_text(bytes));
-        plan.full.push(exclude_full_form(bytes));
-    }
-    Ok(plan)
-}
-
-/// Folded bytes, with backslashes treated as separators on Windows only (on
-/// POSIX a backslash is an ordinary name byte).
-fn exclude_full_form(bytes: &[u8]) -> Vec<u8> {
-    let lowered = fold_native_text(bytes);
-    #[cfg(windows)]
-    {
-        return lowered
-            .iter()
-            .map(|byte| if *byte == b'\\' { b'/' } else { *byte })
-            .collect();
-    }
-    #[cfg(not(windows))]
-    lowered
-}
-
-fn is_excluded(relative: &Path, plan: &ExcludePlan) -> bool {
-    if plan.components.is_empty() && plan.full.is_empty() {
-        return false;
-    }
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            continue;
-        };
-        let lowered = fold_native_text(name.as_encoded_bytes());
-        if plan.components.iter().any(|pattern| *pattern == lowered) {
-            return true;
-        }
-    }
-    let lowered = exclude_full_form(relative.as_os_str().as_encoded_bytes());
-    plan.full.iter().any(|pattern| *pattern == lowered)
+fn build_excludes(filters: &ScanFilters, _events: &JobEvents) -> PathResult<ExcludePlan> {
+    Ok(ExcludePlan::new(&filters.excludes))
 }
 
 fn name_ends_with_case_insensitive(bytes: &[u8], suffix: &[u8]) -> bool {

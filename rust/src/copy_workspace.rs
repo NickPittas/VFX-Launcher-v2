@@ -94,6 +94,7 @@ fn policy_hint(policy: ConflictPolicy) -> &'static str {
 /// selection or rescanning makes the reviewed plan stale.
 #[derive(Clone, PartialEq, Eq)]
 struct Draft {
+    backup: Option<crate::backup::BackupJob>,
     source: String,
     destination: String,
     extensions: Vec<String>,
@@ -120,6 +121,7 @@ struct RowState {
 /// One matching file list produced by a completed scan, bound to the exact
 /// source and suffix set it was found with.
 struct ScanResult {
+    backup: Option<crate::backup::BackupJob>,
     snapshot: ScanSnapshot,
     source: String,
     extensions: Vec<String>,
@@ -132,6 +134,7 @@ struct PickRun {
 }
 
 struct ScanRun {
+    backup: Option<crate::backup::BackupJob>,
     job: JobId,
     replies: Receiver<Result<ScanSnapshot, String>>,
     source: String,
@@ -214,6 +217,8 @@ struct ReviewCounts {
 /// The Copy by File Type workspace: draft inputs, the tracked workers and the
 /// review/run evidence the page and the bottom strip render.
 pub struct CopyByFileTypeState {
+    automatic_phase: Option<u8>,
+    backup: Option<crate::backup::BackupJob>,
     ctx: egui::Context,
     catalog: Option<CatalogClient>,
     user: Option<UserId>,
@@ -245,6 +250,8 @@ pub struct CopyByFileTypeState {
 impl CopyByFileTypeState {
     pub fn new(ctx: &egui::Context) -> Self {
         Self {
+            backup: None,
+            automatic_phase: None,
             ctx: ctx.clone(),
             catalog: None,
             user: None,
@@ -273,6 +280,78 @@ impl CopyByFileTypeState {
             scan_error: None,
             message: None,
             last_pick: None,
+        }
+    }
+
+    pub fn new_backup(ctx: &egui::Context, job: crate::backup::BackupJob) -> Self {
+        let mut state = Self::new(ctx);
+        state.source = job.source.clone();
+        state.destination = job.destination.clone();
+        state.extensions = vec![".aep".into(), ".nk".into()];
+        state.policy = ConflictPolicy::PreserveExisting;
+        state.backup = Some(job);
+        state
+    }
+
+    pub fn backup_job(&self) -> Option<crate::backup::BackupJob> {
+        self.backup.clone().map(|mut job| {
+            job.source = self.source.trim().into();
+            job.destination = self.destination.trim().into();
+            job
+        })
+    }
+
+    pub fn backup_job_mut(&mut self) -> Option<&mut crate::backup::BackupJob> {
+        self.backup.as_mut()
+    }
+    pub fn operation_pending(&self) -> bool {
+        self.busy()
+    }
+
+    pub fn automatic_active(&self) -> bool {
+        self.automatic_phase.is_some()
+    }
+    pub fn begin_automatic(&mut self, jobs: &mut Jobs) {
+        if self.busy() || self.backup.is_none() {
+            return;
+        }
+        self.begin_scan(jobs);
+        if self.scan_run.is_some() {
+            self.automatic_phase = Some(1);
+        }
+    }
+    pub fn advance_automatic(&mut self, jobs: &mut Jobs) {
+        if self.busy() || jobs.is_busy() {
+            return;
+        }
+        match self.automatic_phase {
+            Some(1) => {
+                if self
+                    .scanned
+                    .as_ref()
+                    .is_some_and(|scan| scan.snapshot.coverage == Coverage::Complete)
+                    && !self.selected.is_empty()
+                {
+                    self.begin_validation(jobs);
+                    self.automatic_phase = self.validate_run.as_ref().map(|_| 2);
+                } else {
+                    self.automatic_phase = None;
+                }
+            }
+            Some(2) => {
+                if self
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.ready.is_some())
+                {
+                    self.begin_copy(jobs);
+                    self.automatic_phase = self.copy_run.as_ref().map(|_| 3);
+                } else {
+                    self.automatic_phase = None;
+                }
+            }
+            Some(3) => self.automatic_phase = None,
+            _ => {}
         }
     }
 
@@ -347,6 +426,7 @@ impl CopyByFileTypeState {
                     snapshot,
                     source: run.source,
                     extensions: run.extensions,
+                    backup: run.backup,
                 });
             }
             Err(message) => {
@@ -478,7 +558,10 @@ impl CopyByFileTypeState {
         let Some(scanned) = &self.scanned else {
             return;
         };
-        if scanned.source == self.source.trim() && scanned.extensions == self.extensions {
+        if scanned.source == self.source.trim()
+            && scanned.extensions == self.extensions
+            && scanned.backup == self.backup_job()
+        {
             return;
         }
         self.scanned = None;
@@ -519,6 +602,7 @@ impl CopyByFileTypeState {
 
     fn draft(&self) -> Draft {
         Draft {
+            backup: self.backup_job(),
             source: self.source.trim().to_string(),
             destination: self.destination.trim().to_string(),
             extensions: self.extensions.clone(),
@@ -769,6 +853,8 @@ impl CopyByFileTypeState {
             self.message = Some(reason);
             return;
         }
+        let backup = self.backup_job();
+        let worker_backup = backup.clone();
         let root = PathBuf::from(self.source.trim());
         let request = ScanRequest {
             root: root.clone(),
@@ -794,7 +880,25 @@ impl CopyByFileTypeState {
             let JobContext {
                 control, events, ..
             } = context;
-            let result = discovery::walk(&request, &control, &events);
+            let result = if let Some(job) = worker_backup {
+                crate::backup::scan(&job, &control, &events).map(|scan| {
+                    for issue in &scan.comparison_issues {
+                        events.diagnostic(JobPhase::Scanning, issue.clone());
+                    }
+                    events.diagnostic(
+                        JobPhase::Scanning,
+                        format!(
+                            "{} files compared; {} already up to date.",
+                            scan.compared,
+                            scan.up_to_date.len()
+                        ),
+                    );
+                    scan.snapshot
+                })
+            } else {
+                discovery::walk(&request, &control, &events)
+                    .map_err(|error| error.message().to_string())
+            };
             let (payload, outcome, progress) = match result {
                 Ok(snapshot) => {
                     let outcome = match snapshot.coverage {
@@ -813,7 +917,7 @@ impl CopyByFileTypeState {
                     (Ok(snapshot), outcome, progress)
                 }
                 Err(error) => {
-                    let message = error.message().to_string();
+                    let message = error.to_string();
                     events.diagnostic(JobPhase::Scanning, message.clone());
                     (Err(message), JobOutcome::Failed, JobProgress::default())
                 }
@@ -824,6 +928,7 @@ impl CopyByFileTypeState {
         match started {
             Ok(job) => {
                 self.scan_run = Some(ScanRun {
+                    backup,
                     job,
                     replies: rx,
                     source,
@@ -877,7 +982,9 @@ impl CopyByFileTypeState {
         let total = manifest.entries.len() as u64;
         let (tx, rx) = channel();
         let started = jobs.start(&self.ctx, "Validating selection", move |context| {
-            let JobContext { events, .. } = context;
+            let JobContext {
+                events, control, ..
+            } = context;
             events.progress(
                 JobPhase::Validating,
                 JobProgress {
@@ -888,15 +995,25 @@ impl CopyByFileTypeState {
                     current: None,
                 },
             );
-            let result = transfers::plan_extension_copy(
-                "copy-by-file-type",
-                revision,
-                &manifest,
-                &destination,
-                policy,
-            )
-            .map_err(|error| describe(&error))
-            .map(|plan| transfers::validate_plan(&plan));
+            let planned = if manifest.purpose == ScanPurpose::Backup {
+                transfers::plan_backup_copy("backup", revision, &manifest, &destination)
+            } else {
+                transfers::plan_extension_copy(
+                    "copy-by-file-type",
+                    revision,
+                    &manifest,
+                    &destination,
+                    policy,
+                )
+            };
+            let result = planned
+                .map_err(|error| describe(&error))
+                .map(|plan| transfers::validate_plan(&plan));
+            let result = if control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                Err("Validation was cancelled; no copy was started.".into())
+            } else {
+                result
+            };
             let (outcome, progress) = match &result {
                 Ok(report) => {
                     let outcome = if report.counts.blocked > 0 {
@@ -1054,7 +1171,7 @@ impl CopyByFileTypeState {
                     explain(&response, &reason);
                 }
                 ui.label(
-                    egui::RichText::new("Copy selected file types and keep folders and filenames.")
+                    egui::RichText::new(if self.backup.is_some() { "Back up newer Nuke and After Effects files; preserve older destination versions." } else { "Copy selected file types and keep folders and filenames." })
                         .small()
                         .weak(),
                 );
@@ -1113,7 +1230,15 @@ impl CopyByFileTypeState {
     /// time.
     pub fn execution_control(&mut self, ui: &mut egui::Ui, jobs: &mut Jobs) {
         let blocked = self.copy_blocked();
-        let response = accent_button(ui, "Copy selected", blocked.is_none());
+        let response = accent_button(
+            ui,
+            if self.backup.is_some() {
+                "Back up selected"
+            } else {
+                "Copy selected"
+            },
+            blocked.is_none(),
+        );
         if response.clicked() {
             self.begin_copy(jobs);
         }
@@ -1202,6 +1327,21 @@ impl CopyByFileTypeState {
                     ui.end_row();
                 }
             });
+
+        if let Some(job) = &mut self.backup {
+            ui.horizontal(|ui| {
+                ui.label("Exclude");
+                ui.add(
+                    egui::TextEdit::singleline(&mut job.excludes)
+                        .desired_width(540.0)
+                        .hint_text("Comma-separated names or patterns, e.g. #Backup, *.tmp"),
+                );
+                ui.label("Comparison workers");
+                ui.add(egui::DragValue::new(&mut job.workers).range(1..=16));
+            });
+            ui.label(egui::RichText::new(".nk and .aep · only missing or newer files · older destinations are kept under numbered names").small().weak());
+            return;
+        }
 
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("File types").small().weak());
