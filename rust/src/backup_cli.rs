@@ -90,6 +90,8 @@ pub fn run(arguments: Vec<OsString>, mut data_dir: Option<PathBuf>) -> Result<u8
         if !directory.is_absolute() {
             return Err("--data-dir must be absolute.".into());
         }
+        let directory =
+            crate::config::resolve_workspace(&directory).map_err(|error| error.to_string())?;
         let catalog =
             Catalog::open(directory.join("catalog.sqlite3")).map_err(|error| error.to_string())?;
         catalog

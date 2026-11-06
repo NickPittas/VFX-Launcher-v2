@@ -33,6 +33,8 @@ const UNKNOWN: &str = "—";
 
 /// Starts the native desktop application against one local data area.
 pub fn run_gui(data_dir: PathBuf) -> eframe::Result {
+    let workspace_dir = crate::config::resolve_workspace(&data_dir)
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 880.0])
@@ -43,7 +45,7 @@ pub fn run_gui(data_dir: PathBuf) -> eframe::Result {
     eframe::run_native(
         "vfx-launcher",
         options,
-        Box::new(move |cc| Ok(Box::new(VfxLauncherApp::new(cc, data_dir)))),
+        Box::new(move |cc| Ok(Box::new(VfxLauncherApp::new(cc, data_dir, workspace_dir)))),
     )
 }
 
@@ -152,6 +154,7 @@ pub struct VfxLauncherApp {
     incoming: OrganizeIncomingState,
     copy_by_type: CopyByFileTypeState,
     backup: crate::backup_workspace::BackupWorkspace,
+    legacy_import: crate::import_workspace::ImportWorkspace,
     about_open: bool,
     history: crate::history::HistoryWindow,
     info_dialog: Option<(String, Vec<String>)>,
@@ -168,13 +171,17 @@ pub struct VfxLauncherApp {
 }
 
 impl VfxLauncherApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, data_dir: PathBuf) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        data_dir: PathBuf,
+        workspace_dir: PathBuf,
+    ) -> Self {
         apply_desktop_style(&cc.egui_ctx);
         Self {
             ctx: cc.egui_ctx.clone(),
             view: View::Projects,
             jobs: Jobs::new(),
-            workspace: ProjectWorkspace::new(&cc.egui_ctx, data_dir.clone()),
+            workspace: ProjectWorkspace::new(&cc.egui_ctx, workspace_dir),
             project_filter: String::new(),
             file_tab: FileKind::Nuke,
             file_filter: String::new(),
@@ -182,6 +189,7 @@ impl VfxLauncherApp {
             incoming: OrganizeIncomingState::new(&cc.egui_ctx, data_dir.clone()),
             copy_by_type: CopyByFileTypeState::new(&cc.egui_ctx),
             backup: crate::backup_workspace::BackupWorkspace::new(&cc.egui_ctx, &data_dir),
+            legacy_import: crate::import_workspace::ImportWorkspace::new(data_dir.clone()),
             about_open: false,
             history: crate::history::HistoryWindow::default(),
             info_dialog: None,
@@ -201,6 +209,7 @@ impl eframe::App for VfxLauncherApp {
     /// close coordination never depend on a painted frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.workspace.poll(&mut self.jobs);
+        self.legacy_import.poll();
         self.structure.poll(&mut self.workspace, &mut self.jobs);
         self.history.poll();
         self.backup.poll(
@@ -397,6 +406,7 @@ impl VfxLauncherApp {
                         || self.copy_by_type.picker_pending()
                         || self.structure.picker_pending()
                         || self.incoming.picker_pending()
+                        || self.legacy_import.picker_pending()
                         || self.workspace.registration_picker_pending()
                         || self.workspace.settings_browse_pending())
                 {
@@ -446,6 +456,7 @@ impl VfxLauncherApp {
                             || self.backup.is_picker_job(job.id)
                             || self.structure.is_picker_job(job.id)
                             || self.incoming.is_picker_job(job.id)
+                            || self.legacy_import.is_picker_job(job.id)
                         {
                             ui.label("Waiting for folder chooser");
                         } else {
@@ -876,8 +887,19 @@ impl VfxLauncherApp {
                 self.settings_form(ui);
                 ui.add_space(6.0);
                 self.settings_users_section(ui);
+                ui.collapsing("Import previous Launcher data", |ui| {
+                    self.legacy_import.ui(ui, &mut self.jobs);
+                });
                 ui.collapsing("Logs", |ui| {
-                    empty_state(ui, "No log entries yet.", "Diagnostics appear here.");
+                    if ui.button("Open logs and file-operation history…").clicked() {
+                        self.history.open = true;
+                    }
+                    if let Some(job) = self.jobs.current() {
+                        ui.label(&job.title);
+                        for diagnostic in &job.diagnostics {
+                            ui.label(diagnostic);
+                        }
+                    }
                 });
                 ui.collapsing("Data location", |ui| {
                     ui.label(

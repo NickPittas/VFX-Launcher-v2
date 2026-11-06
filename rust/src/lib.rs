@@ -23,6 +23,7 @@ pub mod copy_workspace;
 pub mod discovery;
 pub mod exclusions;
 pub mod history;
+pub mod import_workspace;
 pub mod incoming;
 pub mod incoming_workspace;
 pub mod jobs;
