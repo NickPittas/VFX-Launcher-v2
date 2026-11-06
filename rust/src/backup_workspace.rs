@@ -332,6 +332,19 @@ impl BackupWorkspace {
             self.copy.execution_control(ui, jobs)
         });
     }
+    pub fn execution_blocked_reason(&self) -> Option<String> {
+        if !self.loaded {
+            return Some(
+                self.error
+                    .clone()
+                    .unwrap_or_else(|| "Backup settings are loading.".into()),
+            );
+        }
+        if self.request.is_some() {
+            return Some("Wait for backup settings to finish saving or loading.".into());
+        }
+        self.copy.execution_blocked_reason()
+    }
     pub fn picker_pending(&self) -> bool {
         self.copy.picker_pending() || self.request.as_ref().is_some_and(|request| request.dialog)
     }

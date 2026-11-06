@@ -636,7 +636,7 @@ fn plan_relative_copy(
     let mut warnings = Vec::new();
     if snapshot.continuity == RootContinuity::Uncertain {
         warnings.push(
-            "mount continuity could not be proven; the explicit reviewed file list may be copied, but catalog pruning stays suppressed"
+            "Copying is allowed. Each selected file will be checked again before copying because the source drive could have changed since the scan."
                 .to_string(),
         );
     }
@@ -1200,10 +1200,10 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
             );
         }
         if evidence.continuity == EvidenceContinuity::Uncertain {
-            warnings.push(
-                "mount continuity was not proven at planning time; verification stays snapshot-only"
-                    .to_string(),
-            );
+            let warning = "Copying is allowed. Each selected file will be checked again before copying because the source drive could have changed since the scan.";
+            if !warnings.iter().any(|existing| existing == warning) {
+                warnings.push(warning.to_string());
+            }
         }
         if let (Some(recorded), Some(source_root)) = (evidence.root_identity, &plan.source_root) {
             let fresh = fs::metadata(source_root.path())

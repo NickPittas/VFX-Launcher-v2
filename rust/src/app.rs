@@ -396,6 +396,14 @@ impl VfxLauncherApp {
             }
 
             ui.horizontal(|ui| {
+                // Reserve execution controls before status text can consume the strip.
+                match self.view {
+                    View::CopyByFileType => self.copy_by_type.execution_control(ui, &mut self.jobs),
+                    View::BackUpProjects => self.backup.execution_control(ui, &mut self.jobs),
+                    View::ShotsAndSequences => self.structure.execution_control(ui, &mut self.jobs),
+                    View::OrganizeIncoming => self.incoming.execution_control(ui, &mut self.jobs),
+                    _ => {}
+                }
                 if self.view == View::OrganizeIncoming {
                     let mut move_files = self.incoming.move_files();
                     ui.radio_value(&mut move_files, false, "Copy");
@@ -445,18 +453,6 @@ impl VfxLauncherApp {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.view == View::CopyByFileType {
-                        self.copy_by_type.execution_control(ui, &mut self.jobs);
-                    }
-                    if self.view == View::BackUpProjects {
-                        self.backup.execution_control(ui, &mut self.jobs);
-                    }
-                    if self.view == View::ShotsAndSequences {
-                        self.structure.execution_control(ui, &mut self.jobs);
-                    }
-                    if self.view == View::OrganizeIncoming {
-                        self.incoming.execution_control(ui, &mut self.jobs);
-                    }
                     if let Some(job) = &job {
                         if job.is_terminal() && job.is_reaped() {
                             if ui.small_button("Dismiss").clicked() {
@@ -492,6 +488,14 @@ impl VfxLauncherApp {
                     }
                 });
             });
+            let blocked = match self.view {
+                View::CopyByFileType => self.copy_by_type.execution_blocked_reason(),
+                View::BackUpProjects => self.backup.execution_blocked_reason(),
+                _ => None,
+            };
+            if let Some(reason) = blocked {
+                ui.label(reason);
+            }
             ui.add_space(3.0);
         });
 

@@ -707,7 +707,14 @@ impl CopyByFileTypeState {
         }
         if review.ready.is_none() {
             return Some(review.refusal.clone().unwrap_or_else(|| {
-                "The review has blocked items; fix them and validate again.".to_string()
+                review
+                    .items
+                    .iter()
+                    .find(|item| item.state == ReviewState::Blocked)
+                    .and_then(|item| item.message.clone())
+                    .unwrap_or_else(|| {
+                        "The review has blocked items; fix them and validate again.".to_string()
+                    })
             }));
         }
         None
@@ -1256,7 +1263,7 @@ impl CopyByFileTypeState {
         let response = accent_button(
             ui,
             if self.backup.is_some() {
-                "Back up selected"
+                "Run backup"
             } else {
                 "Copy selected"
             },
@@ -1268,6 +1275,10 @@ impl CopyByFileTypeState {
         if let Some(reason) = blocked {
             explain(&response, &reason);
         }
+    }
+
+    pub fn execution_blocked_reason(&self) -> Option<String> {
+        self.copy_blocked()
     }
 
     fn state_text(&self) -> Option<String> {
@@ -1287,9 +1298,15 @@ impl CopyByFileTypeState {
                         "Validated · {} file(s) will copy, {} will skip",
                         review.files_copy, review.files_skip
                     ),
-                    None => {
-                        "The review has blocked items; fix them and validate again.".to_string()
-                    }
+                    None => review
+                        .items
+                        .iter()
+                        .find(|item| item.state == ReviewState::Blocked)
+                        .and_then(|item| item.message.clone())
+                        .map(|reason| format!("Cannot copy: {reason}"))
+                        .unwrap_or_else(|| {
+                            "The review has blocked items; fix them and validate again.".to_string()
+                        }),
                 },
             }
         };
@@ -1676,8 +1693,12 @@ impl CopyByFileTypeState {
                 );
 
                 if let Some(review) = &self.review {
-                    for warning in &review.warnings {
-                        ui.label(egui::RichText::new(warning).small().color(WARNING));
+                    if !review.warnings.is_empty() {
+                        ui.collapsing("Review details (does not block copying)", |ui| {
+                            for warning in &review.warnings {
+                                ui.label(egui::RichText::new(warning).small());
+                            }
+                        });
                     }
                     if review.space_unknown {
                         ui.label(
@@ -1764,7 +1785,10 @@ fn accent_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Respons
 
 fn explain(response: &egui::Response, reason: &str) {
     let reason = reason.to_string();
-    let _ = response.clone().on_hover_text(reason);
+    let _ = response
+        .clone()
+        .on_disabled_hover_text(reason.clone())
+        .on_hover_text(reason);
 }
 
 fn progress_block(

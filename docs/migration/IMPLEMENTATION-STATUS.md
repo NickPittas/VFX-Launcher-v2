@@ -2165,6 +2165,24 @@ no test suite. Nothing is committed.
   still not be described as runtime-verified.
 # Completion corrections — 2026-11-06, included in 0.3.0
 
+Post-release Copy UI correction (0.3.1): execution controls are
+allocated before validation/status labels in the pinned strip, so long status
+text cannot consume the Copy button's space. Duplicate source-drive continuity
+warnings are combined into one plain-language advisory and review warnings are
+collapsed by default. Blocked reviews show their first actual refusal reason.
+The explicit reviewed manifest, per-file execution revalidation and all refusal
+checks remain enforced. Cargo check and formatting pass; native verification
+is pending because desktop interaction remains disallowed.
+
+The user's roots `/mnt/Projects` and `/mnt/Kessel/AEPBackup` were inspected
+only at root-metadata level: distinct SMB2 directories on different devices.
+No source contents, production catalogs, or destination writes were used.
+The published 0.3.0 backup CLI dry-run against the existing disposable fixture
+returned a ready three-operation plan while printing both reported continuity
+warnings. The 0.3.1 AppImage repeats that successful dry-run with one combined
+advisory; its version and checksum checks pass. These checks isolate the warnings
+from execution readiness, but do not reproduce or resolve the user's UI state.
+
 The latest repository changes add Incoming's image/sequence dock, exact-member
 navigation, bounded native image decoding and FFmpeg fallback, DJV/MRV2/Nuke
 Player context actions and settings, and the localhost NukeServerSocket client.
