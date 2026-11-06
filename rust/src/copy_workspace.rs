@@ -1843,7 +1843,9 @@ fn progress_block(
                 .desired_height(16.0),
         );
     }
-    ui.label(egui::RichText::new(current).small().weak());
+    // Changing paths must not add rows to the resizable progress dock.
+    ui.add(egui::Label::new(egui::RichText::new(&current).small().weak()).truncate())
+        .on_hover_text(&current);
 }
 
 fn job_status(jobs: &Jobs, id: Option<JobId>) -> Option<&crate::jobs::JobStatus> {
