@@ -237,8 +237,7 @@ pub fn start(tool: Tool, file: &Path, applications: &Applications) -> Result<(),
     spawn(&launch)
 }
 
-/// Reveals a file in the platform file manager, matching the legacy
-/// `open_in_file_manager` behavior (open the containing folder).
+/// Reveals and selects a file in the platform file manager.
 pub fn reveal(file: &Path) -> Result<(), LaunchError> {
     #[cfg(windows)]
     {
@@ -259,13 +258,55 @@ pub fn reveal(file: &Path) -> Result<(), LaunchError> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let folder = file
-            .parent()
-            .filter(|folder| !folder.as_os_str().is_empty())
-            .ok_or_else(|| LaunchError::new("The file has no containing folder to reveal."))?;
-        let mut command = Command::new("xdg-open");
-        command.arg(folder);
-        return spawn_and_reap(command, "the file manager");
+        use std::os::unix::ffi::OsStrExt;
+        let file = std::path::absolute(file)
+            .map_err(|error| LaunchError::new(format!("The file path is unavailable: {error}")))?;
+        std::fs::metadata(&file).map_err(|error| {
+            LaunchError::new(format!(
+                "The selected file is unavailable: {} ({error})",
+                file.display()
+            ))
+        })?;
+        // Encode native filename bytes, including spaces, #, quotes and Unicode.
+        let mut uri = String::from("file://");
+        for byte in file.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+                uri.push(*byte as char);
+            } else {
+                use std::fmt::Write;
+                write!(uri, "%{byte:02X}").expect("writing to a String");
+            }
+        }
+        let mut command = Command::new("gdbus");
+        command
+            .args([
+                "call",
+                "--session",
+                "--timeout",
+                "5",
+                "--dest",
+                "org.freedesktop.FileManager1",
+                "--object-path",
+                "/org/freedesktop/FileManager1",
+                "--method",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            .arg(format!("['{uri}']"))
+            .arg("");
+        sanitize_environment(&mut command);
+        let output = command.output().map_err(|error| {
+            LaunchError::new(format!(
+                "The file manager selection request could not start: {error}"
+            ))
+        })?;
+        if !output.status.success() {
+            return Err(LaunchError::new(format!(
+                "The file manager could not reveal {}: {}",
+                file.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        return Ok(());
     }
     #[allow(unreachable_code)]
     Err(LaunchError::new(
@@ -273,6 +314,7 @@ pub fn reveal(file: &Path) -> Result<(), LaunchError> {
     ))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn spawn_and_reap(mut command: Command, what: &str) -> Result<(), LaunchError> {
     sanitize_environment(&mut command);
     let child = command

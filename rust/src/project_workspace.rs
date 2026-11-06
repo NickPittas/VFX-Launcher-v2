@@ -2183,6 +2183,11 @@ impl ProjectWorkspace {
                 Err(TryRecvError::Disconnected) => {
                     let mut request = self.reveals.remove(index);
                     reap_finished(&mut request.worker);
+                    self.push_notice(Notice {
+                        title: "The file manager request stopped without a result.".to_string(),
+                        detail: None,
+                        error: true,
+                    });
                 }
                 Ok(Ok(())) => {
                     let mut request = self.reveals.remove(index);

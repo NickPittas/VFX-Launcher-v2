@@ -66,7 +66,9 @@ use std::time::SystemTime;
 
 use crate::discovery::{Coverage, FileEntry, FileStamp, RootContinuity, ScanPurpose, ScanSnapshot};
 use crate::paths::{self, PathIssue, PathRelation};
-use crate::patterns::{self, CompiledPatterns, IncomingProfile, MappingState, TagEdits, TagSet};
+use crate::patterns::{
+    self, CompiledPatterns, IncomingProfile, MappingState, TagEdits, TagKind, TagSet,
+};
 use crate::storage::utc_timestamp_now;
 use crate::transfers::{
     self, ConflictPolicy, EvidenceContinuity, EvidenceCoverage, FileAction, IssueSummary,
@@ -850,6 +852,18 @@ pub fn propose_incoming(
     compiled: &CompiledPatterns,
     profile: &IncomingProfile,
     edits: &[ItemEdit],
+    progress: impl FnMut(usize),
+) -> Vec<MappingProposal> {
+    propose_incoming_with_resolutions(items, compiled, profile, edits, &[], progress)
+}
+
+/// Media dimensions fill missing filename resolution tags; explicit edits win.
+pub fn propose_incoming_with_resolutions(
+    items: &[IncomingItem],
+    compiled: &CompiledPatterns,
+    profile: &IncomingProfile,
+    edits: &[ItemEdit],
+    resolutions: &[Option<String>],
     mut progress: impl FnMut(usize),
 ) -> Vec<MappingProposal> {
     let mut proposals = Vec::with_capacity(items.len());
@@ -877,14 +891,32 @@ pub fn propose_incoming(
                 sequence.members.iter().map(|m| m.file.clone()).collect(),
             ),
         };
-        let extracted = match match_name.as_deref() {
+        let mut extracted = match match_name.as_deref() {
             Some(name) => compiled.extract(name),
             None => TagSet::default(),
         };
+        let metadata_resolution = resolutions
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|_| extracted.get(TagKind::Resolution).is_none());
+        if let Some(resolution) = metadata_resolution {
+            extracted.set(TagKind::Resolution, Some(resolution.clone()));
+        }
         let tags = edit.tags.apply(&extracted);
-        let route = patterns::route(profile, &tags);
+        let route = patterns::route_file(
+            profile,
+            &tags,
+            sources
+                .first()
+                .and_then(|file| file.path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        );
         let mut state = route.state;
         let mut reason = route.reason;
+        if let Some(resolution) = metadata_resolution {
+            reason.push_str(&format!("; media metadata resolution {resolution}"));
+        }
         let mut alternatives = route.alternatives;
         let mut folder = route.segments;
         let mut used_footage_fallback = route.used_footage_fallback;

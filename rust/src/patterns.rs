@@ -82,8 +82,8 @@ use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// The reference pattern configuration, copied verbatim from
-/// `CleanIncomings/config/patterns.json`. It is the only seeded configuration;
+/// The pattern configuration seeded from `CleanIncomings/config/patterns.json`,
+/// with support for newer ARRI clip names. It is the only seeded configuration;
 /// nothing in the matching code knows a camera, shot or task name.
 const REFERENCE_PATTERNS_JSON: &str = r##"{
   "shotPatterns": [
@@ -100,7 +100,7 @@ const REFERENCE_PATTERNS_JSON: &str = r##"{
     "SOME0010"
   ],
   "taskPatterns": {
-    "ARRI_Camera_File_Task": ["^([A-Z]\\d{3}C\\d{3})_\\d{6}_[A-Z]\\d+[A-Z0-9]*\\.(?i)(mxf|ari|mov|mp4)$"],
+    "ARRI_Camera_File_Task": ["^([A-Z]_?\\d{3,4}C\\d{3})_\\d{6}_(?:\\d{6}_[A-Za-z0-9]+|[A-Z]\\d+[A-Z0-9]*)\\.(?i)(mxf|ari|mov|mp4)$"],
     "RED_Camera_File_Task": ["^([A-Z]\\d{3}_C\\d{3}_\\d{2}\\d{2}[A-Z0-9]{2})(?:_\\d{3})?\\.(?i)(R3D|mov|mp4|mxf)$"],
     "Sony_Camera_File_Task": ["^((?:[A-Z]?C\\d{3,}(?:M\\d{2})?)|(?:[A-Z]\\d{3}C\\d{3}_(?:[A-Z0-9]+_)?\\d{6}[A-Z0-9]*)|(?:R\\d{3}C\\d{3}_(?:[A-Z0-9]+_)?\\d{6}[A-Z0-9]*)|(?:[A-Z]{2,4}\\d{4,}))\\.(?i)(mxf|mp4|mov)$"],
     "Canon_Camera_File_Task": ["^((?:[A-Z0-9]{2,6}\\d{2,6}(?:_\\d{2})?)|(?:R\\d{3}C\\d{3})|(?:(?:IMG_|MVI_|_MG_)\\d{4,})|(?:[A-Z]\\d{3}R[35678]\\d{2}_.*))\\.(?i)(mxf|mp4|crm|mov)$"],
@@ -1754,6 +1754,46 @@ impl Route {
     }
 }
 
+/// A dot-prefixed folder keyword matches the complete file extension before tag routing.
+pub fn route_file(profile: &IncomingProfile, tags: &TagSet, filename: &str) -> Route {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str());
+    if let Some(extension) = extension {
+        let matches: Vec<_> = profile
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.keywords.iter().any(|word| {
+                    word.trim()
+                        .strip_prefix('.')
+                        .is_some_and(|word| word.eq_ignore_ascii_case(extension))
+                })
+            })
+            .collect();
+        if let Some(rule) = matches.first() {
+            if matches.iter().any(|other| other.path != rule.path) {
+                return Route {
+                    state: MappingState::Ambiguous,
+                    segments: Vec::new(),
+                    base: None,
+                    alternatives: matches.iter().map(|rule| rule.path.clone()).collect(),
+                    used_footage_fallback: false,
+                    reason: format!("extension .{extension} matches multiple destination folders"),
+                };
+            }
+            return Route::resolved(
+                rule,
+                tags,
+                MappingState::Matched,
+                false,
+                format!("extension .{extension} matched this rule"),
+            );
+        }
+    }
+    route(profile, tags)
+}
+
 /// Resolves a destination folder from a profile and one item's tags, following
 /// `generate_simple_target_path` step by step.
 pub fn route(profile: &IncomingProfile, tags: &TagSet) -> Route {
@@ -2020,12 +2060,26 @@ impl PatternStore {
                 format!("the pattern folder could not be created: {error}"),
             )
         })?;
-        let (patterns, patterns_seeded) = self.load_one(
+        let (mut patterns, mut patterns_seeded) = self.load_one(
             &self.patterns_path(),
             PatternSet::reference_defaults(),
             PatternSet::to_json,
             PatternSet::from_json,
         )?;
+        // Upgrade only the unchanged shipped ARRI rule; preserve user edits.
+        for rule in patterns.rules_mut(TagKind::Task) {
+            if rule.task.as_deref() == Some("ARRI_Camera_File_Task")
+                && rule.mode == RuleMode::Regex
+                && rule.text
+                    == r"^([A-Z]\d{3}C\d{3})_\d{6}_[A-Z]\d+[A-Z0-9]*\.(?i)(mxf|ari|mov|mp4)$"
+            {
+                rule.text = r"^([A-Z]_?\d{3,4}C\d{3})_\d{6}_(?:\d{6}_[A-Za-z0-9]+|[A-Z]\d+[A-Z0-9]*)\.(?i)(mxf|ari|mov|mp4)$".into();
+                patterns_seeded = true;
+            }
+        }
+        if patterns_seeded {
+            self.save_patterns(&patterns)?;
+        }
         let (profiles, profiles_seeded) = self.load_one(
             &self.profiles_path(),
             ProfileSet::default(),

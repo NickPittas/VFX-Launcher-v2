@@ -195,12 +195,16 @@ struct Analyzed {
     snapshot: ScanSnapshot,
     analysis: IncomingAnalysis,
     proposals: Vec<MappingProposal>,
+    resolutions: Vec<Option<String>>,
+    metadata_errors: Vec<String>,
 }
 
 /// A completed scan, bound to the source folder it came from.
 struct ScanResult {
     snapshot: ScanSnapshot,
     analysis: IncomingAnalysis,
+    resolutions: Vec<Option<String>>,
+    metadata_errors: Vec<String>,
 }
 
 struct ValidateRun {
@@ -403,6 +407,10 @@ struct MatchRun {
 pub struct OrganizeIncomingState {
     ai_open: bool,
     ai_config: crate::ai::HarnessConfig,
+    ai_models: Vec<String>,
+    ai_models_command: Option<PathBuf>,
+    ai_models_run: Option<(PathBuf, Receiver<Result<Vec<String>, String>>)>,
+    ai_models_error: Option<String>,
     ai_instruction: String,
     ai_prepared: Option<AiPrepared>,
     ai_run: Option<AiRun>,
@@ -495,6 +503,10 @@ impl OrganizeIncomingState {
         Self {
             ai_open: false,
             ai_config: Default::default(),
+            ai_models: Vec::new(),
+            ai_models_command: None,
+            ai_models_run: None,
+            ai_models_error: None,
             ai_instruction: "Suggest folders for these files using the selected folder layout."
                 .into(),
             ai_prepared: None,
@@ -672,6 +684,17 @@ impl OrganizeIncomingState {
         self.poll_execute(jobs);
         self.poll_preview();
         self.poll_ai();
+        if let Some((executable, receiver)) = self.ai_models_run.take() {
+            match receiver.try_recv() {
+                Err(TryRecvError::Empty) => self.ai_models_run = Some((executable, receiver)),
+                result if executable == self.ai_config.executable => match result {
+                    Ok(Ok(models)) => { self.ai_models = models; self.ai_models_error = None; }
+                    Ok(Err(error)) => self.ai_models_error = Some(error),
+                    Err(_) => self.ai_models_error = Some("Pi model discovery stopped without a result.".into()),
+                },
+                _ => {}
+            }
+        }
         self.poll_nuke();
         self.poll_player();
         self.media.poll();
@@ -1127,6 +1150,8 @@ impl OrganizeIncomingState {
                 self.scanned = Some(ScanResult {
                     snapshot: analyzed.snapshot,
                     analysis: analyzed.analysis,
+                    resolutions: analyzed.resolutions,
+                    metadata_errors: analyzed.metadata_errors,
                 });
                 self.folder_scope = None;
                 self.scan_error = None;
@@ -1363,7 +1388,7 @@ impl OrganizeIncomingState {
             return;
         };
         let profile = self.active_profile().cloned();
-        let analysis = self.scanned.as_ref().map(|s| s.analysis.clone());
+        let analysis = self.scanned.as_ref().map(|s| (s.analysis.clone(), s.resolutions.clone()));
         let edits = self.edits.clone();
         let key = self.match_key();
         let (sender, replies) = channel();
@@ -1372,18 +1397,19 @@ impl OrganizeIncomingState {
             let issues = patterns.dialect_issues();
             let mut proposals = Vec::new();
             let mut cancelled = job.control.checkpoint() == Checkpoint::Cancelled;
-            if let (Some(analysis), Some(profile)) = (analysis, profile) {
+            if let (Some((analysis, resolutions)), Some(profile)) = (analysis, profile) {
                 for (index, item) in analysis.items.iter().enumerate() {
                     if job.control.checkpoint() == Checkpoint::Cancelled {
                         cancelled = true;
                         break;
                     }
                     let edit = edits.get(&index).cloned().unwrap_or_default();
-                    let mut result = incoming::propose_incoming(
+                    let mut result = incoming::propose_incoming_with_resolutions(
                         std::slice::from_ref(item),
                         &compiled,
                         &profile,
                         &[edit],
+                        &resolutions[index..index+1],
                         |_| {},
                     );
                     if let Some(mut proposal) = result.pop() {
@@ -1695,15 +1721,18 @@ impl OrganizeIncomingState {
             let JobContext {
                 control, events, ..
             } = context;
-            let result = discovery::walk(&request, &control, &events).map(|snapshot| {
+            let result = discovery::walk(&request, &control, &events).map(|mut snapshot| {
                 let analysis = incoming::analyze_snapshot(&snapshot);
+                let (resolutions, metadata_errors) = crate::incoming_media::scan_resolutions(&analysis.items, &control, &events);
+                if control.is_cancelled() { snapshot.coverage = Coverage::Cancelled; }
                 let total = analysis.items.len().max(1) as u64;
                 let edits = vec![ItemEdit::default(); analysis.items.len()];
-                let proposals = incoming::propose_incoming(
+                let proposals = incoming::propose_incoming_with_resolutions(
                     &analysis.items,
                     &compiled,
                     &profile,
                     &edits,
+                    &resolutions,
                     |matched| {
                         events.progress(
                             JobPhase::Validating,
@@ -1721,6 +1750,8 @@ impl OrganizeIncomingState {
                     snapshot,
                     analysis,
                     proposals,
+                    resolutions,
+                    metadata_errors,
                 }
             });
             let (payload, outcome, progress) = match result {
@@ -3713,6 +3744,18 @@ impl OrganizeIncomingState {
     /// Scan, match and transfer progress with the real counts behind them, then
     /// the run report and every error and recovery path.
     fn progress_dock(&mut self, ui: &mut egui::Ui, jobs: &Jobs) {
+        if let Some(scan) = &self.scanned {
+            let read = scan.resolutions.iter().filter(|value| value.is_some()).count();
+            ui.label(egui::RichText::new(format!("Resolution metadata: {read} items read")).small().weak());
+            if !scan.metadata_errors.is_empty() {
+                ui.collapsing(format!("Resolution unavailable for {} items", scan.metadata_errors.len()), |ui| {
+                    egui::ScrollArea::vertical().id_salt("incoming_metadata_errors").max_height(120.0).show(ui, |ui| {
+                        for error in &scan.metadata_errors { ui.label(error); }
+                    });
+                });
+            }
+        }
+
         let failed_rules = self.compiled_issues.len()
             + self
                 .compiled
@@ -4264,7 +4307,7 @@ impl OrganizeIncomingState {
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_rule_keywords)
-                        .hint_text("keywords, comma separated")
+                        .hint_text("keywords or extensions, e.g. plate, .cube")
                         .desired_width(240.0),
                 );
                 if ui.button("Add rule").clicked() {
@@ -4632,6 +4675,7 @@ impl OrganizeIncomingState {
                 .to_owned();
             selected.push(crate::ai::AiItem {
                 item_id: index as u64,
+                resolution: scanned.resolutions.get(index).cloned().flatten(),
                 filename,
                 kind: if matches!(item, IncomingItem::Sequence(_)) {
                     "frame sequence"
@@ -4844,12 +4888,46 @@ impl OrganizeIncomingState {
         Ok(())
     }
 
+    fn refresh_ai_models(&mut self, jobs: &mut Jobs) {
+        if self.ai_models_run.is_some() || jobs.is_shutting_down() { return; }
+        let config = self.ai_config.clone();
+        let executable = config.executable.clone();
+        self.ai_models_command = Some(executable.clone());
+        let (sender, receiver) = channel();
+        match jobs.start(&self.ctx, "Reading Pi models", move |job| {
+            let result = crate::ai::list_models(&config, &job.control);
+            let outcome = if result.is_ok() { JobOutcome::Succeeded } else { JobOutcome::Failed };
+            let _ = sender.send(result);
+            job.events.finish(outcome, JobProgress::default());
+        }) {
+            Ok(_) => {
+                self.ai_models.clear();
+                self.ai_models_error = None;
+                self.ai_models_run = Some((executable, receiver));
+            }
+            Err(error) => self.ai_models_error = Some(format!("Could not read Pi models: {error}")),
+        }
+    }
+
     fn ai_window(&mut self, ctx: &egui::Context, jobs: &mut Jobs) {
         if !self.ai_open {
             return;
         }
+        if self.ai_models_command.as_ref() != Some(&self.ai_config.executable) {
+            self.refresh_ai_models(jobs);
+        }
+        // Preparing local context has no external side effects; only Send submits it.
+        if self.ai_run.is_none() && self.ai_prepared.as_ref().is_none_or(|prepared| {
+            prepared.draft != self.draft()
+                || prepared.request.instructions != self.ai_instruction
+                || prepared.config.executable != self.ai_config.executable
+                || prepared.config.model != self.ai_config.model
+                || prepared.config.timeout_seconds != self.ai_config.timeout_seconds
+        }) {
+            if let Err(error) = self.prepare_ai() { self.ai_error = Some(error); }
+        }
         let mut open = self.ai_open;
-        let mut prepare = false;
+        let mut refresh_models = false;
         let mut send = false;
         let mut apply = false;
         egui::Window::new("Suggest folders")
@@ -4869,6 +4947,26 @@ impl OrganizeIncomingState {
                             .hint_text("Describe how these files should be organized"),
                     )
                     .changed();
+                ui.add_enabled_ui(self.ai_run.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Model");
+                        let before = self.ai_config.model.clone();
+                        egui::ComboBox::from_id_salt("incoming_pi_model")
+                            .selected_text(if before.is_empty() { "Use Pi's selected model" } else { &before })
+                            .width(400.0).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.ai_config.model, String::new(), "Use Pi's selected model");
+                                for model in &self.ai_models {
+                                    ui.selectable_value(&mut self.ai_config.model, model.clone(), model);
+                                }
+                            });
+                        changed |= before != self.ai_config.model;
+                        if ui.add_enabled(self.ai_models_run.is_none(), egui::Button::new("Refresh models")).clicked() {
+                            refresh_models = true;
+                        }
+                    });
+                });
+                if self.ai_models_run.is_some() { ui.label("Reading models from Pi…"); }
+                if let Some(error) = &self.ai_models_error { ui.colored_label(WARNING, error); }
                 ui.collapsing("Pi settings", |ui| {
                     ui.add_enabled_ui(self.ai_run.is_none(), |ui| {
                         let mut executable =
@@ -4879,15 +4977,6 @@ impl OrganizeIncomingState {
                                 self.ai_config.executable = executable.clone().into();
                                 changed = true;
                             }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Model");
-                            changed |= ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.ai_config.model)
-                                        .hint_text("Use Pi's selected model"),
-                                )
-                                .changed();
                         });
                         ui.horizontal(|ui| {
                             ui.label("Timeout");
@@ -4903,15 +4992,13 @@ impl OrganizeIncomingState {
                 });
                 if changed {
                     self.ai_prepared = None;
+                    ctx.request_repaint();
                 }
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.busy(), egui::Button::new("Prepare request"))
-                        .clicked()
-                    {
-                        prepare = true;
-                    }
+                    let model_available = self.ai_config.model.is_empty()
+                        || self.ai_models.iter().any(|model| model == &self.ai_config.model);
                     let enabled = !self.busy()
+                        && model_available
                         && self
                             .ai_prepared
                             .as_ref()
@@ -4924,6 +5011,11 @@ impl OrganizeIncomingState {
                     }
                     if self.ai_run.is_some() {
                         ui.label("Waiting for suggestions…");
+                    }
+                    if !model_available {
+                        ui.colored_label(WARNING, "The selected model is unavailable. Refresh models or choose another model.");
+                    } else if !enabled && self.ai_run.is_none() {
+                        ui.label("Select files and review the request details below before sending to Pi.");
                     }
                 });
                 if let Some(error) = &self.ai_error {
@@ -4981,11 +5073,7 @@ impl OrganizeIncomingState {
                 }
             });
         self.ai_open = open;
-        if prepare {
-            if let Err(error) = self.prepare_ai() {
-                self.ai_error = Some(error);
-            }
-        }
+        if refresh_models { self.refresh_ai_models(jobs); }
         if send {
             self.begin_ai(jobs);
         }

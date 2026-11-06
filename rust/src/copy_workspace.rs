@@ -245,6 +245,7 @@ pub struct CopyByFileTypeState {
     scan_generation: u64,
     plan_counter: u64,
     validate_run: Option<ValidateRun>,
+    validation_error: Option<(Draft, String)>,
     review: Option<Review>,
     copy_run: Option<CopyRun>,
     report: Option<RunDone>,
@@ -281,6 +282,7 @@ impl CopyByFileTypeState {
             scan_generation: 0,
             plan_counter: 0,
             validate_run: None,
+            validation_error: None,
             review: None,
             copy_run: None,
             report: None,
@@ -498,11 +500,13 @@ impl CopyByFileTypeState {
                     space_unknown,
                     ready,
                 });
+                self.validation_error = None;
                 self.message = None;
                 self.rebuild_row_states();
             }
             Err(message) => {
                 self.review = None;
+                self.validation_error = Some((run.draft, message.clone()));
                 self.row_states.clear();
                 self.message = Some(message);
             }
@@ -708,6 +712,11 @@ impl CopyByFileTypeState {
         }
         if let Some(reason) = self.busy_reason() {
             return Some(reason);
+        }
+        if let Some((draft, reason)) = &self.validation_error {
+            if *draft == self.draft() {
+                return Some(format!("Validation failed: {reason}"));
+            }
         }
         let Some(review) = &self.review else {
             return Some("Validate the current selection first.".to_string());
@@ -1095,11 +1104,16 @@ impl CopyByFileTypeState {
         });
         match started {
             Ok(_) => {
+                self.review = None;
+                self.validation_error = None;
                 self.validate_run = Some(ValidateRun { draft, replies: rx });
                 self.message = None;
             }
             Err(error) => {
-                self.message = Some(format!("Validation could not be started: {error}"));
+                let message = format!("Validation could not be started: {error}");
+                self.review = None;
+                self.validation_error = Some((draft, message.clone()));
+                self.message = Some(message);
             }
         }
     }
@@ -1314,7 +1328,10 @@ impl CopyByFileTypeState {
             "Validating the current selection.".to_string()
         } else {
             match &self.review {
-                None => "Draft · validate the current file list before copying.".to_string(),
+                None => self.validation_error.as_ref()
+                    .filter(|(draft, _)| *draft == self.draft())
+                    .map(|(_, reason)| format!("Validation failed: {reason}"))
+                    .unwrap_or_else(|| "Draft · validate the current file list before copying.".to_string()),
                 Some(review) if review.draft != self.draft() => {
                     "The selection or settings changed; validate again.".to_string()
                 }
@@ -1636,6 +1653,24 @@ impl CopyByFileTypeState {
             .id_salt("copy_progress_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if self.validate_run.is_some() {
+                    ui.label("Validating the current selection…");
+                } else if self.review.is_some() || self.validation_error.as_ref()
+                    .is_some_and(|(draft, _)| *draft == self.draft()) {
+                    if let Some(reason) = self.copy_blocked() {
+                        ui.colored_label(WARNING, reason);
+                    }
+                    if let Some(review) = &self.review {
+                        ui.label(self.list_summary());
+                        for item in review.items.iter().filter(|item| item.state == ReviewState::Blocked) {
+                            ui.colored_label(WARNING, format!("{}: {}",
+                                item.source.as_ref().map(|path| path_display(path.path()))
+                                    .unwrap_or_else(|| "Folder".to_string()),
+                                item.message.as_deref().unwrap_or("Item refused")));
+                        }
+                    }
+                    ui.separator();
+                }
                 let scan_job = job_status(jobs, self.scan_run.as_ref().map(|run| run.job));
                 let scan_label = match scan_job {
                     Some(job) => format!("{} found", job.progress.completed),
@@ -1738,11 +1773,7 @@ impl CopyByFileTypeState {
                 }
 
                 if let Some(report) = &self.report {
-                    let headline = if report.draft != self.draft() {
-                        format!("Previous run · {}", run_headline(report))
-                    } else {
-                        run_headline(report)
-                    };
+                    let headline = format!("Previous run · {}", run_headline(report));
                     egui::CollapsingHeader::new(headline)
                         .id_salt("copy_results")
                         .default_open(report.error.is_some() || report.state != RunState::Succeeded)
@@ -1758,6 +1789,9 @@ impl CopyByFileTypeState {
                                 ui.label(egui::RichText::new(error).color(WARNING));
                             }
                             ui.label(egui::RichText::new(run_counts_text(&report.counts)).small());
+                            if !report.warnings.is_empty() {
+                                ui.label("Advisories recorded before this run:");
+                            }
                             for warning in &report.warnings {
                                 ui.label(egui::RichText::new(warning).small().color(WARNING));
                             }

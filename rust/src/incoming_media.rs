@@ -399,34 +399,8 @@ fn decode(
             return Ok((w as usize, h as usize, image.to_rgb8().into_raw()));
         }
     }
-    let probe = run_bounded(
-        "ffprobe",
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0:s=x",
-            "-i",
-        ],
-        path,
-        &[],
-        &control.control,
-        cancel,
-    )?;
-    let dims =
-        String::from_utf8(probe).map_err(|_| "ffprobe returned invalid dimensions.".to_owned())?;
-    let (w, h) = dims
-        .trim()
-        .split_once('x')
-        .ok_or("ffprobe found no image stream.")?;
-    let (w, h): (usize, usize) = (
-        w.parse().map_err(|_| "Invalid image width.")?,
-        h.parse().map_err(|_| "Invalid image height.")?,
-    );
+    let (w, h) = probe_dimensions(path, &control.control, cancel)?;
+    let (w, h) = (w as usize, h as usize);
     let bytes = w
         .checked_mul(h)
         .and_then(|v| v.checked_mul(3))
@@ -533,4 +507,99 @@ fn run_bounded(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Read dimensions once per analyzed item, using four bounded workers and no media decoding.
+pub(crate) fn scan_resolutions(
+    items: &[IncomingItem],
+    control: &crate::jobs::JobControl,
+    events: &crate::jobs::JobEvents,
+) -> (Vec<Option<String>>, Vec<String>) {
+    use std::sync::{Mutex, atomic::AtomicUsize};
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let result = Mutex::new((vec![None; items.len()], Vec::new()));
+    std::thread::scope(|scope| {
+        for _ in 0..items.len().min(4) {
+            let next = &next;
+            let done = &done;
+            let result = &result;
+            scope.spawn(move || loop {
+                if control.checkpoint() == Checkpoint::Cancelled { break; }
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(index) else { break; };
+                let media = matches!(item, IncomingItem::Sequence(_))
+                    || matches!(item, IncomingItem::Single(single) if matches!(single.kind, SingleKind::Image | SingleKind::Video));
+                if media {
+                    if let Some(file) = item.files().first() {
+                        let dimensions = image::ImageReader::open(&file.path).ok()
+                            .and_then(|reader| reader.with_guessed_format().ok())
+                            .and_then(|reader| reader.into_dimensions().ok())
+                            .filter(|(w,h)| *w > 0 && *h > 0)
+                            .map(|(w,h)| format!("{w}x{h}"))
+                            .map(Ok).unwrap_or_else(|| probe_resolution(&file.path, control));
+                        let mut result = result.lock().expect("metadata results");
+                        match dimensions {
+                            Ok(resolution) => result.0[index] = Some(resolution),
+                            Err(error) => result.1.push(format!("{}: {error}", file.path.display())),
+                        }
+                    }
+                }
+                // Serialize the completion count with its progress event.
+                let _result = result.lock().expect("metadata results");
+                let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
+                events.progress(crate::jobs::JobPhase::MatchingFolders, crate::jobs::JobProgress {
+                    completed: completed as u64, total: Some(items.len() as u64),
+                    ..Default::default()
+                });
+            });
+        }
+    });
+    result.into_inner().expect("metadata results")
+}
+
+fn probe_resolution(
+    path: &std::path::Path,
+    control: &crate::jobs::JobControl,
+) -> Result<String, String> {
+    probe_dimensions(path, control, &AtomicBool::new(false)).map(|(w, h)| format!("{w}x{h}"))
+}
+
+fn probe_dimensions(
+    path: &std::path::Path,
+    control: &crate::jobs::JobControl,
+    cancel: &AtomicBool,
+) -> Result<(u32, u32), String> {
+    // JSON keeps dimensions separate from side-data emitted for camera formats.
+    let output = run_bounded(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            "-i",
+        ],
+        path,
+        &[],
+        control,
+        cancel,
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|error| format!("Invalid dimension output: {error}"))?;
+    let dimensions = value
+        .get("streams")
+        .and_then(|value| value.as_array())
+        .and_then(|streams| streams.first())
+        .and_then(|stream| {
+            let w = u32::try_from(stream.get("width")?.as_u64()?).ok()?;
+            let h = u32::try_from(stream.get("height")?.as_u64()?).ok()?;
+            (w > 0 && h > 0).then_some((w, h))
+        });
+    dimensions
+        .ok_or_else(|| "No readable video/image dimensions; resolution tag unavailable.".into())
 }
