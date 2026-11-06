@@ -1,5 +1,18 @@
 # VFX Launcher 0.2.0 — Windows
 
+[Download portable ZIP](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.2.0/VFX-Launcher-0.2.0-Windows-x86_64.zip) · [SHA-256 checksum](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.2.0/VFX-Launcher-0.2.0-Windows-x86_64.zip.sha256) · [User guides](README.md)
+
+This is the published Windows prerelease. Windows 0.3.4 is not published; the later Linux Incoming/media and validation fixes are not included here. See [Windows verification evidence](migration/NATIVE-WINDOWS-EVIDENCE.md).
+
+Verify the archive before extracting:
+
+```powershell
+Get-FileHash .\VFX-Launcher-0.2.0-Windows-x86_64.zip -Algorithm SHA256
+Get-Content .\VFX-Launcher-0.2.0-Windows-x86_64.zip.sha256
+```
+
+Compare the hash values; they must match.
+
 Extract `VFX-Launcher-0.2.0-Windows-x86_64.zip` into a local folder, then
 double-click `vfx-launcher.exe`. No Python, Rust or installer is needed to run it.
 Windows 10/11 x64 with working desktop OpenGL drivers is required.

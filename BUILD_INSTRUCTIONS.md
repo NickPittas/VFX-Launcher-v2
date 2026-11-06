@@ -1,4 +1,18 @@
-# VFX Launcher - Build and Installation Instructions
+# Build and installation instructions
+
+For the current Rust desktop, use the platform-specific recipes:
+
+- [Linux AppImage build and installation](docs/LINUX-APPIMAGE.md).
+- [Windows portable build and installation](docs/WINDOWS.md).
+- [Published downloads](README.md#downloads) and [release history](CHANGELOG.md).
+
+The scripts package the Rust application without running test suites. Linux 0.3.4 and Windows 0.2.0 are the currently published packages; do not infer Windows version parity from the shared source.
+
+## Legacy Python build
+
+The instructions below apply only to the retained Python/PySide6 application.
+
+# Python build and installation
 
 ## Prerequisites
 

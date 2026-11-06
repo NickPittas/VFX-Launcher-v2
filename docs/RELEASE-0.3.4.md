@@ -23,3 +23,11 @@ routing, extension conflicts, preservation of custom rules, resolution probing,
 manual overrides, and actual Pi model discovery. No generation request was sent.
 Native UI and provider generation remain unverified. No real project media or
 production catalog was used for validation. Previous runtime limitations apply.
+
+## Downloads and included fixes
+
+[Linux AppImage and checksum](../README.md#downloads) are published on the [0.3.4 GitHub release](https://github.com/NickPittas/VFX-Launcher-v2/releases/tag/v0.3.4). Windows remains the separately published [0.2.0 portable prerelease](WINDOWS.md); no Windows 0.3.4 package is available.
+
+This package also includes the [0.3.3 fixes](RELEASE-0.3.3.md): Linux file-manager reveal/selection, retained copy/backup validation reasons, current blocked items above historical results, and clearing old approval after failed revalidation.
+
+See the [page guides](README.md) for operation and [release history](../CHANGELOG.md) for earlier changes.

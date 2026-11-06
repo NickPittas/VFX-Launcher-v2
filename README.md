@@ -1,210 +1,66 @@
-# VFX Project Launcher
+# VFX Launcher
 
-The merged Rust/egui application is now version **0.3.1**, packaged for Linux
-x86_64 as an AppImage. See [Linux installation and build instructions](docs/LINUX-APPIMAGE.md)
-and [0.3.1 release notes](docs/RELEASE-0.3.1.md).
-Version 0.2.0 also has a [Windows x64 portable package](docs/WINDOWS.md) with native file operations.
+A native Rust/egui desktop for VFX projects: browse and launch Nuke and After Effects files, create shot structures, organize incoming media, copy selected file types, and back up projects with reviewed file-operation plans.
 
-The Python Windows application remains available. The sections below describe
-that legacy application.
+## Downloads
 
-![VFX Launcher](ui_slick/icons/icon_3_512.png)
+| Platform | Published version | Download | Installation |
+| --- | --- | --- | --- |
+| Linux x86_64 | **0.3.4** | [AppImage](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-x86_64.AppImage) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-x86_64.AppImage.sha256) | [Linux guide](docs/LINUX-APPIMAGE.md) |
+| Windows 10/11 x64 | **0.2.0 prerelease** | [Portable ZIP](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.2.0/VFX-Launcher-0.2.0-Windows-x86_64.zip) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.2.0/VFX-Launcher-0.2.0-Windows-x86_64.zip.sha256) | [Windows guide](docs/WINDOWS.md) |
 
-## 🎯 Purpose
+No Python or Rust installation is needed for these packages. Windows 0.2.0 is already published on GitHub; a Windows 0.3.4 package is not published. The later Linux changes listed below are not included in that Windows download.
 
-A Python-based Windows application that helps VFX artists manage and quickly launch Nuke (.nk) and After Effects (.aep) projects directly from a centralized project database, featuring user logging, project scanning, version selection, and real-time monitoring.
+## Screenshots
 
-## ✨ Features
+Actual native desktop captures from earlier feature-local verification runs, using disposable data; these are not mockups or evidence of a new 0.3.4 runtime check.
 
-### Core Functionalities
-- 📁 **Project Management**: Select project from database, scan and track .nk and .aep files
-- 🔍 **Smart Scanning**: Automatically scan directories for VFX project files with real-time progress
-- 📊 **Version Management**: Auto-detect and allow manual selection of script/project versions
-- ⭐ **Favorites**: Mark frequently used files as favorites for quick access
-- 📈 **File Tracking**: Track when files were last opened and by whom
-- 👥 **User Management**: Log actions (no passwords required), add/remove/edit users (admin function)
-- 🚀 **Integration**: Automatically launch selected project with Nuke (using --nukex) or After Effects
-- 📝 **Real-Time Logging**: Record actions and scan progress for troubleshooting and accountability
-- 👁️ **Folder Monitoring**: Scan configured directories to detect and update new script versions
-- 🎨 **Modern UI**: Clean, dark-themed interface with collapsible sidebar
-- 💾 **Persistent State**: Remembers window size, column widths, sidebar state, and UI preferences
-- 🌳 **File System Interaction**: Tree-view browsing, context menus, and detailed project info
+**Projects on Windows (0.2.0):** browse projects, choose a script version, and launch it.
 
-## 📋 Requirements
+![Native Windows Projects page with a Nuke script and version selector](docs/images/windows-projects.png)
 
-### For End Users
-- Windows 10/11
-- Nuke and/or After Effects (for launching files)
+**Organize Incoming on Linux (earlier development capture):** grouped sequences, proposed destinations, folder preview, and explicit validation and copy controls.
 
-### For Development
-- Python 3.11+
-- PySide6 for GUI
-- SQLite database (lightweight, embedded, perfect for network-shared environment via SMB/QNAP)
-- Watchdog library for file monitoring
+![Native Incoming page showing sequence grouping and destination review](docs/images/incoming.png)
 
-## 🚀 Installation
+## Latest updates
 
-### Option 1: Use Pre-built Executable (Recommended)
+[0.3.4](docs/RELEASE-0.3.4.md) adds newer ARRI filename recognition, extension-based folder keywords such as `.cube`, resolution metadata during Incoming scans, corrected ffprobe parsing, and Pi model discovery with explicit submission. It also includes the 0.3.3 file-manager reveal and validation-error fixes.
 
-**Windows:** Download `VFX_Launcher.exe` from the
-[latest release](https://github.com/NickPittas/VFX-Launcher-v2/releases) and run it.
-Configure the database location on first run, then set paths to Nuke and
-After Effects in Settings.
+Recent releases improved contained file-link copying, visible execution controls and refusal reasons, stable progress rows, Incoming media previews, external players, and sending media to a running Nuke socket session. See the [release history](CHANGELOG.md) for details and verification limits.
 
-**Linux:** Use the versioned Rust AppImage described in the
-[Linux instructions](docs/LINUX-APPIMAGE.md).
+## Get started
 
-### Option 2: Use Installer
-1. Download `VFX_Launcher_Setup.exe` from releases
-2. Run the installer
-3. Follow the installation wizard
-4. Select database location (local or network share)
-5. Launch from Start Menu or Desktop shortcut
+1. Download your platform package above and verify its checksum.
+2. On Linux, make the AppImage executable and run it. On Windows, extract the ZIP and run `vfx-launcher.exe`.
+3. Open **Settings**, configure installed applications, select a user, and save.
+4. In **Projects**, use **Add existing folder…** and **Scan folders**, or **New project…** to create a structure.
+5. For file operations, scan, review the destination and conflict policy, then **Validate selection** before executing. Check the per-file report afterward.
 
-### Option 3: Run from Source
-```bash
-# Clone the repository
-git clone <repository-url>
-cd VFX-Launcher
+## User guides
 
-# Install dependencies
-pip install -r requirements.txt
+| Page or workflow | Guide |
+| --- | --- |
+| First run, navigation and safe operation | [Getting started](docs/guides/GETTING-STARTED.md) |
+| Projects, versions and launching | [Projects](docs/guides/PROJECTS.md) |
+| New projects, templates, shots and sequences | [Shots & Sequences](docs/guides/SHOTS-AND-SEQUENCES.md) |
+| Rules, tags, previews, copy/move and Pi suggestions | [Organize Incoming](docs/guides/INCOMING.md) |
+| Extension selection and reviewed copying | [Copy by File Type](docs/guides/COPY-BY-FILE-TYPE.md) |
+| Backup jobs and schedules | [Back Up Projects](docs/guides/BACKUP.md) |
+| Application paths, users and legacy import | [Settings](docs/guides/SETTINGS.md) |
+| Logs, failures and recovery information | [History and troubleshooting](docs/guides/HISTORY.md) |
 
-# Run the application
-python ui_slick/main_slick.py
-```
+## Requirements and limits
 
-## 🔨 Building from Source
+Linux requires x86_64, glibc 2.35+, working desktop OpenGL drivers, and Linux 5.6+ for native transfers. Windows requires Windows 10/11 x64 and working desktop OpenGL drivers. Network locations must already be accessible to the application.
 
-### Build Executable
-```bash
-# Run the build script
-build_exe.bat
+Nuke, After Effects, DJV, MRV2, FFmpeg/ffprobe and the optional external Pi harness are separate host installations where used. Schedules run while the application is open. Full production/NAS, hostile filesystem-race and power-loss behavior are not established by the published checks. Windows directory-entry durability remains unconfirmed; ACLs and alternate data streams are not copied. See platform guides and release notes before moving valuable files.
 
-# Or manually with PyInstaller
-python -m PyInstaller vfx_launcher.spec --clean
-```
+## Development and documentation
 
-The executable will be created at `dist/VFX_Launcher.exe` (~47 MB single file).
+- [Documentation index](docs/README.md), [release history](CHANGELOG.md), and [build instructions](BUILD_INSTRUCTIONS.md).
+- Rust desktop and file operations: `rust/`; embedded folder templates: see `rust/src/builtin_templates.rs`.
+- [Migration status](docs/migration/IMPLEMENTATION-STATUS.md), [contracts](docs/migration/CONTRACTS.md), and [approved desktop design](docs/migration/DESIGN-APPROVAL.md).
+- The [legacy Python application](docs/LEGACY-PYTHON.md) remains available during migration.
 
-### Build Installer
-1. Install [Inno Setup](https://jrsoftware.org/isdl.php)
-2. Open `installer.iss` in Inno Setup Compiler
-3. Click "Compile" to create the installer
-4. Installer will be created in `installer_output/VFX_Launcher_Setup.exe`
-
-### Build Linux AppImage
-```bash
-./build_appimage.sh
-```
-This builds the merged Rust application and creates
-`artifacts/releases/VFX-Launcher-0.3.1-x86_64.AppImage` plus its SHA-256 checksum.
-It requires the Linux build dependencies listed in
-[the packaging guide](docs/LINUX-APPIMAGE.md). Templates are embedded; PyInstaller
-and a Python environment are not used by this build.
-
-## ⚙️ Configuration
-
-### Database Location
-On first run, you'll be prompted to select a database location. You can choose:
-- **Local**: `C:\Users\<username>\AppData\Local\VFX_Launcher\vfx_launcher.db`
-- **Network**: `\\server\shared\vfx_launcher.db` (for multi-user setups)
-
-The location is saved in `config.ini`.
-
-### Application Paths
-Configure paths to Nuke and After Effects executables in the Settings panel:
-- Nuke: `C:\Program Files\Nuke14.0v5\Nuke14.0.exe`
-- After Effects: `C:\Program Files\Adobe\Adobe After Effects 2024\Support Files\AfterFX.exe`
-
-## 📖 Usage
-
-1. **Add Projects**: Click "Add Project" to create a new project entry
-2. **Scan Directories**: Use "Scan Directory" to automatically find VFX files
-3. **Browse Files**: Navigate through projects and their file versions
-4. **Launch Files**: Double-click a file to open it in the appropriate application
-5. **Mark Favorites**: Click the star icon to mark files as favorites
-6. **Collapse Sidebar**: Click the ☰ button to collapse/expand the navigation sidebar
-7. **View Logs**: Access application logs from the Logs panel
-
-## 📁 Project Structure
-
-```
-VFX-Launcher/
-├── ui_slick/              # Main application code (Slick UI)
-│   ├── main_slick.py      # Application entry point
-│   ├── main_window.py     # Main window UI
-│   ├── sidebar.py         # Collapsible sidebar navigation
-│   ├── project_panel.py   # Project management panel
-│   ├── user_panel.py      # User management panel
-│   ├── settings_panel.py  # Settings configuration panel
-│   ├── log_panel.py       # Log viewer panel
-│   ├── icons/             # Application icons (PNG, ICO)
-│   └── styles.qss         # Qt stylesheet (dark theme)
-├── database_manager.py    # SQLite database operations
-├── config_manager.py      # Configuration management (config.ini)
-├── vfx_launcher.spec      # PyInstaller specification (single-file build)
-├── installer.iss          # Inno Setup installer script
-├── build_exe.bat          # Build script for executable
-├── requirements.txt       # Python dependencies
-├── .gitignore             # Git ignore rules
-└── README.md              # This file
-```
-
-## 🗄️ Database Schema
-
-The application uses SQLite with the following main tables:
-- **projects**: Project information (name, description, root path)
-- **files**: File entries with versions (path, project_id, version)
-- **file_access_log**: Track file access history (file_id, user_id, timestamp)
-- **users**: User profiles (name, email)
-
-## 📝 Logs
-
-Application logs are stored in:
-```
-C:\Users\<username>\AppData\Local\VFX_Launcher\logs\
-```
-
-Logs include:
-- Application startup/shutdown
-- File scanning progress
-- File launches
-- Database operations
-- Errors and warnings
-
-## 🎨 UI Features
-
-### Collapsible Sidebar
-- Click ☰ to toggle between expanded (200px) and collapsed (60px) states
-- Collapsed state shows first letter of each section (P, U, S, L)
-- State persists across sessions
-
-### File Browser
-- Star column for favorites
-- Last Opened and Opened By columns
-- Sortable columns
-- Column widths persist across sessions
-
-### Dark Theme
-- Modern dark color scheme
-- Consistent styling across all panels
-- Custom QSS stylesheet
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## 📄 License
-
-[Add your license here]
-
-## 👤 Author
-
-[Add your name/organization here]
-
-## 🙏 Acknowledgments
-
-- Built with PySide6 (Qt for Python)
-- Icons created with custom designs
-- Inspired by modern VFX pipeline tools
+Follow [AGENTS.md](AGENTS.md) when contributing. Reference clones in `gitclones/` are read-only inputs and are not shipped.
