@@ -202,10 +202,21 @@ pub struct Applications {
 
 /// Project registration preferences (legacy `project_directories`, a
 /// comma-separated list of directory names, is stored as a list here).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectDiscovery {
     pub project_directory_names: Vec<String>,
+}
+
+impl Default for ProjectDiscovery {
+    fn default() -> Self {
+        Self {
+            project_directory_names: ["project", "projects", "Project", "Projects"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
 }
 
 /// Versioned application settings.
