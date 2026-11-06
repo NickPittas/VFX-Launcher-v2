@@ -513,24 +513,6 @@ const CACHE_EXTENSIONS: [&[u8]; 7] = [
     b".abc", b".bgeo", b".vdb", b".ass", b".usd", b".usda", b".usdc",
 ];
 
-/// The dotted suffix list an incoming scan request uses, in reference order and
-/// without duplicates.
-pub fn scan_suffixes() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for known in IMAGE_EXTENSIONS
-        .iter()
-        .chain(VIDEO_EXTENSIONS.iter())
-        .chain(PROJECT_EXTENSIONS.iter())
-        .chain(CACHE_EXTENSIONS.iter())
-    {
-        let suffix = String::from_utf8_lossy(known).into_owned();
-        if !out.contains(&suffix) {
-            out.push(suffix);
-        }
-    }
-    out
-}
-
 /// Component names the reference scanner skipped while walking. Discovery
 /// matches these case-insensitively against a single component.
 pub fn scan_excludes() -> Vec<String> {
