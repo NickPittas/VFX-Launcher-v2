@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::copy_workspace::CopyByFileTypeState;
+use crate::incoming_workspace::OrganizeIncomingState;
 use crate::jobs::{JobId, JobStatus, Jobs, LIVE_POLL_INTERVAL};
 use crate::launch::Tool;
 use crate::project_workspace::{ProjectWorkspace, RegistrationStatus, SettingsPath};
@@ -119,21 +120,6 @@ impl View {
             Self::Settings => "Settings",
         }
     }
-
-    /// Execution control pinned in the bottom strip. `None` for views whose
-    /// execution lives on a row (Project file launch), that execute nothing, or
-    /// that draw their own control from the reviewed plan state (Copy by File
-    /// Type).
-    fn primary_action(self) -> Option<&'static str> {
-        match self {
-            // The Shots view draws its own reviewed plan controls in the strip.
-            Self::ShotsAndSequences => None,
-            Self::OrganizeIncoming => Some("Copy selected"),
-            Self::CopyByFileType => None,
-            Self::BackUpProjects => None,
-            Self::Projects | Self::Settings => None,
-        }
-    }
 }
 
 /// What a pane asks the shell to do once the frame's borrows are released.
@@ -163,9 +149,7 @@ pub struct VfxLauncherApp {
     /// Version picked per file group, so one row can stand for every version of a
     /// group. A pick that the current view no longer offers falls back to latest.
     version_choice: HashMap<GroupKey, FileId>,
-    incoming_source: String,
-    incoming_destination: String,
-    incoming_move: bool,
+    incoming: OrganizeIncomingState,
     copy_by_type: CopyByFileTypeState,
     backup: crate::backup_workspace::BackupWorkspace,
     about_open: bool,
@@ -195,9 +179,7 @@ impl VfxLauncherApp {
             file_tab: FileKind::Nuke,
             file_filter: String::new(),
             version_choice: HashMap::new(),
-            incoming_source: String::new(),
-            incoming_destination: String::new(),
-            incoming_move: false,
+            incoming: OrganizeIncomingState::new(&cc.egui_ctx, data_dir.clone()),
             copy_by_type: CopyByFileTypeState::new(&cc.egui_ctx),
             backup: crate::backup_workspace::BackupWorkspace::new(&cc.egui_ctx, &data_dir),
             about_open: false,
@@ -225,6 +207,11 @@ impl eframe::App for VfxLauncherApp {
             self.workspace.catalog_client().as_ref(),
             self.workspace.user().map(|user| user.id),
             &mut self.jobs,
+        );
+        self.incoming.poll(
+            self.workspace.catalog_client().as_ref(),
+            self.workspace.user().map(|user| user.id),
+            &self.jobs,
         );
         self.copy_by_type.poll(
             self.workspace.catalog_client().as_ref(),
@@ -387,10 +374,14 @@ impl VfxLauncherApp {
 
             ui.horizontal(|ui| {
                 if self.view == View::OrganizeIncoming {
-                    ui.radio_value(&mut self.incoming_move, false, "Copy");
-                    ui.radio_value(&mut self.incoming_move, true, "Move");
+                    let mut move_files = self.incoming.move_files();
+                    ui.radio_value(&mut move_files, false, "Copy");
+                    ui.radio_value(&mut move_files, true, "Move");
+                    if move_files != self.incoming.move_files() {
+                        self.incoming.set_move_files(move_files);
+                    }
                     ui.separator();
-                    let _ = pending_button(ui, "Validate selection");
+                    self.incoming.validate_control(ui, &mut self.jobs);
                 }
                 if self.view == View::CopyByFileType {
                     self.copy_by_type.validate_control(ui, &mut self.jobs);
@@ -405,6 +396,7 @@ impl VfxLauncherApp {
                     && (self.backup.picker_pending()
                         || self.copy_by_type.picker_pending()
                         || self.structure.picker_pending()
+                        || self.incoming.picker_pending()
                         || self.workspace.registration_picker_pending()
                         || self.workspace.settings_browse_pending())
                 {
@@ -428,11 +420,6 @@ impl VfxLauncherApp {
                         );
                     }
                 }
-                let action = if self.view == View::OrganizeIncoming && self.incoming_move {
-                    Some("Move selected")
-                } else {
-                    self.view.primary_action()
-                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.view == View::CopyByFileType {
                         self.copy_by_type.execution_control(ui, &mut self.jobs);
@@ -443,8 +430,8 @@ impl VfxLauncherApp {
                     if self.view == View::ShotsAndSequences {
                         self.structure.execution_control(ui, &mut self.jobs);
                     }
-                    if let Some(action) = action {
-                        explain(&primary_button(ui, action, false), UNAVAILABLE);
+                    if self.view == View::OrganizeIncoming {
+                        self.incoming.execution_control(ui, &mut self.jobs);
                     }
                     if let Some(job) = &job {
                         if job.is_terminal() && job.is_reaped() {
@@ -458,6 +445,7 @@ impl VfxLauncherApp {
                         } else if self.copy_by_type.is_picker_job(job.id)
                             || self.backup.is_picker_job(job.id)
                             || self.structure.is_picker_job(job.id)
+                            || self.incoming.is_picker_job(job.id)
                         {
                             ui.label("Waiting for folder chooser");
                         } else {
@@ -867,65 +855,7 @@ impl VfxLauncherApp {
     }
 
     fn incoming_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            explain(&primary_button(ui, "Scan folders", false), UNAVAILABLE);
-            ui.separator();
-            folder_field(
-                ui,
-                "Source",
-                &mut self.incoming_source,
-                "No source folder chosen",
-            );
-            ui.separator();
-            folder_field(
-                ui,
-                "Destination",
-                &mut self.incoming_destination,
-                "No destination folder chosen",
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let _ = pending_button(ui, "Suggest folders");
-            });
-        });
-        ui.separator();
-
-        egui::Panel::bottom("incoming_preview_dock")
-            .resizable(true)
-            .default_size(160.0)
-            .min_size(110.0)
-            .max_size(340.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Selected file").small().weak());
-                empty_state(
-                    ui,
-                    "No file selected.",
-                    "The planned destination and file changes appear here.",
-                );
-            });
-
-        egui::Panel::left("incoming_source_tree")
-            .resizable(true)
-            .default_size(300.0)
-            .min_size(200.0)
-            .max_size(560.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Source folders").small().weak());
-                empty_state(
-                    ui,
-                    "No source folder scanned.",
-                    "Choose a source folder, then scan.",
-                );
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.label(egui::RichText::new("Planned files").small().weak());
-            ui.separator();
-            empty_state(
-                ui,
-                "No planned files yet.",
-                "Copy and move plans appear here after a scan.",
-            );
-        });
+        self.incoming.view(ui, &mut self.jobs);
     }
 
     fn copy_by_file_type_view(&mut self, ui: &mut egui::Ui) {
@@ -1681,11 +1611,6 @@ fn explain(response: &egui::Response, reason: &str) {
     let _ = response.clone().on_hover_text(reason);
 }
 
-fn pending_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_enabled(false, egui::Button::new(label))
-        .on_hover_text(UNAVAILABLE)
-}
-
 fn notice_row(ui: &mut egui::Ui, title: &str, detail: Option<&str>, error: bool) {
     ui.horizontal(|ui| {
         let text = egui::RichText::new(title).small();
@@ -1872,17 +1797,6 @@ fn folded_contains(text: &str, needle: &[u8]) -> bool {
     crate::paths::fold_native_text(text.as_bytes())
         .windows(needle.len())
         .any(|window| window == needle)
-}
-
-fn folder_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &'static str) {
-    ui.label(egui::RichText::new(label).small().weak());
-    ui.add_enabled(
-        false,
-        egui::TextEdit::singleline(value)
-            .hint_text(hint)
-            .desired_width(210.0),
-    );
-    let _ = pending_button(ui, "Browse…");
 }
 
 fn status_text(job: Option<&JobStatus>, closing: bool, live_jobs: usize) -> String {

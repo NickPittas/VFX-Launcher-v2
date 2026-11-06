@@ -59,10 +59,20 @@
 //! is identical regardless of scan iteration order.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
-use crate::discovery::{FileEntry, ScanSnapshot};
+use crate::discovery::{Coverage, FileEntry, FileStamp, RootContinuity, ScanPurpose, ScanSnapshot};
+use crate::paths::{self, PathIssue, PathRelation};
+use crate::patterns::{self, CompiledPatterns, IncomingProfile, MappingState, TagEdits, TagSet};
+use crate::storage::utc_timestamp_now;
+use crate::transfers::{
+    self, ConflictPolicy, EvidenceContinuity, EvidenceCoverage, FileAction, IssueSummary,
+    NativeIdentity, OperationPlan, PlanOrigin, PlannedAction, SourceEvidence, SourceStamp,
+    StoredPath, TransferCategory, TransferError,
+};
 
 /// One analyzed incoming source item: a single file or an image sequence,
 /// as CONTRACTS.md §5 defines `IncomingItem`.
@@ -487,29 +497,81 @@ fn is_sequence_capable(extension: &[u8]) -> bool {
         .any(|known| *known == folded.as_slice())
 }
 
+/// `scanner.py` `supported_extensions`, the file types the reference tool treats
+/// as incoming material. They are also the suffixes an incoming scan asks
+/// discovery for, so what the page lists is exactly what the analysis can
+/// classify.
+const IMAGE_EXTENSIONS: [&[u8]; 8] = [
+    b".exr", b".dpx", b".tiff", b".tif", b".jpg", b".jpeg", b".png", b".hdr",
+];
+const VIDEO_EXTENSIONS: [&[u8]; 7] = [
+    b".mov", b".mp4", b".avi", b".mkv", b".mxf", b".r3d", b".braw",
+];
+const PROJECT_EXTENSIONS: [&[u8]; 7] =
+    [b".nk", b".hip", b".ma", b".mb", b".blend", b".c4d", b".aep"];
+const CACHE_EXTENSIONS: [&[u8]; 7] = [
+    b".abc", b".bgeo", b".vdb", b".ass", b".usd", b".usda", b".usdc",
+];
+
+/// The dotted suffix list an incoming scan request uses, in reference order and
+/// without duplicates.
+pub fn scan_suffixes() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for known in IMAGE_EXTENSIONS
+        .iter()
+        .chain(VIDEO_EXTENSIONS.iter())
+        .chain(PROJECT_EXTENSIONS.iter())
+        .chain(CACHE_EXTENSIONS.iter())
+    {
+        let suffix = String::from_utf8_lossy(known).into_owned();
+        if !out.contains(&suffix) {
+            out.push(suffix);
+        }
+    }
+    out
+}
+
+/// Component names the reference scanner skipped while walking. Discovery
+/// matches these case-insensitively against a single component.
+pub fn scan_excludes() -> Vec<String> {
+    [
+        "__pycache__",
+        ".git",
+        "node_modules",
+        ".tmp",
+        ".cache",
+        "Thumbs.db",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect()
+}
+
 /// Single-file media category from `scanner.py` `supported_extensions`.
 fn single_kind(extension: Option<&[u8]>) -> SingleKind {
-    const IMAGE: [&[u8]; 8] = [
-        b".exr", b".dpx", b".tiff", b".tif", b".jpg", b".jpeg", b".png", b".hdr",
-    ];
-    const VIDEO: [&[u8]; 7] = [
-        b".mov", b".mp4", b".avi", b".mkv", b".mxf", b".r3d", b".braw",
-    ];
-    const PROJECT: [&[u8]; 7] = [b".nk", b".hip", b".ma", b".mb", b".blend", b".c4d", b".aep"];
-    const CACHE: [&[u8]; 7] = [
-        b".abc", b".bgeo", b".vdb", b".ass", b".usd", b".usda", b".usdc",
-    ];
     let Some(extension) = extension else {
         return SingleKind::Other;
     };
     let folded = ascii_lowercase(extension);
-    if IMAGE.iter().any(|known| *known == folded.as_slice()) {
+    if IMAGE_EXTENSIONS
+        .iter()
+        .any(|known| *known == folded.as_slice())
+    {
         SingleKind::Image
-    } else if VIDEO.iter().any(|known| *known == folded.as_slice()) {
+    } else if VIDEO_EXTENSIONS
+        .iter()
+        .any(|known| *known == folded.as_slice())
+    {
         SingleKind::Video
-    } else if PROJECT.iter().any(|known| *known == folded.as_slice()) {
+    } else if PROJECT_EXTENSIONS
+        .iter()
+        .any(|known| *known == folded.as_slice())
+    {
         SingleKind::Project
-    } else if CACHE.iter().any(|known| *known == folded.as_slice()) {
+    } else if CACHE_EXTENSIONS
+        .iter()
+        .any(|known| *known == folded.as_slice())
+    {
         SingleKind::Cache
     } else {
         SingleKind::Other
@@ -600,10 +662,16 @@ fn extract_frame_info(name: &str) -> Option<FrameInfo> {
         }
         return Some(FrameInfo {
             prefix,
-            // Gate-passed extensions are pure ASCII, so ASCII folding here is
-            // exactly the legacy `lower()` comparison form of the node field.
-            suffix: String::from_utf8(ascii_lowercase(extension.as_bytes()))
-                .expect("ASCII case folding preserves UTF-8"),
+            // The legacy `base_name` + suffix pair re-joins as
+            // `base.####.exr`: the suffix keeps its leading dot, and ASCII
+            // folding here is exactly the legacy `lower()` form of the node
+            // field. Group identity uses the same dotted spelling, so a
+            // demoted single member still classifies as its own media type.
+            suffix: format!(
+                ".{}",
+                String::from_utf8(ascii_lowercase(extension.as_bytes()))
+                    .expect("ASCII case folding preserves UTF-8")
+            ),
             frame: frame as i64,
             padding: candidate.digits.len(),
             pattern: candidate.pattern,
@@ -695,4 +763,585 @@ fn underscore_frame_middle(name_part: &str) -> Option<(&str, &str, &str)> {
 /// reachability of `\d{min,max}` followed by the extension dot.
 fn is_digit_run(text: &str, min: usize, max: usize) -> bool {
     text.len() >= min && text.len() <= max && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
+// I5: reviewed proposals and the incoming transfer plan
+// ---------------------------------------------------------------------------
+
+/// Explicit edits for one analyzed item. An empty `folder` keeps the routed
+/// folder and an empty `filename` keeps the source basename, so an untouched
+/// edit changes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemEdit {
+    pub tags: TagEdits,
+    /// Destination-relative folder, either separator accepted.
+    pub folder: String,
+    /// Replacement basename for a single file.
+    pub filename: String,
+}
+
+impl ItemEdit {
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.folder.trim().is_empty() && self.filename.trim().is_empty()
+    }
+}
+
+/// One reviewed mapping for one analyzed item, `CONTRACTS.md` §5
+/// `MappingProposal`: the exact sources, the tags used, the resolved destination
+/// folder and why it was chosen.
+#[derive(Clone, Debug)]
+pub struct MappingProposal {
+    /// Index into the analyzed item list this proposal describes.
+    pub item: usize,
+    /// Display name: a sequence keeps its `prefix####suffix` convention.
+    pub label: String,
+    /// Every actual file, in analysis order (frames ascending for a sequence).
+    pub sources: Vec<FileEntry>,
+    /// Tags the patterns produced for this item.
+    pub extracted: TagSet,
+    /// Tags after the item's edits.
+    pub tags: TagSet,
+    /// Destination-relative folder segments, already validated.
+    pub folder: Vec<String>,
+    /// Replacement basename, single files only.
+    pub rename: Option<String>,
+    pub state: MappingState,
+    pub alternatives: Vec<String>,
+    pub reason: String,
+    pub used_footage_fallback: bool,
+}
+
+impl MappingProposal {
+    /// Actual file count, which is the frame count for a sequence.
+    pub fn frames(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Sum of the scanned sizes of the exact members.
+    pub fn bytes(&self) -> u64 {
+        self.sources.iter().map(|entry| entry.stamp.size).sum()
+    }
+
+    pub fn folder_display(&self) -> String {
+        self.folder.join("/")
+    }
+
+    /// Only a resolved destination may be planned.
+    pub fn is_executable(&self) -> bool {
+        self.state.is_executable() && !self.folder.is_empty()
+    }
+
+    /// Every `(source, destination-relative)` pair this proposal plans. The
+    /// relative path is the folder plus each member's own basename, so a
+    /// sequence is expanded into its exact files and never into a range.
+    pub fn destinations(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut folder = PathBuf::new();
+        for segment in &self.folder {
+            folder.push(segment);
+        }
+        self.sources
+            .iter()
+            .filter_map(|entry| {
+                let name = match (&self.rename, entry.path.file_name()) {
+                    (Some(rename), _) => PathBuf::from(rename),
+                    (None, Some(name)) => PathBuf::from(name),
+                    (None, None) => return None,
+                };
+                Some((entry.path.clone(), folder.join(name)))
+            })
+            .collect()
+    }
+}
+
+/// Builds one proposal per analyzed item. Deterministic and pure: no
+/// filesystem, no catalog, and the only input beyond the items is the compiled
+/// pattern set, the profile and the user's edits.
+///
+/// `progress` is called once per item so the worker can report the real number
+/// matched instead of an invented percentage.
+pub fn propose_incoming(
+    items: &[IncomingItem],
+    compiled: &CompiledPatterns,
+    profile: &IncomingProfile,
+    edits: &[ItemEdit],
+    mut progress: impl FnMut(usize),
+) -> Vec<MappingProposal> {
+    let mut proposals = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let edit = edits.get(index).cloned().unwrap_or_default();
+        // A sequence is matched from its base name once, exactly like
+        // `create_sequence_mapping`; a single file from its own name.
+        let (label, match_name, sources) = match item {
+            IncomingItem::Single(single) => {
+                let name = single
+                    .file
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string);
+                (
+                    name.clone().unwrap_or_default(),
+                    name,
+                    vec![single.file.clone()],
+                )
+            }
+            IncomingItem::Sequence(sequence) => (
+                sequence.display_name(),
+                Some(sequence.prefix.clone()),
+                sequence.members.iter().map(|m| m.file.clone()).collect(),
+            ),
+        };
+        let extracted = match match_name.as_deref() {
+            Some(name) => compiled.extract(name),
+            None => TagSet::default(),
+        };
+        let tags = edit.tags.apply(&extracted);
+        let route = patterns::route(profile, &tags);
+        let mut state = route.state;
+        let mut reason = route.reason;
+        let mut alternatives = route.alternatives;
+        let mut folder = route.segments;
+        let mut used_footage_fallback = route.used_footage_fallback;
+
+        if match_name.is_none() {
+            state = MappingState::Invalid;
+            alternatives.clear();
+            folder.clear();
+            reason =
+                "the filename is not valid UTF-8, so no pattern could be applied to it".to_string();
+        }
+
+        let override_folder = edit.folder.trim();
+        if !override_folder.is_empty() {
+            match patterns::split_relative(override_folder) {
+                Ok(segments) => {
+                    folder = segments;
+                    state = MappingState::Matched;
+                    alternatives.clear();
+                    used_footage_fallback = false;
+                    reason = "the destination folder was set by hand".to_string();
+                }
+                Err(message) => {
+                    state = MappingState::Invalid;
+                    folder.clear();
+                    alternatives.clear();
+                    reason = message;
+                }
+            }
+        }
+
+        let override_name = edit.filename.trim();
+        let mut rename = None;
+        if !override_name.is_empty() {
+            match (item, basename_is_usable(override_name)) {
+                (IncomingItem::Sequence(_), _) => {
+                    state = MappingState::Invalid;
+                    folder.clear();
+                    reason = "a sequence keeps each member's own filename; edit the destination folder instead"
+                        .to_string();
+                }
+                (_, false) => {
+                    state = MappingState::Invalid;
+                    folder.clear();
+                    reason = format!("the filename \"{override_name}\" is not one plain file name");
+                }
+                (_, true) => rename = Some(override_name.to_string()),
+            }
+        }
+        if state.is_executable() && folder.is_empty() {
+            state = MappingState::Invalid;
+            reason = "no destination folder could be resolved for this item".to_string();
+        }
+
+        progress(index + 1);
+        proposals.push(MappingProposal {
+            item: index,
+            label,
+            sources,
+            extracted,
+            tags,
+            folder,
+            rename,
+            state,
+            alternatives,
+            reason,
+            used_footage_fallback,
+        });
+    }
+    proposals
+}
+
+/// True when `name` is usable as one destination basename.
+fn basename_is_usable(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':'])
+        && !name.contains('\0')
+}
+
+/// The explicit, reviewed inputs of one incoming plan.
+pub struct IncomingPlanRequest<'a> {
+    pub id: &'a str,
+    pub revision: u64,
+    pub snapshot: &'a ScanSnapshot,
+    pub destination_root: &'a Path,
+    pub policy: ConflictPolicy,
+    pub file_action: FileAction,
+    /// The selected, executable proposals. A non-executable one is refused
+    /// rather than skipped, so a reviewed plan can never quietly drop an item.
+    pub proposals: &'a [MappingProposal],
+}
+
+/// Plans the reviewed incoming transfer.
+///
+/// The plan keeps the exact source root and its evidence, one `CreateDirectory`
+/// per new parent (deduplicated, parents before their children), and one `File`
+/// action per actual member of every selected item. Copy and Move differ only in
+/// the action carried into the same validated plan.
+pub fn plan_incoming(request: IncomingPlanRequest<'_>) -> Result<OperationPlan, TransferError> {
+    let snapshot = request.snapshot;
+    if snapshot.purpose != ScanPurpose::Incoming {
+        return Err(TransferError::new(
+            TransferCategory::InvalidInput,
+            Some(&snapshot.root),
+            "only an Incoming scan can produce an incoming plan",
+        ));
+    }
+    if !snapshot.root.is_absolute() || !request.destination_root.is_absolute() {
+        return Err(TransferError::new(
+            TransferCategory::InvalidInput,
+            Some(request.destination_root),
+            "source and destination roots must be absolute",
+        ));
+    }
+    match snapshot.coverage {
+        Coverage::Complete => {}
+        Coverage::Partial => {
+            return Err(TransferError::new(
+                TransferCategory::StaleEvidence,
+                Some(&snapshot.root),
+                format!(
+                    "the scan is partial: {} path issue(s) left part of the source unread; rescan before organizing",
+                    snapshot.errors.len()
+                ),
+            ));
+        }
+        Coverage::Cancelled => {
+            return Err(TransferError::new(
+                TransferCategory::StaleEvidence,
+                Some(&snapshot.root),
+                "the scan was cancelled before enumeration finished; rescan before organizing",
+            ));
+        }
+        Coverage::RootUnavailable => {
+            return Err(TransferError::new(
+                TransferCategory::Unavailable,
+                Some(&snapshot.root),
+                "the source root was unavailable during the scan",
+            ));
+        }
+    }
+    if request.proposals.is_empty() {
+        return Err(TransferError::new(
+            TransferCategory::InvalidInput,
+            None,
+            "no item is selected, so there is nothing to plan",
+        ));
+    }
+    for proposal in request.proposals {
+        if !proposal.is_executable() {
+            return Err(TransferError::new(
+                TransferCategory::Refused,
+                None,
+                format!(
+                    "the item '{}' has no executable destination ({})",
+                    proposal.label, proposal.reason
+                ),
+            ));
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if snapshot.continuity == RootContinuity::Uncertain {
+        warnings.push(
+            "mount continuity could not be proven; the explicit reviewed file list may be organized, but catalog pruning stays suppressed"
+                .to_string(),
+        );
+    }
+
+    paths::inspect_root(request.destination_root)?;
+    let source_key = paths::path_key(&snapshot.root, &snapshot.root)?;
+    let destination_key = paths::path_key(request.destination_root, request.destination_root)?;
+    match paths::relation(&source_key, &destination_key) {
+        PathRelation::Disjoint => {}
+        PathRelation::Same => {
+            return Err(TransferError::new(
+                TransferCategory::Refused,
+                Some(request.destination_root),
+                "the source and destination folders are the same directory",
+            ));
+        }
+        _ => {
+            return Err(TransferError::new(
+                TransferCategory::Refused,
+                Some(request.destination_root),
+                "the source and destination folders are nested; organizing would chase its own output",
+            ));
+        }
+    }
+    if paths::evidence_same_file(&snapshot.root, request.destination_root) == Some(true) {
+        return Err(TransferError::new(
+            TransferCategory::Refused,
+            Some(request.destination_root),
+            "the source and destination resolve to the same directory through a link or mount alias",
+        ));
+    }
+    if let Err(reason) = refuse_resolved_root_overlap(&snapshot.root, request.destination_root) {
+        return Err(TransferError::new(
+            TransferCategory::Refused,
+            Some(request.destination_root),
+            reason,
+        ));
+    }
+
+    let scanned_identity = paths::inspect_root(&snapshot.root)?;
+    match snapshot.root_identity {
+        Some(recorded) => match recorded.compare_identity(&scanned_identity) {
+            Some(false) => {
+                return Err(TransferError::new(
+                    TransferCategory::StaleEvidence,
+                    Some(&snapshot.root),
+                    "the source root identity changed after the scan; the entry list is no longer trusted",
+                ));
+            }
+            Some(true) => {}
+            None => warnings.push(
+                "the scan and the current root share no comparable identity evidence; continuity stays unproven"
+                    .to_string(),
+            ),
+        },
+        None => warnings.push(
+            "the scan recorded no root identity evidence; continuity stays unproven".to_string(),
+        ),
+    }
+
+    let root_metadata = fs::metadata(&snapshot.root).map_err(|error| {
+        TransferError::new(
+            TransferCategory::Unavailable,
+            Some(&snapshot.root),
+            format!("source root metadata could not be read: {error}"),
+        )
+    })?;
+    let root_modified_ns = match root_metadata.modified() {
+        Ok(modified) => match nanos_from_time(modified) {
+            Ok(nanos) => Some(nanos),
+            Err(message) => {
+                warnings.push(format!("source root {message}"));
+                None
+            }
+        },
+        Err(error) => {
+            warnings.push(format!(
+                "source root modification time is unavailable ({error}); continuity stays unproven"
+            ));
+            None
+        }
+    };
+
+    // The reviewed entry list is the authority for stamps: a plan never
+    // re-stats a source and then pretends it reviewed the scanned bytes.
+    let mut stamps: HashMap<PathBuf, FileStamp> = HashMap::with_capacity(snapshot.entries.len());
+    for entry in &snapshot.entries {
+        stamps.insert(entry.path.clone(), entry.stamp.clone());
+    }
+
+    let normalized_root = paths::normalize_lexical(&snapshot.root, &snapshot.root)?;
+    let mut seen: HashSet<paths::PathKey> = HashSet::new();
+    let mut directories: HashSet<paths::PathKey> = HashSet::new();
+    let mut actions: Vec<PlannedAction> = Vec::new();
+    let mut missing_mtime = 0usize;
+    let mut planned_files = 0usize;
+
+    for proposal in request.proposals {
+        for (source, relative) in proposal.destinations() {
+            let source_relative = source.strip_prefix(&normalized_root).map_err(|_| {
+                TransferError::new(
+                    TransferCategory::InvalidInput,
+                    Some(&source),
+                    "a selected file is outside the scanned source root",
+                )
+            })?;
+            if source_relative.as_os_str().is_empty()
+                || source_relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(TransferError::new(
+                    TransferCategory::InvalidInput,
+                    Some(&source),
+                    "a selected file does not have a plain spelling inside the source root",
+                ));
+            }
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(TransferError::new(
+                    TransferCategory::InvalidInput,
+                    Some(&relative),
+                    "a planned destination is not a plain relative path",
+                ));
+            }
+            let key = paths::path_key(&source, &snapshot.root)?;
+            if !seen.insert(key) {
+                continue;
+            }
+            let stamp = stamps.get(&source).ok_or_else(|| {
+                TransferError::new(
+                    TransferCategory::StaleEvidence,
+                    Some(&source),
+                    "a selected file is not in the reviewed scan",
+                )
+            })?;
+            let expected = expected_stamp(&source, stamp)?;
+            if expected.modified_ns.is_none() {
+                missing_mtime += 1;
+            }
+            let mut parents = relative.ancestors().skip(1).collect::<Vec<_>>();
+            parents.reverse();
+            for parent in parents {
+                if parent.as_os_str().is_empty() {
+                    continue;
+                }
+                let destination = request.destination_root.join(parent);
+                if directories.insert(paths::path_key(&destination, request.destination_root)?) {
+                    actions.push(PlannedAction::CreateDirectory {
+                        relative: StoredPath::from_native(parent, request.destination_root)?,
+                    });
+                }
+            }
+            actions.push(PlannedAction::File {
+                source: StoredPath::from_native(&source, &snapshot.root)?,
+                relative: StoredPath::from_native(&relative, request.destination_root)?,
+                action: request.file_action,
+                expected: Some(expected),
+            });
+            planned_files += 1;
+        }
+    }
+    if planned_files == 0 {
+        return Err(TransferError::new(
+            TransferCategory::InvalidInput,
+            None,
+            "the selection contains no file to organize",
+        ));
+    }
+    if missing_mtime > 0 {
+        warnings.push(format!(
+            "{missing_mtime} scanned file(s) carried no modification time; validation re-stats them and refuses any it cannot record"
+        ));
+    }
+
+    let evidence = SourceEvidence {
+        observed_at: utc_timestamp_now(),
+        coverage: match snapshot.coverage {
+            Coverage::Complete => EvidenceCoverage::Complete,
+            Coverage::Partial => EvidenceCoverage::Partial,
+            Coverage::Cancelled => EvidenceCoverage::Cancelled,
+            Coverage::RootUnavailable => EvidenceCoverage::RootUnavailable,
+        },
+        continuity: match snapshot.continuity {
+            RootContinuity::Proven => EvidenceContinuity::Proven,
+            RootContinuity::Uncertain => EvidenceContinuity::Uncertain,
+        },
+        // The stat just taken for the root, through the same platform rules the
+        // extension-copy plan uses: execution re-proves this identity before the
+        // first item runs.
+        root_identity: root_identity(&root_metadata),
+        root_modified_ns,
+        issues: snapshot.errors.iter().map(issue_summary).collect(),
+    };
+
+    Ok(OperationPlan {
+        id: request.id.to_string(),
+        revision: request.revision,
+        origin: PlanOrigin::Incoming,
+        destination_root: StoredPath::from_native(
+            request.destination_root,
+            request.destination_root,
+        )?,
+        add_to_existing: true,
+        policy: request.policy,
+        source_root: Some(StoredPath::from_native(&snapshot.root, &snapshot.root)?),
+        source_evidence: Some(evidence),
+        warnings,
+        actions,
+    })
+}
+
+/// Observable identity of one stat snapshot, through the transfer module's
+/// platform rules.
+fn root_identity(metadata: &fs::Metadata) -> Option<NativeIdentity> {
+    paths::FileIdentity::from_metadata(metadata).map(transfers::native_identity_of)
+}
+
+fn expected_stamp(path: &Path, stamp: &FileStamp) -> Result<SourceStamp, TransferError> {
+    let modified_ns = match stamp.modified {
+        Some(modified) => Some(nanos_from_time(modified).map_err(|message| {
+            TransferError::new(
+                TransferCategory::Unsupported,
+                Some(path),
+                format!("scan stamp {message}"),
+            )
+        })?),
+        None => None,
+    };
+    Ok(SourceStamp {
+        size: stamp.size,
+        modified_ns,
+        identity: stamp.identity.map(transfers::native_identity_of),
+    })
+}
+
+fn issue_summary(issue: &PathIssue) -> IssueSummary {
+    IssueSummary {
+        path: StoredPath::from_native(&issue.path, &issue.path).ok(),
+        path_display: issue.path.display().to_string(),
+        category: issue.category.label().to_string(),
+        message: issue.message.clone(),
+    }
+}
+
+fn nanos_from_time(time: SystemTime) -> Result<u64, String> {
+    let elapsed = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "modification time is before the UNIX epoch".to_string())?;
+    u64::try_from(elapsed.as_nanos())
+        .map_err(|_| "modification time is too far in the future".to_string())
+}
+
+fn refuse_resolved_root_overlap(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_key = resolved_key(source, "source root")?;
+    let destination_key = resolved_key(destination, "destination root")?;
+    match paths::relation(&source_key, &destination_key) {
+        PathRelation::Disjoint => Ok(()),
+        PathRelation::Same => Err(
+            "the source and destination folders resolve to the same directory through a link or mount alias"
+                .to_string(),
+        ),
+        _ => Err(
+            "the source and destination folders resolve to nested directories through a link or mount alias"
+                .to_string(),
+        ),
+    }
+}
+
+fn resolved_key(path: &Path, what: &str) -> Result<paths::PathKey, String> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|error| format!("the {what} cannot be resolved through links: {error}"))?;
+    paths::path_key(&resolved, &resolved)
+        .map_err(|error| format!("the resolved {what} is unusable: {error}"))
 }

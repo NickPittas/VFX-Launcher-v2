@@ -856,6 +856,16 @@ fn native_identity(identity: paths::FileIdentity) -> NativeIdentity {
     NativeIdentity { unix, windows }
 }
 
+/// The same conversion, exposed for plans this module does not build.
+///
+/// Incoming assembles its own plan (its actions depend on routing, not on an
+/// extension-copy scan) and still has to record the source evidence execution
+/// re-proves. The platform identity rules stay here; a caller never re-derives
+/// them, and a caller never gets to invent an identity either.
+pub fn native_identity_of(identity: paths::FileIdentity) -> NativeIdentity {
+    native_identity(identity)
+}
+
 fn issue_summary(issue: &PathIssue) -> IssueSummary {
     IssueSummary {
         path: StoredPath::from_native(&issue.path, &issue.path).ok(),
