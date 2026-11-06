@@ -394,7 +394,11 @@ impl VfxLauncherApp {
                 if self.view == View::CopyByFileType {
                     self.copy_by_type.validate_control(ui, &mut self.jobs);
                 }
-                if closing && self.copy_by_type.picker_pending() {
+                if closing
+                    && (self.copy_by_type.picker_pending()
+                        || self.workspace.registration_picker_pending()
+                        || self.workspace.settings_browse_pending())
+                {
                     ui.label("Close the folder chooser to finish quitting.");
                 } else {
                     ui.label(

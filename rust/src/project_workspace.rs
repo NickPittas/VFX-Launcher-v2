@@ -26,6 +26,7 @@
 //! they produce, and only then consumes the catalog: no queued write is lost and
 //! no frame waits on a thread.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -366,6 +367,8 @@ struct Scan {
     step: Option<ScanStep>,
     lines: Vec<String>,
     running: bool,
+    only_projects: Option<HashSet<ProjectId>>,
+    followup: HashSet<ProjectId>,
 }
 
 /// One launch, reveal or registration result shown in the Projects pane.
@@ -451,6 +454,8 @@ pub struct ProjectWorkspace {
     files_error: Option<String>,
     recent: Option<Pending<String>>,
     registration: Registration,
+    registration_workers: Vec<JoinHandle<()>>,
+    registration_user: Option<UserId>,
     scan: Scan,
     launches: Vec<LaunchRequest>,
     reveals: Vec<RevealRequest>,
@@ -506,6 +511,8 @@ impl ProjectWorkspace {
             files_error: None,
             recent: None,
             registration: Registration::Idle,
+            registration_workers: Vec::new(),
+            registration_user: None,
             scan: Scan::default(),
             launches: Vec::new(),
             reveals: Vec::new(),
@@ -1422,7 +1429,8 @@ impl ProjectWorkspace {
         let start = self
             .selected_project()
             .and_then(|project| project.root.clone());
-        let _ = std::thread::Builder::new()
+        self.registration_user = self.user.as_ref().map(|user| user.id);
+        match std::thread::Builder::new()
             .name("vfx-folder-dialog".to_string())
             .spawn(move || {
                 let mut dialog = rfd::FileDialog::new().set_title("Add existing project folders");
@@ -1432,29 +1440,55 @@ impl ProjectWorkspace {
                 let picked = dialog.pick_folders();
                 let _ = tx.send(picked);
                 ctx.request_repaint();
-            });
-        self.registration = Registration::Choosing(rx);
+            }) {
+            Ok(worker) => {
+                self.registration_workers.push(worker);
+                self.registration = Registration::Choosing(rx);
+            }
+            Err(error) => {
+                self.registration = Registration::Failed(format!(
+                    "The folder chooser could not be started: {error}"
+                ))
+            }
+        }
     }
 
     fn poll_registration(&mut self) {
+        let mut worker_index = 0;
+        while worker_index < self.registration_workers.len() {
+            if self.registration_workers[worker_index].is_finished() {
+                let _ = self.registration_workers.remove(worker_index).join();
+            } else {
+                worker_index += 1;
+            }
+        }
         let mut next = None;
         match &mut self.registration {
             Registration::Choosing(rx) => match rx.try_recv() {
-                Ok(Some(roots)) if !roots.is_empty() => {
-                    next = Some(Registration::Planning(start_planning(
-                        roots,
-                        self.ctx.clone(),
-                    )));
+                Ok(Some(roots)) if !roots.is_empty() && !self.closing => {
+                    next = Some(match start_planning(roots, self.ctx.clone()) {
+                        Ok((replies, worker)) => {
+                            self.registration_workers.push(worker);
+                            Registration::Planning(replies)
+                        }
+                        Err(error) => Registration::Failed(format!(
+                            "Checking the folders could not be started: {error}"
+                        )),
+                    });
                 }
                 Ok(_) => next = Some(Registration::Idle),
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => next = Some(Registration::Idle),
             },
             Registration::Planning(rx) => match rx.try_recv() {
-                Ok(plan) => {
-                    next = match (&self.catalog, &self.user) {
+                Ok(plan) if !self.closing => {
+                    next = match (
+                        &self.catalog,
+                        self.registration_user
+                            .or_else(|| self.user.as_ref().map(|user| user.id)),
+                    ) {
                         (Some(catalog), Some(user)) => Some(
-                            match crate::projects::register_projects(catalog, user.id, plan) {
+                            match crate::projects::register_projects(catalog, user, plan) {
                                 Ok(pending) => Registration::Registering(pending),
                                 Err(error) => Registration::Failed(error.message().to_string()),
                             },
@@ -1462,6 +1496,7 @@ impl ProjectWorkspace {
                         _ => Some(Registration::Idle),
                     };
                 }
+                Ok(_) => next = Some(Registration::Idle),
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     next = Some(Registration::Failed(
@@ -1473,6 +1508,15 @@ impl ProjectWorkspace {
                 ReplyState::Waiting => {}
                 ReplyState::Ready(summary) => {
                     self.refresh_projects();
+                    if !self.closing {
+                        let ids: HashSet<_> = summary
+                            .added
+                            .iter()
+                            .map(|project| project.project)
+                            .chain(summary.skipped.iter().filter_map(|project| project.project))
+                            .collect();
+                        self.scan.followup.extend(ids);
+                    }
                     next = Some(Registration::Summary(summary));
                 }
                 ReplyState::Failed(error) => {
@@ -1484,6 +1528,9 @@ impl ProjectWorkspace {
         }
         if let Some(registration) = next {
             self.registration = registration;
+        }
+        if !self.registration_busy() {
+            self.registration_user = None;
         }
     }
 
@@ -1499,6 +1546,10 @@ impl ProjectWorkspace {
         }
     }
 
+    pub fn registration_picker_pending(&self) -> bool {
+        matches!(self.registration, Registration::Choosing(_))
+    }
+
     // -------------------------------------------------------------------- scan
 
     /// Queues every registered scan folder of every project, one scope at a time.
@@ -1512,6 +1563,7 @@ impl ProjectWorkspace {
         match crate::projects::list_projects(catalog, user.id, ProjectList::All, None) {
             Ok(pending) => {
                 self.scan.projects = Some(pending);
+                self.scan.only_projects = None;
                 self.scan.running = true;
                 self.scan.cancelled = false;
                 self.scan.control = None;
@@ -1534,12 +1586,18 @@ impl ProjectWorkspace {
             jobs.cancel(*job);
         }
         self.scan.queue.clear();
+        self.scan.followup.clear();
         if self.scan.step.is_none() {
             self.scan.running = false;
         }
     }
 
     fn poll_scan(&mut self, jobs: &mut Jobs) {
+        if !self.scan.running && !self.scan.followup.is_empty() && !self.closing {
+            let ids = std::mem::take(&mut self.scan.followup);
+            self.begin_scan();
+            self.scan.only_projects = Some(ids);
+        }
         if !self.scan.running {
             return;
         }
@@ -1551,6 +1609,12 @@ impl ProjectWorkspace {
                     self.scan.projects = None;
                     self.scan.queue = projects
                         .into_iter()
+                        .filter(|project| {
+                            self.scan
+                                .only_projects
+                                .as_ref()
+                                .is_none_or(|ids| ids.contains(&project.id))
+                        })
                         .flat_map(|project| {
                             project.scan_folders.into_iter().filter_map(move |folder| {
                                 folder.path.map(|path| (project.id, path))
@@ -1938,6 +2002,7 @@ impl ProjectWorkspace {
         self.closing = true;
         self.scan.cancelled = true;
         self.scan.queue.clear();
+        self.scan.followup.clear();
         self.scan.projects = None;
         if let Some(control) = &self.scan.control {
             control.cancel();
@@ -1991,6 +2056,8 @@ impl ProjectWorkspace {
             || self.settings_browse.is_some()
             || self.users_busy()
             || !self.removals.is_empty()
+            || !self.registration_workers.is_empty()
+            || self.registration_busy()
     }
 
     /// Closes the catalog request queue once the accepted actions drained. Called
@@ -2210,16 +2277,19 @@ fn reap_finished(worker: &mut Option<JoinHandle<()>>) {
     }
 }
 
-fn start_planning(roots: Vec<PathBuf>, ctx: egui::Context) -> Receiver<RegistrationPlan> {
+fn start_planning(
+    roots: Vec<PathBuf>,
+    ctx: egui::Context,
+) -> std::io::Result<(Receiver<RegistrationPlan>, JoinHandle<()>)> {
     let (tx, rx) = channel();
-    let _ = std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("vfx-registration-plan".to_string())
         .spawn(move || {
             let plan = crate::projects::plan_registration(&roots);
             let _ = tx.send(plan);
             ctx.request_repaint();
-        });
-    rx
+        })?;
+    Ok((rx, worker))
 }
 
 fn start_walk(
