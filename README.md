@@ -13,15 +13,27 @@ No Python or Rust installation is needed for these packages. Windows 0.2.0 is al
 
 ## Screenshots
 
-Actual native desktop captures from earlier feature-local verification runs, using disposable data; these are not mockups or evidence of a new 0.3.4 runtime check.
+Screenshots supplied by the user of the native desktop pages.
 
-**Projects on Windows (0.2.0):** browse projects, choose a script version, and launch it.
+### Projects
 
-![Native Windows Projects page with a Nuke script and version selector](docs/images/windows-projects.png)
+![Projects with script version selection](docs/images/projects.png)
 
-**Organize Incoming on Linux (earlier development capture):** grouped sequences, proposed destinations, folder preview, and explicit validation and copy controls.
+### Shots & Sequences
 
-![Native Incoming page showing sequence grouping and destination review](docs/images/incoming.png)
+![Shots and sequences with destination preview](docs/images/shots-sequences.png)
+
+### Organize Incoming
+
+![Incoming media routing and destination preview](docs/images/incoming.png)
+
+### Copy by File Type
+
+![Selected file types and reviewed copy destinations](docs/images/copy.png)
+
+### Back Up Projects
+
+![Backup comparison and selected project files](docs/images/backup.png)
 
 ## Latest updates
 
