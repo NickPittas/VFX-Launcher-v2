@@ -27,11 +27,12 @@ pub struct RunReport {
 }
 
 /// Refuses execution: no platform-safe staging/commit primitives exist here yet.
-pub fn execute(
+pub fn execute_with_workers(
     _catalog: &CatalogClient,
     _validated: ValidatedPlan,
     _control: &JobControl,
     _events: &JobEvents,
+    _workers: usize,
 ) -> Result<RunReport, TransferError> {
     Err(TransferError::new(
         TransferCategory::Unsupported,

@@ -65,6 +65,23 @@ pub fn execute(
     control: &JobControl,
     events: &JobEvents,
 ) -> Result<RunReport, TransferError> {
+    execute_with_workers(catalog, validated, control, events, 1)
+}
+
+pub fn execute_with_workers(
+    catalog: &CatalogClient,
+    validated: ValidatedPlan,
+    control: &JobControl,
+    events: &JobEvents,
+    workers: usize,
+) -> Result<RunReport, TransferError> {
+    if !(1..=16).contains(&workers) {
+        return Err(TransferError::new(
+            TransferCategory::InvalidInput,
+            None,
+            "Choose between 1 and 16 copy workers.",
+        ));
+    }
     let destination = resolved_key(validated.destination_root())?;
     let source = validated
         .plan()
@@ -99,7 +116,7 @@ pub fn execute(
     });
     let admission = Admission(id);
     drop(active);
-    let result = platform::execute(catalog, validated, control, events);
+    let result = platform::execute_with_workers(catalog, validated, control, events, workers);
     drop(admission);
     result
 }

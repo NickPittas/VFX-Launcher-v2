@@ -1109,14 +1109,18 @@ impl CopyByFileTypeState {
             })
             .collect();
         let draft = review.draft.clone();
+        let workers = draft.backup.as_ref().map(|job| job.workers).unwrap_or(1);
         self.review = Some(review);
         let (tx, rx) = channel();
-        let started = jobs.start(&self.ctx, "Copying files", move |context| {
-            let JobContext {
-                control, events, ..
-            } = context;
-            let result =
-                transfers::execute(&catalog, validated, &control, &events).map_err(|error| {
+        let started =
+            jobs.start(&self.ctx, "Copying files", move |context| {
+                let JobContext {
+                    control, events, ..
+                } = context;
+                let result = transfers::execute_with_workers(
+                    &catalog, validated, &control, &events, workers,
+                )
+                .map_err(|error| {
                     let mut message = describe(&error);
                     let inspection = error.run_id().and_then(|run_id| {
                         match transfers::read_run(&catalog, run_id).and_then(|reply| reply.wait()) {
@@ -1135,19 +1139,19 @@ impl CopyByFileTypeState {
                         progress: events.last_progress(),
                     }
                 });
-            let (outcome, progress) = match &result {
-                Ok(report) => {
-                    let progress = report_progress(report);
-                    (job_outcome(report.summary.state), progress)
-                }
-                Err(failure) => {
-                    events.diagnostic(JobPhase::Copying, failure.message.clone());
-                    (JobOutcome::Failed, failure.progress.clone())
-                }
-            };
-            let _ = tx.send(result);
-            events.finish(outcome, progress);
-        });
+                let (outcome, progress) = match &result {
+                    Ok(report) => {
+                        let progress = report_progress(report);
+                        (job_outcome(report.summary.state), progress)
+                    }
+                    Err(failure) => {
+                        events.diagnostic(JobPhase::Copying, failure.message.clone());
+                        (JobOutcome::Failed, failure.progress.clone())
+                    }
+                };
+                let _ = tx.send(result);
+                events.finish(outcome, progress);
+            });
         match started {
             Ok(job) => {
                 self.copy_run = Some(CopyRun {
@@ -1358,7 +1362,7 @@ impl CopyByFileTypeState {
                         .desired_width(540.0)
                         .hint_text("Comma-separated names or patterns, e.g. #Backup, *.tmp"),
                 );
-                ui.label("Comparison workers");
+                ui.label("Copy workers");
                 ui.add(egui::DragValue::new(&mut job.workers).range(1..=16));
             });
             ui.label(egui::RichText::new(".nk and .aep · only missing or newer files · older destinations are kept under numbered names").small().weak());

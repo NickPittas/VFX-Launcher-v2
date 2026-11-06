@@ -15,8 +15,13 @@ source-review findings are corrected: automatic execution binds the saved job an
 waits for dirty settings, pending schedules survive ordinary edits/manual work,
 path spellings stay consistent, last-browsed paths persist, Retry can re-arm, and
 quitting admits the latest valid settings save before job shutdown. Scheduling,
-dialogs and failure cases still need localized live verification. Copy execution
-remains sequential; the worker value currently controls comparison concurrency.
+dialogs and failure cases still need localized live verification. The worker value
+now controls real bounded file-copy concurrency as well as comparison. A four-worker
+disposable CLI run copied 18 files with nine preserved originals and matching hashes;
+the native one-minute interval triggered and completed a fresh backup automatically.
+Fresh source review confirmed the parallel coordination and prior scheduling fixes;
+its late-cancellation finalization finding is corrected. See the evidence document
+for exact limits; cancellation timing/DST/failure branches remain unverified.
 
 File-operation admission now refuses intersecting destination scopes and writes
 into another active run's source inside this process, while allowing shared

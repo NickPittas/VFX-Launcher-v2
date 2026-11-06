@@ -65,6 +65,11 @@ impl Root {
     }
     /// Second handle on the selected root, for callers that need "the root as a
     /// directory" without resolving an empty relative path.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            fd: self.duplicate()?,
+        })
+    }
     pub(crate) fn duplicate(&self) -> io::Result<OwnedFd> {
         rustix::io::dup(&self.fd).map_err(Into::into)
     }

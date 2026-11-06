@@ -30,7 +30,9 @@ historical packet reports and their superseding corrections.
    succeeded; see NATIVE-BACKUP-EVIDENCE.md. Job import/export, atomic persistence
    and interval/daily GUI scheduling compile. Kimi's initial six scheduling/path/
    browse findings are corrected; scheduled runtime cases remain unverified.
-   Execution is still sequential, so copy-worker parity is unfinished.
+   Real 1–16-worker execution is now wired, source-reviewed, and manually exercised
+   with 18 files/four workers. One native interval trigger also passed; daily/DST,
+   busy/cancel/error and import/export cases remain to verify.
 5. **Finish remaining ports.** Legacy import/adoption, template persistence/editing,
    incoming tags/routing and Pi proposal UI, then packaging/platform integration.
    The bounded proposal-only Pi adapter exists but is not wired or model-verified.
@@ -48,8 +50,8 @@ remain unverified. Settings source-review findings have implementation fixes.
 
 The Linux executor's fresh review found no remaining original cooperative-writer
 data-safety blocker; reporting corrections are integrated. The first Skip copy
-operation is runtime evidence for that path only. Execution is sequential and
-Linux-only. Hostile namespace races remain outside its stated model.
+operation is runtime evidence for that path only. Bounded parallel execution is
+now implemented and Linux-only. Hostile namespace races remain outside its stated model.
 
 No test suites until all features are implemented. No global tests before the
 app is functional and verified. Use bounded feature-local checks and disposable

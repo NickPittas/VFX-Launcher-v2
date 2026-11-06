@@ -21,9 +21,9 @@
 //!
 //! Deliberate limits of this packet:
 //! - Linux only; other platforms keep the unsupported-operation boundary.
-//! - Items run one at a time, in reviewed order. The contract's transfer
-//!   concurrency setting is not implemented here, so there is no per-run worker
-//!   pool and no shared mutable executor state.
+//! - Directory prerequisites run in order, then up to 16 scoped file workers
+//!   share the one catalog queue and aggregate progress. Every worker is joined
+//!   before finalization or failure returns; reports retain reviewed ordinals.
 //! - Pause/cancel is cooperative between items and copy chunks. A blocked OS
 //!   read/write is not interrupted.
 //! - Identity comparison around a name-based rename or unlink is a fresh check,
@@ -59,6 +59,10 @@ use std::{
     fs::{self, File},
     io::{self, ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 /// Chunk size for staged copies. Cancellation and progress are checked between
@@ -92,11 +96,12 @@ pub struct RunReport {
 /// The catalog is reached only through its request-only client, and every reply
 /// is awaited on this worker thread before the next filesystem step, so the run
 /// is never executed against evidence the journal has not recorded yet.
-pub fn execute(
+pub fn execute_with_workers(
     catalog: &CatalogClient,
     validated: ValidatedPlan,
     control: &JobControl,
     events: &JobEvents,
+    workers: usize,
 ) -> Result<RunReport, TransferError> {
     let total_items = validated.items().len() as u64;
     let total_bytes = plan_bytes(validated.items());
@@ -147,13 +152,22 @@ pub fn execute(
             source_root,
             source_root_path,
             destination_root,
-            blocked_directories: HashSet::new(),
-            verified_folders: HashMap::new(),
+            blocked_directories: Arc::new(HashSet::new()),
+            verified_folders: Arc::new(HashMap::new()),
             staging_counter: 0,
+            protected_names: Arc::new(
+                journal
+                    .validated()
+                    .items()
+                    .iter()
+                    .flat_map(|item| [item.destination.as_ref(), item.displaced.as_ref()])
+                    .flatten()
+                    .map(|path| path.path().to_path_buf())
+                    .collect(),
+            ),
             total_items,
             total_bytes,
-            completed: 0,
-            bytes_done: 0,
+            progress: Arc::new(Mutex::new(RunProgress::default())),
             outcomes: Vec::with_capacity(journal.validated().items().len()),
         };
 
@@ -164,72 +178,41 @@ pub fn execute(
 
         let items = journal.validated().items().to_vec();
         let mut cancelled = false;
-        for item in &items {
-            if control.checkpoint() == Checkpoint::Cancelled {
-                cancelled = true;
-                break;
-            }
-            match executor.run(item) {
-                Ok(Done::Succeeded { note, recovery }) => {
-                    let state = success_state(item.effect);
-                    let bytes = item.bytes.unwrap_or(0);
-                    executor.record(item, state, bytes, note, recovery)?;
-                }
-                Ok(Done::SourceRetained { message, recovery }) => {
-                    executor.record(
-                        item,
-                        ItemState::CopiedSourceRetained,
-                        item.bytes.unwrap_or(0),
-                        Some(message),
-                        recovery,
-                    )?;
-                }
-                Err(Flow::Problem(message, recovery)) => {
-                    executor.note_failure(item);
-                    events.diagnostic(
-                        JobPhase::Copying,
-                        format!("item {} failed: {message}", item.index + 1),
-                    );
-                    executor.record(item, ItemState::Failed, 0, Some(message), recovery)?;
-                }
-                Err(Flow::PostInstall { message, recovery }) => {
-                    executor.note_failure(item);
-                    events.diagnostic(
-                        JobPhase::Copying,
-                        format!(
-                            "item {} installed but was not verified: {message}",
-                            item.index + 1
-                        ),
-                    );
-                    // The reviewed bytes are already committed to the destination;
-                    // the journal accepts them only after an install checkpoint.
-                    executor.record(
-                        item,
-                        ItemState::Failed,
-                        item.bytes.unwrap_or(0),
-                        Some(message),
-                        recovery,
-                    )?;
-                }
-                Err(Flow::Cancelled(recovery)) => {
-                    executor.record(
-                        item,
-                        ItemState::Cancelled,
-                        0,
-                        Some("cancelled before the destination was installed".to_string()),
-                        recovery,
-                    )?;
+        if workers == 1 {
+            for item in &items {
+                if control.checkpoint() == Checkpoint::Cancelled || executor.process_one(item)? {
                     cancelled = true;
                     break;
                 }
-                Err(Flow::Abort(error)) => return Err(error),
+            }
+        } else {
+            // Directory dependencies finish before independent file actions enter the pool.
+            for item in items
+                .iter()
+                .filter(|item| item.effect == ItemEffect::CreateDirectory)
+            {
+                if control.checkpoint() == Checkpoint::Cancelled || executor.process_one(item)? {
+                    cancelled = true;
+                    break;
+                }
+            }
+            if !cancelled {
+                cancelled = executor.parallel_files(&items, workers)?;
             }
         }
 
         let terminal = if cancelled {
             // Every remaining reviewed item gets its own terminal outcome, so the
             // returned report and the persisted run name the same items.
-            for item in items.iter().skip(executor.outcomes.len()) {
+            let finished = executor
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.ordinal)
+                .collect::<HashSet<_>>();
+            for item in items
+                .iter()
+                .filter(|item| !finished.contains(&(item.index as i64)))
+            {
                 executor.record(
                     item,
                     ItemState::Cancelled,
@@ -238,10 +221,19 @@ pub fn execute(
                     Vec::new(),
                 )?;
             }
-            RunTerminal::Cancelled
+            if executor
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.state == ItemState::Cancelled)
+            {
+                RunTerminal::Cancelled
+            } else {
+                terminal_for(&executor.outcomes)
+            }
         } else {
             terminal_for(&executor.outcomes)
         };
+        executor.outcomes.sort_by_key(|outcome| outcome.ordinal);
         let summary = awaited(finalize_run(catalog, run_id, terminal))?;
         Ok(RunReport {
             run_id,
@@ -427,6 +419,13 @@ fn same_entry(left: EntryIdentity, right: EntryIdentity) -> bool {
     left.device == right.device && left.inode == right.inode
 }
 
+#[derive(Default)]
+struct RunProgress {
+    completed: u64,
+    committed: u64,
+    staging: HashMap<PathBuf, u64>,
+}
+
 struct Executor<'a> {
     catalog: &'a CatalogClient,
     journal: &'a JournaledPlan,
@@ -440,21 +439,213 @@ struct Executor<'a> {
     destination_root: PathBuf,
     /// Destination-relative folders whose creation failed; children of these are
     /// failed without being attempted, so a blocked prerequisite stays visible.
-    blocked_directories: HashSet<PathBuf>,
+    blocked_directories: Arc<HashSet<PathBuf>>,
     /// Folders this run has proven unchanged: the reviewed ancestors captured
     /// while validating, plus the folders it creates. Every parent is compared
     /// with this evidence immediately before an item mutates it, so a folder
     /// swapped after the run-level check is never written into.
-    verified_folders: HashMap<PathBuf, NativeIdentity>,
+    verified_folders: Arc<HashMap<PathBuf, NativeIdentity>>,
     staging_counter: u64,
+    protected_names: Arc<HashSet<PathBuf>>,
     total_items: u64,
     total_bytes: Option<u64>,
-    completed: u64,
-    bytes_done: u64,
+    progress: Arc<Mutex<RunProgress>>,
     outcomes: Vec<ItemOutcome>,
 }
 
-impl Executor<'_> {
+struct StopOnPanic<'a>(&'a AtomicBool);
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl<'run> Executor<'run> {
+    fn fork(&self) -> Result<Executor<'run>, TransferError> {
+        Ok(Executor {
+            catalog: self.catalog,
+            journal: self.journal,
+            control: self.control,
+            events: self.events,
+            root: self.root.try_clone().map_err(|error| {
+                refused(&format!(
+                    "The destination handle could not be duplicated: {error}"
+                ))
+            })?,
+            source_root: self
+                .source_root
+                .as_ref()
+                .map(Root::try_clone)
+                .transpose()
+                .map_err(|error| {
+                    refused(&format!(
+                        "The source handle could not be duplicated: {error}"
+                    ))
+                })?,
+            source_root_path: self.source_root_path.clone(),
+            destination_root: self.destination_root.clone(),
+            blocked_directories: self.blocked_directories.clone(),
+            verified_folders: self.verified_folders.clone(),
+            staging_counter: 0,
+            protected_names: Arc::clone(&self.protected_names),
+            total_items: self.total_items,
+            total_bytes: self.total_bytes,
+            progress: Arc::clone(&self.progress),
+            outcomes: Vec::new(),
+        })
+    }
+
+    fn parallel_files(
+        &mut self,
+        items: &[ItemValidation],
+        workers: usize,
+    ) -> Result<bool, TransferError> {
+        let files = items
+            .iter()
+            .filter(|item| item.effect != ItemEffect::CreateDirectory)
+            .collect::<Vec<_>>();
+        let mut forks = Vec::new();
+        for _ in 0..workers.min(files.len()) {
+            forks.push(self.fork()?);
+        }
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let (results, spawn_error) = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut spawn_error = None;
+            for (index, mut executor) in forks.into_iter().enumerate() {
+                let files = &files;
+                let next = &next;
+                let stop = &stop;
+                match std::thread::Builder::new()
+                    .name(format!("vfx-copy-{}-{index}", self.journal.run_id()))
+                    .spawn_scoped(scope, move || {
+                        let _panic_guard = StopOnPanic(stop);
+                        let mut cancelled = false;
+                        loop {
+                            if stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            if executor.control.checkpoint() == Checkpoint::Cancelled {
+                                cancelled = true;
+                                stop.store(true, Ordering::Release);
+                                break;
+                            }
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(item) = files.get(index) else {
+                                break;
+                            };
+                            if stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            match executor.process_one(item) {
+                                Ok(true) => {
+                                    cancelled = true;
+                                    stop.store(true, Ordering::Release);
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    stop.store(true, Ordering::Release);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        Ok((executor.outcomes, cancelled))
+                    }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        stop.store(true, Ordering::Release);
+                        spawn_error =
+                            Some(refused(&format!("A copy worker could not start: {error}")));
+                        break;
+                    }
+                }
+            }
+            let results = handles.into_iter().map(|handle| handle.join().unwrap_or_else(|_| Err(refused("A copy worker stopped unexpectedly; inspect the journal before retrying.")))).collect::<Vec<_>>();
+            (results, spawn_error)
+        });
+        let mut error = spawn_error;
+        let mut cancelled = false;
+        for result in results {
+            match result {
+                Ok((outcomes, was_cancelled)) => {
+                    self.outcomes.extend(outcomes);
+                    cancelled |= was_cancelled;
+                }
+                Err(problem) => {
+                    if error.is_none() {
+                        error = Some(problem);
+                    }
+                }
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(cancelled)
+    }
+
+    fn process_one(&mut self, item: &ItemValidation) -> Result<bool, TransferError> {
+        match self.run(item) {
+            Ok(Done::Succeeded { note, recovery }) => {
+                let state = success_state(item.effect);
+                let bytes = item.bytes.unwrap_or(0);
+                self.record(item, state, bytes, note, recovery)?;
+            }
+            Ok(Done::SourceRetained { message, recovery }) => {
+                self.record(
+                    item,
+                    ItemState::CopiedSourceRetained,
+                    item.bytes.unwrap_or(0),
+                    Some(message),
+                    recovery,
+                )?;
+            }
+            Err(Flow::Problem(message, recovery)) => {
+                self.note_failure(item);
+                self.events.diagnostic(
+                    JobPhase::Copying,
+                    format!("item {} failed: {message}", item.index + 1),
+                );
+                self.record(item, ItemState::Failed, 0, Some(message), recovery)?;
+            }
+            Err(Flow::PostInstall { message, recovery }) => {
+                self.note_failure(item);
+                self.events.diagnostic(
+                    JobPhase::Copying,
+                    format!(
+                        "item {} installed but was not verified: {message}",
+                        item.index + 1
+                    ),
+                );
+                // The reviewed bytes are already committed to the destination;
+                // the journal accepts them only after an install checkpoint.
+                self.record(
+                    item,
+                    ItemState::Failed,
+                    item.bytes.unwrap_or(0),
+                    Some(message),
+                    recovery,
+                )?;
+            }
+            Err(Flow::Cancelled(recovery)) => {
+                self.record(
+                    item,
+                    ItemState::Cancelled,
+                    0,
+                    Some("cancelled before the destination was installed".to_string()),
+                    recovery,
+                )?;
+                return Ok(true);
+            }
+            Err(Flow::Abort(error)) => return Err(error),
+        }
+        Ok(false)
+    }
+
     // -- journal -------------------------------------------------------------
 
     /// Appends one durable terminal outcome. Failures here abort the run and
@@ -484,8 +675,17 @@ impl Executor<'_> {
             message,
             recovery,
         });
-        self.completed += 1;
-        self.bytes_done += committed_bytes;
+        {
+            let mut progress = self
+                .progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            progress.completed += 1;
+            progress.committed = progress.committed.saturating_add(committed_bytes);
+            if let Some(destination) = &item.destination {
+                progress.staging.remove(destination.path());
+            }
+        }
         self.emit_progress(None);
         Ok(())
     }
@@ -508,12 +708,19 @@ impl Executor<'_> {
     }
 
     fn emit_progress(&self, current: Option<PathBuf>) {
+        let progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.events.progress(
             JobPhase::Copying,
             JobProgress {
-                completed: self.completed,
+                completed: progress.completed,
                 total: Some(self.total_items),
-                bytes_done: self.bytes_done,
+                bytes_done: progress
+                    .staging
+                    .values()
+                    .fold(progress.committed, |sum, bytes| sum.saturating_add(*bytes)),
                 bytes_total: self.total_bytes,
                 current,
             },
@@ -526,7 +733,7 @@ impl Executor<'_> {
         }
         if let Some(destination) = item.destination.as_ref().map(StoredPath::path) {
             if let Ok(relative) = destination.strip_prefix(&self.destination_root) {
-                self.blocked_directories.insert(relative.to_path_buf());
+                Arc::make_mut(&mut self.blocked_directories).insert(relative.to_path_buf());
             }
         }
     }
@@ -548,7 +755,7 @@ impl Executor<'_> {
             Some(root_identity),
             "the destination root",
         )?;
-        self.verified_folders.insert(PathBuf::new(), root_identity);
+        Arc::make_mut(&mut self.verified_folders).insert(PathBuf::new(), root_identity);
         for ancestor in &evidence.ancestors {
             let path = ancestor.path.path();
             let relative = path.strip_prefix(&self.destination_root).map_err(|_| {
@@ -579,7 +786,7 @@ impl Executor<'_> {
                 Some(fresh),
                 &format!("reviewed destination folder {}", path.display()),
             )?;
-            self.verified_folders.insert(relative.to_path_buf(), fresh);
+            Arc::make_mut(&mut self.verified_folders).insert(relative.to_path_buf(), fresh);
         }
         Ok(())
     }
@@ -752,13 +959,26 @@ impl Executor<'_> {
             file,
             name,
             path,
-            identity,
+            mut identity,
             published,
         } = stage;
-        drop(file);
         if published {
             return None;
         }
+        // Permission preservation changes mode, not ownership. Read mode only
+        // from our still-held creating handle, never from the cleanup pathname.
+        match rustix::fs::fstat(&file) {
+            Ok(stat) if same_entry(EntryIdentity::from(stat), identity) => {
+                identity.mode = stat.st_mode
+            }
+            _ => {
+                return Some(format!(
+                    "The staging file {} was retained because its creating handle could not be verified.",
+                    path.display()
+                ));
+            }
+        }
+        drop(file);
         match self.root.remove_owned(parent, &name, identity) {
             Ok(()) => None,
             Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -844,7 +1064,7 @@ impl Executor<'_> {
                     // synced, so its children cannot outlive it after a crash.
                     self.root.sync_dir(&created).map_err(&created_error)?;
                     self.root.sync_dir(&parent).map_err(created_error)?;
-                    self.verified_folders.insert(relative, identity);
+                    Arc::make_mut(&mut self.verified_folders).insert(relative, identity);
                     Ok(Done::Succeeded {
                         note: None,
                         recovery: Vec::new(),
@@ -871,7 +1091,7 @@ impl Executor<'_> {
                     &format!("folder {}", destination.display()),
                 )
                 .map_err(|message| Flow::Problem(message, Vec::new()))?;
-                self.verified_folders.insert(relative, fresh);
+                Arc::make_mut(&mut self.verified_folders).insert(relative, fresh);
                 Ok(Done::Succeeded {
                     note: None,
                     recovery: Vec::new(),
@@ -1138,16 +1358,12 @@ impl Executor<'_> {
                     source.display()
                 )));
             }
-            self.events.progress(
-                JobPhase::Copying,
-                JobProgress {
-                    completed: self.completed,
-                    total: Some(self.total_items),
-                    bytes_done: self.bytes_done + written,
-                    bytes_total: self.total_bytes,
-                    current: Some(destination.to_path_buf()),
-                },
-            );
+            self.progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .staging
+                .insert(destination.to_path_buf(), written);
+            self.emit_progress(Some(destination.to_path_buf()));
         }
         if written != reviewed.size {
             return Err(problem(format!(
@@ -1288,7 +1504,7 @@ impl Executor<'_> {
                             .to_os_string();
                         (backup, true)
                     }
-                    None => (self.unique_backup_name(parent, name)?, false),
+                    None => (self.unique_backup_name(parent, name, destination)?, false),
                 };
 
                 let backup_path = destination.with_file_name(&backup);
@@ -1515,9 +1731,20 @@ impl Executor<'_> {
     /// Smallest unused `<stem>.vfxlauncher-replace-<n>` beside the destination.
     /// The rename that uses it reserves the name with no-clobber semantics, so a
     /// raced file is never overwritten.
-    fn unique_backup_name(&self, parent: &OwnedFd, name: &OsStr) -> Result<OsString, Flow> {
+    fn unique_backup_name(
+        &self,
+        parent: &OwnedFd,
+        name: &OsStr,
+        destination: &Path,
+    ) -> Result<OsString, Flow> {
         for counter in 1..=u64::from(MAX_BACKUP_ATTEMPTS) {
             let candidate = suffixed_name(name, REPLACE_SUFFIX, counter);
+            if self
+                .protected_names
+                .contains(&destination.with_file_name(&candidate))
+            {
+                continue;
+            }
             match self.root.entry_identity(parent, &candidate) {
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(candidate),
                 Ok(_) => continue,
@@ -1653,6 +1880,12 @@ impl Executor<'_> {
     ) -> Result<OsString, Flow> {
         for _ in 0..MAX_BACKUP_ATTEMPTS {
             let candidate = self.staging_name(name);
+            if self
+                .protected_names
+                .contains(&destination.with_file_name(&candidate))
+            {
+                continue;
+            }
             match self.root.entry_identity(parent, &candidate) {
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(candidate),
                 Ok(_) => continue,

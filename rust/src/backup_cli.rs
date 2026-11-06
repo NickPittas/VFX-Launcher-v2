@@ -158,8 +158,14 @@ pub fn run(arguments: Vec<OsString>, mut data_dir: Option<PathBuf>) -> Result<u8
                 return Ok(0);
             }
             let client = client.ok_or("The backup catalog is unavailable.")?;
-            let report = transfers::execute(&client, validated, &context.control, &context.events)
-                .map_err(|error| error.to_string())?;
+            let report = transfers::execute_with_workers(
+                &client,
+                validated,
+                &context.control,
+                &context.events,
+                job.workers,
+            )
+            .map_err(|error| error.to_string())?;
             let counts = report.summary.counts;
             println!(
                 "Run {}: {} | Copied: {} | Skipped: {} | Failed: {} | Cancelled: {} | Bytes: {}",
