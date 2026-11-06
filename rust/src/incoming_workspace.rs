@@ -60,7 +60,6 @@ const POLICIES: [ConflictPolicy; 4] = [
     ConflictPolicy::KeepBoth,
     ConflictPolicy::PreserveExisting,
 ];
-const ASSISTANT_STATUS: &str = "assistant disconnected";
 /// Destination preview limits: the tree is evidence for the user, not an
 /// inventory, so a huge root cannot stall the page.
 const PREVIEW_MAX_DEPTH: usize = 8;
@@ -325,7 +324,37 @@ enum ListAction {
 
 /// The Organize Incoming workspace: draft inputs, tracked workers and the
 /// review and run evidence the page renders.
+struct AiPrepared {
+    draft: Draft,
+    request: crate::ai::AiRequest,
+    config: crate::ai::HarnessConfig,
+    context: String,
+}
+struct AiRun {
+    job: JobId,
+    draft: Draft,
+    request: crate::ai::AiRequest,
+    replies: Receiver<Result<Vec<crate::ai::AiSuggestion>, String>>,
+}
+struct AiChoice {
+    selected: bool,
+    suggestion: crate::ai::AiSuggestion,
+}
+struct AiResponse {
+    draft: Draft,
+    choices: Vec<AiChoice>,
+}
+
 pub struct OrganizeIncomingState {
+    ai_open: bool,
+    ai_config: crate::ai::HarnessConfig,
+    ai_instruction: String,
+    ai_prepared: Option<AiPrepared>,
+    ai_run: Option<AiRun>,
+    ai_response: Option<AiResponse>,
+    ai_previous: Option<(Draft, Vec<crate::ai::AiSuggestion>)>,
+    ai_error: Option<String>,
+    ai_counter: u64,
     ctx: egui::Context,
     store: PatternStore,
     catalog: Option<CatalogClient>,
@@ -397,6 +426,16 @@ impl OrganizeIncomingState {
             .map(|profile| profile.name.clone())
             .unwrap_or_default();
         Self {
+            ai_open: false,
+            ai_config: Default::default(),
+            ai_instruction: "Suggest folders for these files using the selected folder layout."
+                .into(),
+            ai_prepared: None,
+            ai_run: None,
+            ai_response: None,
+            ai_previous: None,
+            ai_error: None,
+            ai_counter: 0,
             ctx: ctx.clone(),
             store: PatternStore::new(&data_dir),
             catalog: None,
@@ -487,6 +526,7 @@ impl OrganizeIncomingState {
         self.poll_validation();
         self.poll_execute(jobs);
         self.poll_preview();
+        self.poll_ai();
         self.sync_draft();
         self.invalidate_review();
     }
@@ -500,8 +540,13 @@ impl OrganizeIncomingState {
         self.pick.is_some() || self.config_run.is_some()
     }
 
+    pub fn is_ai_job(&self, id: JobId) -> bool {
+        self.ai_run.as_ref().is_some_and(|run| run.job == id)
+    }
+
     fn busy(&self) -> bool {
-        self.pick.is_some()
+        self.ai_run.is_some()
+            || self.pick.is_some()
             || self.config_run.is_some()
             || self.scan_run.is_some()
             || self.validate_run.is_some()
@@ -2027,7 +2072,9 @@ impl OrganizeIncomingState {
                     refresh_preview = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    assistant_control(ui);
+                    if ui.button("Suggest folders…").clicked() {
+                        self.ai_open = true;
+                    }
                     ui.separator();
                     ui.label(egui::RichText::new(self.list_summary()).small().weak());
                 });
@@ -2090,6 +2137,8 @@ impl OrganizeIncomingState {
         }
         self.sync_draft();
         self.invalidate_review();
+        let context = ui.ctx().clone();
+        self.ai_window(&context, jobs);
     }
 
     /// The bottom strip's validation control.
@@ -3629,23 +3678,6 @@ fn profile_combo(ui: &mut egui::Ui, name: &mut String, profiles: Option<&Profile
         });
 }
 
-/// The collapsed assistant control. It states the connection truthfully: no
-/// provider is wired, so it suggests nothing and never pretends to.
-fn assistant_control(ui: &mut egui::Ui) {
-    ui.menu_button("Suggest folders", |ui| {
-        ui.add_enabled(
-            false,
-            egui::TextEdit::singleline(&mut String::new())
-                .hint_text("instruction")
-                .desired_width(240.0),
-        );
-        let _ = ui
-            .add_enabled(false, egui::Button::new("Suggest folders"))
-            .on_hover_text("Routing is manual in this build; nothing is sent anywhere.");
-        ui.label(egui::RichText::new(ASSISTANT_STATUS).small().color(MUTED));
-    });
-}
-
 fn insert_preview(root: &mut PreviewNode, path: &str, is_dir: bool, proposed: bool, exists: bool) {
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     if parts.is_empty() {
@@ -3690,6 +3722,395 @@ fn build_preview(existing: &BTreeMap<String, bool>, proposed: &[String]) -> Prev
     }
     sort_preview(&mut root);
     root
+}
+
+impl OrganizeIncomingState {
+    fn prepare_ai(&mut self) -> Result<(), String> {
+        let scanned = self
+            .scanned
+            .as_ref()
+            .ok_or("Scan the incoming folder first.")?;
+        let mut indices = self.selected.iter().copied().collect::<Vec<_>>();
+        indices.sort_unstable();
+        let mut selected = Vec::new();
+        for index in indices {
+            let item = scanned
+                .analysis
+                .items
+                .get(index)
+                .ok_or("The selected file list changed; scan again.")?;
+            let files = item.files();
+            let filename = files
+                .first()
+                .and_then(|file| file.path.file_name())
+                .and_then(|name| name.to_str())
+                .ok_or("A selected filename cannot be sent as Unicode text.")?
+                .to_owned();
+            selected.push(crate::ai::AiItem {
+                item_id: index as u64,
+                filename,
+                kind: if matches!(item, IncomingItem::Sequence(_)) {
+                    "frame sequence"
+                } else {
+                    "single file"
+                }
+                .into(),
+                actual_frames: if matches!(item, IncomingItem::Sequence(_)) {
+                    files.len()
+                } else {
+                    0
+                },
+                size_bytes: files
+                    .iter()
+                    .try_fold(0u64, |sum, file| sum.checked_add(file.stamp.size)),
+            });
+        }
+        let draft = self.draft();
+        let previous_proposals = self
+            .ai_previous
+            .as_ref()
+            .filter(|(old, _)| {
+                old.source == draft.source
+                    && old.destination == draft.destination
+                    && old.profile == draft.profile
+                    && old.scan_generation == draft.scan_generation
+                    && old.patterns_revision == draft.patterns_revision
+            })
+            .map(|(_, suggestions)| {
+                suggestions
+                    .iter()
+                    .filter(|suggestion| {
+                        selected
+                            .iter()
+                            .any(|item| item.item_id == suggestion.item_id)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let request_id = self
+            .ai_counter
+            .checked_add(1)
+            .ok_or("The assistant request counter is exhausted; restart the app.")?;
+        let request = crate::ai::AiRequest {
+            request_id,
+            selected,
+            structure: self
+                .active_profile()
+                .ok_or("Choose a folder layout first.")?
+                .rules
+                .iter()
+                .map(|rule| rule.path.clone())
+                .collect(),
+            instructions: self.ai_instruction.clone(),
+            previous_proposals,
+        };
+        let context = crate::ai::request_context(&request)?;
+        self.ai_counter = request_id;
+        self.ai_prepared = Some(AiPrepared {
+            draft,
+            request,
+            context,
+            config: self.ai_config.clone(),
+        });
+        self.ai_response = None;
+        self.ai_error = None;
+        Ok(())
+    }
+
+    fn begin_ai(&mut self, jobs: &mut Jobs) {
+        if self.busy() || jobs.is_shutting_down() {
+            return;
+        }
+        let Some(prepared) = &self.ai_prepared else {
+            return;
+        };
+        if prepared.draft != self.draft() {
+            self.ai_error =
+                Some("The file selection or layout changed. Prepare a new request.".into());
+            return;
+        }
+        let request = prepared.request.clone();
+        let config = prepared.config.clone();
+        let draft = prepared.draft.clone();
+        let worker_request = request.clone();
+        let (sender, replies) = channel();
+        match jobs.start(&self.ctx, "Suggesting incoming folders", move |context| {
+            context
+                .events
+                .progress(JobPhase::Suggesting, JobProgress::default());
+            let result = crate::ai::suggest(&config, &worker_request, &context.control);
+            let outcome = if context.control.is_cancelled() {
+                JobOutcome::Cancelled
+            } else if result.is_ok() {
+                JobOutcome::Succeeded
+            } else {
+                JobOutcome::Failed
+            };
+            let count = result.as_ref().map(Vec::len).unwrap_or(0) as u64;
+            let _ = sender.send(result);
+            context.events.finish(
+                outcome,
+                JobProgress {
+                    completed: count,
+                    total: Some(worker_request.selected.len() as u64),
+                    ..Default::default()
+                },
+            );
+        }) {
+            Ok(job) => {
+                self.ai_run = Some(AiRun {
+                    job,
+                    draft,
+                    request,
+                    replies,
+                });
+                self.ai_error = None;
+                self.ai_response = None;
+            }
+            Err(error) => {
+                self.ai_error = Some(format!("The assistant worker could not start: {error}"))
+            }
+        }
+    }
+
+    fn poll_ai(&mut self) {
+        let Some(run) = self.ai_run.take() else {
+            return;
+        };
+        let result = match run.replies.try_recv() {
+            Err(TryRecvError::Empty) => {
+                self.ai_run = Some(run);
+                return;
+            }
+            Err(TryRecvError::Disconnected) => {
+                Err("The assistant stopped without a result. Nothing was applied.".into())
+            }
+            Ok(result) => result,
+        };
+        if run.draft != self.draft() {
+            self.ai_error = Some("The files or layout changed while the assistant was working. Its reply was discarded.".into());
+            return;
+        }
+        match result {
+            Err(error) => self.ai_error = Some(error),
+            Ok(suggestions) => {
+                // Decode again against the captured IDs if the bridge ever changes.
+                let response = serde_json::json!({"suggestions": suggestions});
+                match crate::ai::decode_suggestions(&response.to_string(), &run.request) {
+                    Err(error) => self.ai_error = Some(error),
+                    Ok(suggestions) => {
+                        self.ai_previous = Some((run.draft.clone(), suggestions.clone()));
+                        self.ai_response = Some(AiResponse {
+                            draft: run.draft,
+                            choices: suggestions
+                                .into_iter()
+                                .map(|suggestion| AiChoice {
+                                    selected: true,
+                                    suggestion,
+                                })
+                                .collect(),
+                        });
+                        self.ai_error = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_ai(&mut self) -> Result<(), String> {
+        if self.busy() {
+            return Err("Wait for the current operation to finish.".into());
+        }
+        let response = self
+            .ai_response
+            .as_ref()
+            .ok_or("There are no suggestions to apply.")?;
+        if response.draft != self.draft() {
+            return Err("The selection or layout changed. Request fresh suggestions.".into());
+        }
+        let edits = response
+            .choices
+            .iter()
+            .filter(|choice| choice.selected)
+            .map(|choice| {
+                let folder =
+                    crate::patterns::split_relative(&choice.suggestion.destination_relative)?
+                        .join("/");
+                let index = usize::try_from(choice.suggestion.item_id)
+                    .map_err(|_| "A suggestion has an invalid item ID.")?;
+                if !self.selected.contains(&index) {
+                    return Err("A suggested item is no longer selected.".into());
+                }
+                Ok((index, folder))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if edits.is_empty() {
+            return Err("Select a suggestion to apply.".into());
+        }
+        for (index, folder) in edits {
+            self.edits.entry(index).or_default().folder = folder;
+        }
+        self.edit_generation += 1;
+        self.ai_response = None;
+        self.ai_prepared = None;
+        self.rematch();
+        self.tree = None;
+        self.message = Some("Suggested folders applied to the draft. Review the destinations, then validate the selection.".into());
+        Ok(())
+    }
+
+    fn ai_window(&mut self, ctx: &egui::Context, jobs: &mut Jobs) {
+        if !self.ai_open {
+            return;
+        }
+        let mut open = self.ai_open;
+        let mut prepare = false;
+        let mut send = false;
+        let mut apply = false;
+        egui::Window::new("Suggest folders")
+            .open(&mut open)
+            .default_width(760.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Pi handles sign-in and model setup. Only the reviewed context below is sent.",
+                );
+                let mut changed = ui
+                    .add_enabled(
+                        self.ai_run.is_none(),
+                        egui::TextEdit::multiline(&mut self.ai_instruction)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Describe how these files should be organized"),
+                    )
+                    .changed();
+                ui.collapsing("Pi settings", |ui| {
+                    ui.add_enabled_ui(self.ai_run.is_none(), |ui| {
+                        let mut executable =
+                            self.ai_config.executable.to_string_lossy().into_owned();
+                        ui.horizontal(|ui| {
+                            ui.label("Command");
+                            if ui.text_edit_singleline(&mut executable).changed() {
+                                self.ai_config.executable = executable.clone().into();
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Model");
+                            changed |= ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.ai_config.model)
+                                        .hint_text("Use Pi's selected model"),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Timeout");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.ai_config.timeout_seconds)
+                                        .range(1..=600),
+                                )
+                                .changed();
+                            ui.label("seconds");
+                        });
+                    });
+                });
+                if changed {
+                    self.ai_prepared = None;
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.busy(), egui::Button::new("Prepare request"))
+                        .clicked()
+                    {
+                        prepare = true;
+                    }
+                    let enabled = !self.busy()
+                        && self
+                            .ai_prepared
+                            .as_ref()
+                            .is_some_and(|prepared| prepared.draft == self.draft());
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Send to Pi").fill(ACCENT))
+                        .clicked()
+                    {
+                        send = true;
+                    }
+                    if self.ai_run.is_some() {
+                        ui.label("Waiting for suggestions…");
+                    }
+                });
+                if let Some(error) = &self.ai_error {
+                    ui.colored_label(WARNING, error);
+                }
+                if let Some(prepared) = &mut self.ai_prepared {
+                    ui.collapsing("Context sent to Pi", |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("ai_request_context")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut prepared.context)
+                                        .font(egui::TextStyle::Monospace)
+                                        .interactive(false)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    });
+                }
+                if let Some(response) = &mut self.ai_response {
+                    egui::ScrollArea::vertical()
+                        .id_salt("ai_folder_choices")
+                        .max_height(340.0)
+                        .show(ui, |ui| {
+                            for choice in &mut response.choices {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut choice.selected, "");
+                                    let index = choice.suggestion.item_id as usize;
+                                    ui.label(
+                                        self.proposals
+                                            .iter()
+                                            .find(|proposal| proposal.item == index)
+                                            .map(|proposal| proposal.label.as_str())
+                                            .unwrap_or("Unknown item"),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut choice.suggestion.destination_relative,
+                                        )
+                                        .desired_width(280.0),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(&choice.suggestion.reason)
+                                        .small()
+                                        .weak(),
+                                );
+                                ui.separator();
+                            }
+                        });
+                    if ui.button("Apply selected folders to draft").clicked() {
+                        apply = true;
+                    }
+                }
+            });
+        self.ai_open = open;
+        if prepare {
+            if let Err(error) = self.prepare_ai() {
+                self.ai_error = Some(error);
+            }
+        }
+        if send {
+            self.begin_ai(jobs);
+        }
+        if apply {
+            if let Err(error) = self.apply_ai() {
+                self.ai_error = Some(error);
+            }
+        }
+    }
 }
 
 fn sort_preview(node: &mut PreviewNode) {

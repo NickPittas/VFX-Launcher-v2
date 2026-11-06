@@ -45,6 +45,7 @@ const MAX_DIAGNOSTICS_PER_POLL: usize = 32;
 pub enum JobPhase {
     FindingFolders,
     MatchingFolders,
+    Suggesting,
     Counting,
     Scanning,
     Validating,
@@ -57,6 +58,7 @@ impl JobPhase {
         match self {
             Self::FindingFolders => "Finding project folders",
             Self::MatchingFolders => "Matching project folders",
+            Self::Suggesting => "Suggesting folders",
             Self::Counting => "Counting files",
             Self::Scanning => "Scanning",
             Self::Validating => "Validating",

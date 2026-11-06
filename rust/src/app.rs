@@ -452,7 +452,9 @@ impl VfxLauncherApp {
                             if ui.button("Cancel").clicked() {
                                 cancel = Some(job.id);
                             }
-                            if job.paused || job.pause_requested {
+                            if self.incoming.is_ai_job(job.id) {
+                                ui.label("Waiting for Pi");
+                            } else if job.paused || job.pause_requested {
                                 if ui.button("Resume").clicked() {
                                     resume = Some(job.id);
                                 }
