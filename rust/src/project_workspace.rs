@@ -456,6 +456,9 @@ pub struct ProjectWorkspace {
     registration: Registration,
     registration_workers: Vec<JoinHandle<()>>,
     registration_user: Option<UserId>,
+    /// Root of a project this application created itself, so the registration
+    /// summary it produces also selects and scans that project.
+    created_root: Option<PathBuf>,
     scan: Scan,
     launches: Vec<LaunchRequest>,
     reveals: Vec<RevealRequest>,
@@ -513,6 +516,7 @@ impl ProjectWorkspace {
             registration: Registration::Idle,
             registration_workers: Vec::new(),
             registration_user: None,
+            created_root: None,
             scan: Scan::default(),
             launches: Vec::new(),
             reveals: Vec::new(),
@@ -1517,6 +1521,11 @@ impl ProjectWorkspace {
                             .collect();
                         self.scan.followup.extend(ids);
                     }
+                    if self.created_root.take().is_some() {
+                        self.select_created(
+                            summary.added.iter().map(|added| added.project).collect(),
+                        );
+                    }
                     next = Some(Registration::Summary(summary));
                 }
                 ReplyState::Failed(error) => {
@@ -1548,6 +1557,60 @@ impl ProjectWorkspace {
 
     pub fn registration_picker_pending(&self) -> bool {
         matches!(self.registration, Registration::Choosing(_))
+    }
+
+    /// Registers one folder the application itself just created. Planning runs on
+    /// the existing registration worker, so no walk, dialog or SQL happens inside a
+    /// frame; the summary this produces also selects and scans the new project.
+    pub fn register_created_project(&mut self, root: PathBuf) {
+        if self.closing {
+            return;
+        }
+        if self.registration_busy() {
+            self.push_notice(Notice {
+                title: "The project was created but is not registered yet.".to_string(),
+                detail: Some(format!(
+                    "Another folder change is still running; {} can be added with Add existing folder.",
+                    root.display()
+                )),
+                error: true,
+            });
+            return;
+        }
+        if !self.actions_enabled() {
+            let reason = self
+                .actions_blocked_reason()
+                .unwrap_or_else(|| "registration is unavailable".to_string());
+            self.push_notice(Notice {
+                title: "The project was created but cannot be registered yet.".to_string(),
+                detail: Some(format!("{} ({reason})", root.display())),
+                error: true,
+            });
+            return;
+        }
+        match start_planning(vec![root.clone()], self.ctx.clone()) {
+            Ok((replies, worker)) => {
+                self.registration_workers.push(worker);
+                self.registration_user = self.user.as_ref().map(|user| user.id);
+                self.created_root = Some(root);
+                self.registration = Registration::Planning(replies);
+            }
+            Err(error) => self.push_notice(Notice {
+                title: "The project was created but registration could not start.".to_string(),
+                detail: Some(format!("{}: {error}", root.display())),
+                error: true,
+            }),
+        }
+    }
+
+    /// Selects the project a created-root registration just added, so the new
+    /// project is the current one in Projects and in Shots & Sequences.
+    fn select_created(&mut self, added: Vec<ProjectId>) {
+        let Some(id) = added.first().copied() else {
+            return;
+        };
+        self.selected = None;
+        self.select_project(id);
     }
 
     // -------------------------------------------------------------------- scan

@@ -20,6 +20,7 @@ use crate::launch::Tool;
 use crate::project_workspace::{ProjectWorkspace, RegistrationStatus, SettingsPath};
 use crate::projects::{FileGroup, FileKind, ProjectFile, ProjectList};
 use crate::storage::{FileId, ProjectId};
+use crate::structure_workspace::StructureWorkspace;
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
 const PANEL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x24, 0x25, 0x28);
@@ -125,7 +126,8 @@ impl View {
     /// Type).
     fn primary_action(self) -> Option<&'static str> {
         match self {
-            Self::ShotsAndSequences => Some("Add to project"),
+            // The Shots view draws its own reviewed plan controls in the strip.
+            Self::ShotsAndSequences => None,
             Self::OrganizeIncoming => Some("Copy selected"),
             Self::CopyByFileType => None,
             Self::BackUpProjects => None,
@@ -146,11 +148,6 @@ enum Action {
     FileInfo(ProjectFile),
     CopyText(String),
     ChooseUser(crate::storage::UserId),
-}
-
-#[derive(Clone, Debug, Default)]
-struct NewProjectDraft {
-    name: String,
 }
 
 pub struct VfxLauncherApp {
@@ -178,7 +175,8 @@ pub struct VfxLauncherApp {
     user_name: String,
     user_is_admin: bool,
     user_delete_confirmation: Option<crate::storage::UserId>,
-    new_project: Option<NewProjectDraft>,
+    /// Shots & Sequences editor, template administration and the New project dialog.
+    structure: StructureWorkspace,
     /// A close request is pending until the workers and the catalog have stopped.
     closing: bool,
     /// The close command was already sent; no further coordination is wanted.
@@ -209,7 +207,7 @@ impl VfxLauncherApp {
             user_name: String::new(),
             user_is_admin: false,
             user_delete_confirmation: None,
-            new_project: None,
+            structure: StructureWorkspace::new(&cc.egui_ctx, &data_dir),
             closing: false,
             close_sent: false,
         }
@@ -221,6 +219,7 @@ impl eframe::App for VfxLauncherApp {
     /// close coordination never depend on a painted frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.workspace.poll(&mut self.jobs);
+        self.structure.poll(&mut self.workspace, &mut self.jobs);
         self.history.poll();
         self.backup.poll(
             self.workspace.catalog_client().as_ref(),
@@ -399,13 +398,19 @@ impl VfxLauncherApp {
                 if self.view == View::BackUpProjects {
                     self.backup.validate_control(ui, &mut self.jobs);
                 }
+                if self.view == View::ShotsAndSequences {
+                    self.structure.validate_control(ui, &mut self.jobs);
+                }
                 if closing
                     && (self.backup.picker_pending()
                         || self.copy_by_type.picker_pending()
+                        || self.structure.picker_pending()
                         || self.workspace.registration_picker_pending()
                         || self.workspace.settings_browse_pending())
                 {
                     ui.label("Close the folder chooser to finish quitting.");
+                } else if self.view == View::ShotsAndSequences {
+                    ui.label(egui::RichText::new(self.structure.status_line()).small());
                 } else {
                     ui.label(
                         egui::RichText::new(status_text(job.as_ref(), closing, live_jobs)).small(),
@@ -435,6 +440,9 @@ impl VfxLauncherApp {
                     if self.view == View::BackUpProjects {
                         self.backup.execution_control(ui, &mut self.jobs);
                     }
+                    if self.view == View::ShotsAndSequences {
+                        self.structure.execution_control(ui, &mut self.jobs);
+                    }
                     if let Some(action) = action {
                         explain(&primary_button(ui, action, false), UNAVAILABLE);
                     }
@@ -449,6 +457,7 @@ impl VfxLauncherApp {
                             ui.label(egui::RichText::new("Finishing…").small().weak());
                         } else if self.copy_by_type.is_picker_job(job.id)
                             || self.backup.is_picker_job(job.id)
+                            || self.structure.is_picker_job(job.id)
                         {
                             ui.label("Waiting for folder chooser");
                         } else {
@@ -587,7 +596,7 @@ impl VfxLauncherApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("New project…").clicked() {
-                    self.new_project = Some(NewProjectDraft::default());
+                    self.structure.begin_new_project(&self.workspace);
                 }
                 ui.separator();
                 self.user_chooser(ui, actions);
@@ -854,63 +863,7 @@ impl VfxLauncherApp {
     // ------------------------------------------------------------------ views
 
     fn shots_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Project").small().weak());
-            let current = self
-                .workspace
-                .selected_project()
-                .map(|project| project.name.as_str())
-                .unwrap_or("No project selected");
-            ui.label(current);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let _ = pending_button(ui, "Templates…");
-            });
-        });
-        ui.separator();
-
-        egui::Panel::bottom("structure_preview_dock")
-            .resizable(true)
-            .default_size(170.0)
-            .min_size(110.0)
-            .max_size(340.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Preview").small().weak());
-                empty_state(
-                    ui,
-                    "No preview yet.",
-                    "Proposed folders and Nuke scripts appear here.",
-                );
-            });
-
-        egui::Panel::left("structure_destination_tree")
-            .resizable(true)
-            .default_size(300.0)
-            .min_size(200.0)
-            .max_size(560.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new("Destination folders").small().weak());
-                empty_state(
-                    ui,
-                    "No project folders.",
-                    "Choose a project to edit its sequence and shot structure.",
-                );
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let _ = pending_button(ui, "Add sequence");
-                let _ = pending_button(ui, "Add shot");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let _ = pending_button(ui, "Remove");
-                });
-            });
-            ui.separator();
-            empty_state(
-                ui,
-                "No sequences yet.",
-                "Sequences, shots and Nuke settings appear here once a project is selected.",
-            );
-        });
+        self.structure.view(ui, &mut self.jobs);
     }
 
     fn incoming_view(&mut self, ui: &mut egui::Ui) {
@@ -1279,48 +1232,9 @@ impl VfxLauncherApp {
     }
 
     fn new_project_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut draft) = self.new_project.take() else {
-            return;
-        };
-
-        let mut open = true;
-        let mut cancel = false;
-        egui::Window::new("New project")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(240.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Client");
-                    let _ = pending_button(ui, "Default");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Template");
-                    let _ = pending_button(ui, "Default");
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let _ = pending_button(ui, "Create");
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "Creating a project needs the folder-structure and template packets, so it stays disabled rather than creating an empty folder.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
-
-        if open && !cancel {
-            self.new_project = Some(draft);
-        }
+        self.structure
+            .new_project_dialog(ctx, &mut self.workspace, &mut self.jobs);
+        self.structure.templates_dialog(ctx, &mut self.jobs);
     }
 
     fn info_dialog(&mut self, ctx: &egui::Context) {
@@ -1363,7 +1277,7 @@ impl VfxLauncherApp {
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 ui.label(
                     egui::RichText::new(
-                        "Project catalog and file launch are wired. Folder structure creation, incoming organization, file-type copy, backup and settings editing arrive in later builds.",
+                        "Project catalog, file launch, Shots & Sequences additions, new-project creation, incoming organization, file-type copy, backup and settings editing are wired to the shared transfer engine.",
                     )
                     .small()
                     .weak(),

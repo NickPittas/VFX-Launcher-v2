@@ -34,6 +34,8 @@ pub mod projects;
 pub mod schedule;
 pub mod storage;
 pub mod structure;
+pub mod structure_workspace;
+pub mod templates;
 pub mod transfers;
 
 pub use app::{VfxLauncherApp, run_gui};
