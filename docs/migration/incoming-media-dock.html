@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>VFX Launcher — Incoming media dock</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --window:#101419; --surface:#171b20; --raised:#20262c; --control:#222c37;
+      --selected:#203c56; --border:#30363d; --strong:#596979; --text:#edf1f5;
+      --muted:#b2bdc9; --quiet:#8f9ba8; --accent:#83b7ef; --primary:#397fb7;
+      --focus:#ffd166; --warning:#edc47c; --dock-height:292px; --source-width:236px;
+      font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    * { box-sizing:border-box; }
+    html,body { width:100%; height:100%; margin:0; overflow:hidden; background:var(--window); color:var(--text); font:400 12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    button,input,select { font:inherit; color:inherit; }
+    button { min-height:23px; padding:2px 8px; border:1px solid var(--strong); border-radius:1px; background:var(--control); font-weight:400; cursor:pointer; }
+    button:hover:not(:disabled) { background:#2a3643; }
+    button:disabled { opacity:.42; cursor:default; }
+    button:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible { outline:2px solid var(--focus); outline-offset:1px; }
+    input,select { min-height:24px; padding:3px 6px; border:1px solid var(--strong); border-radius:1px; background:#11161b; }
+    .mono { font-family:ui-monospace,"Cascadia Mono","Segoe UI Mono",Consolas,monospace; }
+    .quiet { color:var(--quiet); } .muted { color:var(--muted); } .warning { color:var(--warning); }
+    .push { margin-left:auto; }
+    .app { height:100%; min-width:960px; min-height:620px; display:grid; grid-template-rows:26px 30px 34px minmax(0,1fr) 31px; }
+    .menu { display:flex; align-items:center; gap:18px; padding:0 8px; background:#14181d; border-bottom:1px solid var(--border); }
+    .menu .name { margin-right:8px; font-weight:500; } .menu span:not(.name) { color:var(--muted); }
+    .workspaces { display:flex; background:#14181d; border-bottom:1px solid var(--border); }
+    .workspace { border:0; border-right:1px solid var(--border); border-radius:0; background:transparent; color:var(--muted); padding:3px 13px; }
+    .workspace[aria-current="page"] { color:var(--text); background:#252d35; box-shadow:inset 0 -2px var(--accent); }
+    .projectbar,.toolbar { display:flex; align-items:center; gap:6px; padding:4px 7px; background:#181d22; border-bottom:1px solid var(--border); }
+    .projectbar select { width:310px; } .primary { background:var(--primary); border-color:#69a7d4; }
+    .incoming { min-height:0; display:grid; grid-template-rows:30px 57px minmax(150px,1fr) 5px minmax(190px,var(--dock-height)); }
+    .setup { display:grid; grid-template-columns:1fr 1fr 230px; gap:7px; padding:5px 7px; border-bottom:1px solid var(--border); }
+    .field { min-width:0; display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:5px; color:var(--muted); }
+    .field input,.field select { width:100%; min-width:0; }
+    .work { min-height:0; display:grid; grid-template-columns:minmax(180px,var(--source-width)) 5px minmax(420px,1fr); }
+    .pane { min-width:0; min-height:0; display:flex; flex-direction:column; overflow:hidden; background:var(--surface); border:1px solid var(--border); }
+    .panehead { flex:none; min-height:26px; display:flex; align-items:center; gap:6px; padding:3px 6px; background:var(--raised); border-bottom:1px solid var(--border); }
+    .panehead .small { font-size:11px; }
+    .tree { flex:1; min-height:0; overflow:auto; padding:4px 0; font:12px/1.75 ui-monospace,"Cascadia Mono",monospace; }
+    .tree ul { list-style:none; margin:0; padding-left:18px; } .tree>ul { padding-left:8px; }
+    .folder { color:#b8d4ee; } .new { color:#82d6aa; }
+    .tablewrap { flex:1; min-height:0; overflow:auto; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; }
+    th { padding:5px 8px; text-align:left; color:var(--muted); background:#1b242d; border-bottom:1px solid var(--strong); font-weight:400; }
+    td { padding:5px 8px; border-bottom:1px solid #2b3540; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    tr.selected { background:var(--selected); box-shadow:inset 2px 0 var(--accent); }
+    .check { width:32px; text-align:center; } .type { width:110px; } .frames { width:100px; }
+    .splitter { background:#252c33; cursor:col-resize; position:relative; }
+    .splitter::after { content:""; position:absolute; inset:0; background:var(--border); }
+    .splitter:hover::after,.splitter:focus-visible::after { background:var(--accent); }
+    .vertical { cursor:row-resize; }
+    .dock-tabs { align-self:stretch; display:flex; margin:-3px -6px -3px -6px; }
+    .dock-tab { min-height:26px; border:0; border-right:1px solid var(--border); border-radius:0; background:transparent; color:var(--muted); padding:3px 12px; }
+    .dock-tab[aria-selected="true"] { color:var(--text); background:#2a3138; box-shadow:inset 0 -2px var(--accent); }
+    .dock-body { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .dock-body[hidden] { display:none; }
+    .dock-note { flex:none; padding:3px 7px; border-top:1px solid var(--border); color:var(--quiet); }
+    .media-tools { flex:none; display:flex; align-items:center; gap:4px; padding:4px 6px; border-bottom:1px solid var(--border); background:#181d22; }
+    .media-tools button { min-width:26px; padding-inline:5px; }
+    .media-tools .frame-slider { flex:1; min-width:100px; margin:0 6px; accent-color:var(--accent); }
+    .tool-separator { width:1px; height:18px; margin:0 3px; background:var(--border); }
+    .zoom { width:56px; text-align:right; color:var(--muted); }
+    .image-area { flex:1; min-height:0; position:relative; display:grid; place-items:center; overflow:auto; background-color:#0d1115; background-image:linear-gradient(45deg,#161c22 25%,transparent 25%),linear-gradient(-45deg,#161c22 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#161c22 75%),linear-gradient(-45deg,transparent 75%,#161c22 75%); background-size:16px 16px; background-position:0 0,0 8px,8px -8px,-8px 0; }
+    .frame-image { width:min(88%,760px); max-height:100%; aspect-ratio:16/9; object-fit:contain; box-shadow:0 0 0 1px #4c5965; }
+    .media-status { flex:none; display:flex; gap:16px; align-items:center; padding:3px 7px; border-top:1px solid var(--border); color:var(--muted); }
+    .actionbar { display:flex; align-items:center; gap:9px; padding:4px 7px; border-top:1px solid #4a535d; background:#1b2127; }
+    .actionbar label { color:var(--muted); } .actionbar input { vertical-align:middle; accent-color:var(--primary); }
+    @media (max-width:1100px) { .setup { grid-template-columns:1fr 1fr 190px; } .media-tools .tool-text { display:none; } }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="menu"><span class="name">VFX Launcher</span><span>File</span><span>Edit</span><span>View</span><span>Window</span><span>Help</span></div>
+  <nav class="workspaces" aria-label="Workspaces">
+    <button class="workspace">Projects</button><button class="workspace">Shots &amp; Sequences</button><button class="workspace" aria-current="page">Organize Incoming</button><button class="workspace">Copy by File Type</button><button class="workspace">Back Up Projects</button><span class="push"></span><button class="workspace">Settings</button>
+  </nav>
+  <div class="projectbar"><label class="muted" for="project">Current project</label><select id="project"><option>00142_Northwind_Tidal_2026-11-05</option></select><span class="push"></span><span class="quiet">User: admin</span></div>
+
+  <main class="incoming" aria-label="Organize Incoming">
+    <div class="toolbar"><button class="primary">Scan folders</button><span class="muted">3 items · 202 files</span><span class="push"></span><button>Suggest folders</button><button>Rules</button></div>
+    <div class="setup">
+      <label class="field">Source <input class="mono" value="/mnt/Ingest/Northwind/day_03"><button>Browse…</button></label>
+      <label class="field">Destination <input class="mono" value="/mnt/Projects/00142_Northwind_Tidal_2026-11-05"><button>Browse…</button></label>
+      <label class="field">Folder layout <select><option>Shot / task / version</option></select></label>
+    </div>
+
+    <div class="work" id="work">
+      <section class="pane" aria-label="Source folders">
+        <div class="panehead"><span>Source</span><span class="small quiet">day_03</span></div>
+        <div class="tree"><ul><li><span class="folder">day_03/</span><ul><li><span class="folder">camera_a/</span><ul><li>A012C003_261105.mxf</li></ul></li><li><span class="folder">renders/</span><ul><li class="selected">SH010_beauty_v003.####.exr</li><li>SH010_cryptomatte_v003.####.exr</li></ul></li></ul></li></ul></div>
+      </section>
+      <div class="splitter" role="separator" tabindex="0" aria-label="Resize source pane" aria-orientation="vertical" id="source-split"></div>
+      <section class="pane" aria-label="Files and destinations">
+        <div class="panehead"><span>Files and destinations</span><span class="push"></span><button>Select all</button><button>Clear</button></div>
+        <div class="tablewrap"><table aria-label="Incoming files and destinations"><thead><tr><th class="check"></th><th>File</th><th>Destination</th><th class="type">Type</th><th class="frames">Frames</th></tr></thead><tbody>
+          <tr class="selected"><td class="check"><input type="checkbox" checked aria-label="Select beauty"></td><td class="mono">SH010_beauty_v003.####.exr</td><td class="mono">04_vfx/SH010/beauty/v003</td><td>EXR sequence</td><td>200</td></tr>
+          <tr><td class="check"><input type="checkbox" checked aria-label="Select cryptomatte"></td><td class="mono">SH010_cryptomatte_v003.####.exr</td><td class="mono">04_vfx/SH010/cryptomatte/v003</td><td>EXR sequence</td><td>200</td></tr>
+          <tr><td class="check"><input type="checkbox" checked aria-label="Select camera"></td><td class="mono">A012C003_261105.mxf</td><td class="mono">01_plates/SH010/camera_a</td><td>MXF</td><td></td></tr>
+        </tbody></table></div>
+      </section>
+    </div>
+
+    <div class="splitter vertical" role="separator" tabindex="0" aria-label="Resize destination and media dock" aria-orientation="horizontal" id="dock-split"></div>
+    <section class="pane" aria-label="Destination and media dock">
+      <div class="panehead">
+        <div class="dock-tabs" role="tablist" aria-label="Incoming preview">
+          <button class="dock-tab" role="tab" id="destination-tab" aria-controls="destination-panel" aria-selected="false">Destination</button>
+          <button class="dock-tab" role="tab" id="media-tab" aria-controls="media-panel" aria-selected="true">Media</button>
+        </div>
+        <span class="push"></span><span class="mono quiet" id="dock-file">SH010_beauty_v003.####.exr</span>
+      </div>
+      <div class="dock-body" id="destination-panel" role="tabpanel" aria-labelledby="destination-tab" hidden>
+        <div class="tree"><ul><li><span class="folder">00142_Northwind_Tidal_2026-11-05/</span><ul><li><span class="folder">04_vfx/SH010/</span><ul><li><span class="folder">beauty/v003/</span><ul><li class="new">SH010_beauty_v003.1001.exr · will copy</li><li class="new">SH010_beauty_v003.1002.exr · will copy</li><li class="new">SH010_beauty_v003.1003.exr · will replace</li></ul></li><li><span class="folder">cryptomatte/v003/</span></li></ul></li><li><span class="folder">01_plates/SH010/camera_a/</span></li></ul></li></ul></div>
+        <div class="dock-note">Existing content and planned files · 1 existing file</div>
+      </div>
+      <div class="dock-body" id="media-panel" role="tabpanel" aria-labelledby="media-tab">
+        <div class="media-tools" aria-label="Exact frame controls">
+          <button id="first" title="First actual frame" aria-label="First actual frame">|◀</button><button id="previous" title="Previous actual frame" aria-label="Previous actual frame">◀</button>
+          <input class="frame-slider" id="frame-slider" type="range" min="0" max="3" step="1" value="2" aria-label="Actual frame position">
+          <button id="next" title="Next actual frame" aria-label="Next actual frame">▶</button><button id="last" title="Last actual frame" aria-label="Last actual frame">▶|</button>
+          <span class="tool-separator"></span><button id="fit">Fit</button><button id="actual-size">100%</button><button id="zoom-out" aria-label="Zoom out">−</button><output class="zoom" id="zoom">Fit</output><button id="zoom-in" aria-label="Zoom in">+</button><button id="refresh">Refresh</button>
+        </div>
+        <div class="image-area" id="image-area">
+          <svg class="frame-image" id="frame-image" viewBox="0 0 1920 1080" role="img" aria-label="Preview of actual frame 1004">
+            <defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#263b52"/><stop offset="1" stop-color="#bf8060"/></linearGradient><linearGradient id="ground" x2="0" y2="1"><stop stop-color="#2b3338"/><stop offset="1" stop-color="#101416"/></linearGradient></defs>
+            <rect width="1920" height="1080" fill="url(#sky)"/><circle cx="1470" cy="280" r="90" fill="#edc47c" opacity=".8"/><path d="M0 610L260 430 480 590 720 350 1010 600 1260 430 1540 580 1740 390 1920 550V1080H0Z" fill="#323e47"/><path d="M0 720Q420 600 850 720T1920 680V1080H0Z" fill="url(#ground)"/><path d="M640 1080L910 650H1030L1320 1080" fill="#222b30"/><g fill="#d9e2e8" font-family="monospace"><text x="54" y="74" font-size="28">SH010 · BEAUTY · v003</text><text id="svg-frame" x="54" y="1020" font-size="32">ACTUAL FRAME 1004</text><text x="1690" y="1020" font-size="25">1920 × 1080</text></g>
+          </svg>
+        </div>
+        <div class="media-status"><span>Dimensions <strong>1920 × 1080</strong></span><span>Actual frame <strong class="mono" id="actual-frame">1004</strong></span><span class="mono" id="frame-position">3 of 4 present frames</span><span class="push"></span><span class="quiet" id="media-feedback">Missing frames are skipped</span></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="actionbar"><label><input type="radio" name="action" checked> Copy</label><label><input type="radio" name="action"> Move</label><button>Validate selection</button><span class="muted">Ready · 3 items, 202 files</span><span class="push"></span><button class="primary">Copy selected</button></footer>
+</div>
+<script>
+  const frames = [1001, 1002, 1004, 1007];
+  let frameIndex = 2;
+  let zoom = 0;
+  const $ = id => document.getElementById(id);
+  function renderFrame() {
+    $('frame-slider').value = frameIndex;
+    $('actual-frame').textContent = frames[frameIndex];
+    $('frame-position').textContent = `${frameIndex + 1} of ${frames.length} present frames`;
+    $('svg-frame').textContent = `ACTUAL FRAME ${frames[frameIndex]}`;
+    $('frame-image').setAttribute('aria-label', `Preview of actual frame ${frames[frameIndex]}`);
+    $('first').disabled = $('previous').disabled = frameIndex === 0;
+    $('next').disabled = $('last').disabled = frameIndex === frames.length - 1;
+  }
+  function selectFrame(index) { frameIndex = Math.max(0, Math.min(frames.length - 1, index)); renderFrame(); }
+  $('first').onclick = () => selectFrame(0);
+  $('previous').onclick = () => selectFrame(frameIndex - 1);
+  $('next').onclick = () => selectFrame(frameIndex + 1);
+  $('last').onclick = () => selectFrame(frames.length - 1);
+  $('frame-slider').oninput = event => selectFrame(Number(event.target.value));
+  function renderZoom() {
+    $('zoom').textContent = zoom === 0 ? 'Fit' : `${zoom}%`;
+    $('frame-image').style.width = zoom === 0 ? 'min(88%, 760px)' : `${Math.round(760 * zoom / 100)}px`;
+    $('frame-image').style.maxHeight = zoom === 0 ? '100%' : 'none';
+  }
+  $('fit').onclick = () => { zoom = 0; renderZoom(); };
+  $('actual-size').onclick = () => { zoom = 100; renderZoom(); };
+  $('zoom-out').onclick = () => { zoom = Math.max(10, (zoom || 67) - 10); renderZoom(); };
+  $('zoom-in').onclick = () => { zoom = Math.min(400, (zoom || 67) + 10); renderZoom(); };
+  $('refresh').onclick = () => { $('media-feedback').textContent = `Frame ${frames[frameIndex]} refreshed`; };
+  function selectDock(media) {
+    $('media-tab').setAttribute('aria-selected', media);
+    $('destination-tab').setAttribute('aria-selected', !media);
+    $('media-panel').hidden = !media;
+    $('destination-panel').hidden = media;
+  }
+  $('media-tab').onclick = () => selectDock(true);
+  $('destination-tab').onclick = () => selectDock(false);
+  document.querySelector('.dock-tabs').onkeydown = event => {
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); selectDock(event.key === 'ArrowRight'); (event.key === 'ArrowRight' ? $('media-tab') : $('destination-tab')).focus(); }
+  };
+  function resizeWithKeys(event, target, property, min, max, horizontal) {
+    const direction = horizontal ? (event.key === 'ArrowUp' ? 1 : event.key === 'ArrowDown' ? -1 : 0) : (event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0);
+    if (!direction) return;
+    event.preventDefault();
+    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue(property));
+    document.documentElement.style.setProperty(property, `${Math.max(min, Math.min(max, current + direction * (event.shiftKey ? 40 : 10)))}px`);
+  }
+  $('dock-split').onkeydown = event => resizeWithKeys(event, $('dock-split'), '--dock-height', 190, 440, true);
+  $('source-split').onkeydown = event => resizeWithKeys(event, $('source-split'), '--source-width', 180, 400, false);
+  renderFrame();
+</script>
+</body>
+</html>

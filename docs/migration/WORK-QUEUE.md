@@ -16,11 +16,13 @@ historical packet reports and their superseding corrections.
    close branches remain compile-verified only. Follow-up source review confirmed
    the original fixes; its three smaller findings (failed-start prior report,
    interrupted aggregate counts and fallback warnings) are corrected and compile.
-2. **Implement Incoming routing and UI.** Exact frame grouping and file analysis
+2. **Incoming routing and UI implemented; finish localized verification.** Exact frame grouping and file analysis
    are integrated and source-reviewed. The unsupported-name reporting finding
    is corrected; no sequence correctness blocker was found. Mapping/editing and
-   Incoming UI remain to implement. No runtime grouping pass.
-3. **Wire Shots & Sequences and New project.** Structure planning and the Nuke
+   Incoming UI are wired, including edits, routing, tags and proposal-only Pi.
+   Earlier disposable Incoming evidence covers its recorded workflow only;
+   new media, external-player and Nuke socket paths await live verification.
+3. **Shots & Sequences and New project wired; finish verification.** Structure planning and the Nuke
    content provider are integrated with legacy parity findings corrected.
    Preserve the approved tree editor and existing-project-only additions page.
    Native structure execution and Nuke acceptance remain unverified.
@@ -33,9 +35,12 @@ historical packet reports and their superseding corrections.
    Real 1–16-worker execution is now wired, source-reviewed, and manually exercised
    with 18 files/four workers. One native interval trigger also passed; daily/DST,
    busy/cancel/error and import/export cases remain to verify.
-5. **Finish remaining ports.** Legacy import/adoption, template persistence/editing,
-   incoming tags/routing and Pi proposal UI, then packaging/platform integration.
-   The bounded proposal-only Pi adapter exists but is not wired or model-verified.
+5. **Verify completed ports.** Legacy import/adoption, template persistence/editing,
+   incoming tags/routing and Pi proposal UI are implemented. Current fixes add
+   bounded Python-compatible regex matching, embedded image/sequence inspection,
+   DJV/MRV2/Nuke Player launch paths and Send to Nuke. These latest paths are
+   compile-verified, not a runtime parity claim. Linux and Windows 0.2.0 packages
+   were released before these uncommitted fixes; see the platform evidence docs.
 
 Every original algorithm remains the source of truth. Discovery uses counted
 filename and metadata-processing stages, configured project-folder matching,
@@ -51,7 +56,13 @@ remain unverified. Settings source-review findings have implementation fixes.
 The Linux executor's fresh review found no remaining original cooperative-writer
 data-safety blocker; reporting corrections are integrated. The first Skip copy
 operation is runtime evidence for that path only. Bounded parallel execution is
-now implemented and Linux-only. Hostile namespace races remain outside its stated model.
+now implemented for Linux and Windows. Windows uses the user-approved native
+completion semantics and records unconfirmed power-loss namespace durability.
+Hostile namespace races remain outside its stated model.
+
+Desktop verification is paused while the user works on this machine. Continue
+repository changes and bounded compilation only; no desktop input or app launches
+without explicit renewed authorization. No claim of 100% runtime verification.
 
 No test suites until all features are implemented. No global tests before the
 app is functional and verified. Use bounded feature-local checks and disposable

@@ -2163,3 +2163,33 @@ no test suite. Nothing is committed.
   runtime.
 - No UI/app caller exists, so no live transfer pass has run; the executor must
   still not be described as runtime-verified.
+# Completion corrections — 2026-11-06, included in 0.3.0
+
+The latest repository changes add Incoming's image/sequence dock, exact-member
+navigation, bounded native image decoding and FFmpeg fallback, DJV/MRV2/Nuke
+Player context actions and settings, and the localhost NukeServerSocket client.
+Sequence arguments are reconstructed from verified actual frame names. Socket
+submission distinguishes not-submitted from uncertain outcomes and never retries
+an ambiguous submission automatically. External launch success means spawn
+accepted, not application startup verified.
+
+Filename rules now use bounded fancy-regex matching with explicit unsupported
+dialect/limit diagnostics. Compilation and matching run off the UI thread;
+validation requires the current completed match key. Settings acknowledgement,
+identity deletion, import/adoption inspection and history attribution corrections
+are integrated. The latest source review's two findings are corrected: accepted
+registration now defers deletion of its initiating user, and match keys normalize
+source whitespace consistently with scan/draft handling.
+
+`cargo check --offline --locked --lib --bin vfx-launcher`, `cargo fmt --check`
+and `git diff --check` pass after integration. Commands were capped at 20–30s.
+No test suite was created or run in this continuation. No new desktop input,
+app launch or runtime operation was performed after the user said they were
+working on this machine. Media rendering, external-player launches, real Nuke
+socket acceptance and the newly corrected lifecycle branches remain unverified
+at runtime. Nuke is installed at `/opt/Nuke17.1v2/`; installation alone does not
+verify that NukeServerSocket is enabled in a running session.
+
+WORK-QUEUE.md supersedes stale historical claims below that Incoming/structure,
+import or Windows execution are unimplemented. Published 0.2.0 assets do not
+contain these completion corrections; they are included in 0.3.0.

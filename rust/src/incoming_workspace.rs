@@ -385,6 +385,21 @@ struct AiResponse {
     choices: Vec<AiChoice>,
 }
 
+type MatchKey = (u64, u64, u64, String, String);
+struct MatchRun {
+    key: MatchKey,
+    replies: Receiver<
+        Result<
+            (
+                CompiledPatterns,
+                Vec<crate::patterns::DialectIssue>,
+                Vec<MappingProposal>,
+            ),
+            String,
+        >,
+    >,
+}
+
 pub struct OrganizeIncomingState {
     ai_open: bool,
     ai_config: crate::ai::HarnessConfig,
@@ -411,6 +426,10 @@ pub struct OrganizeIncomingState {
     patterns: Option<PatternSet>,
     profiles: Option<ProfileSet>,
     compiled: Option<CompiledPatterns>,
+    compiled_issues: Vec<crate::patterns::DialectIssue>,
+    match_run: Option<MatchRun>,
+    match_requested: bool,
+    last_matched: Option<MatchKey>,
     config_run: Option<ConfigRun>,
     config_message: Option<String>,
     config_error: Option<String>,
@@ -440,6 +459,13 @@ pub struct OrganizeIncomingState {
     /// Item whose exact member files are open in the frames dialog.
     frames_open: Option<usize>,
     focus: Option<usize>,
+    nuke_run: Option<(JobId, Receiver<crate::nuke_socket::NukeReply>)>,
+    nuke_notice: Option<String>,
+    media: crate::incoming_media::IncomingMedia,
+    media_target: Option<(u64, usize)>,
+    media_tab: bool,
+    media_applications: crate::config::Applications,
+    player_run: Option<Receiver<Result<String, String>>>,
     editor: ItemEditor,
 
     plan_counter: u64,
@@ -491,6 +517,10 @@ impl OrganizeIncomingState {
             patterns: None,
             profiles: Some(profiles),
             compiled: None,
+            compiled_issues: Vec::new(),
+            match_run: None,
+            match_requested: false,
+            last_matched: None,
             config_run: None,
             config_message: None,
             config_error: None,
@@ -517,6 +547,13 @@ impl OrganizeIncomingState {
             folder_scope: None,
             frames_open: None,
             focus: None,
+            nuke_run: None,
+            nuke_notice: None,
+            media: Default::default(),
+            media_target: None,
+            media_tab: false,
+            media_applications: Default::default(),
+            player_run: None,
             editor: ItemEditor::default(),
             plan_counter: 0,
             validate_run: None,
@@ -530,6 +567,73 @@ impl OrganizeIncomingState {
             tree: None,
             tree_key: String::new(),
             message: None,
+        }
+    }
+
+    pub fn set_media_applications(&mut self, applications: crate::config::Applications) {
+        self.media_applications = applications;
+    }
+
+    fn launch_player(
+        &mut self,
+        index: usize,
+        player: crate::media_player::MediaPlayer,
+        jobs: &mut Jobs,
+    ) {
+        if self.busy() || jobs.is_shutting_down() {
+            return;
+        }
+        let Some(item) = self
+            .scanned
+            .as_ref()
+            .and_then(|s| s.analysis.items.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let configured = match player {
+            crate::media_player::MediaPlayer::Djv => self.media_applications.djv_path.as_ref(),
+            crate::media_player::MediaPlayer::Mrv2 => self.media_applications.mrv2_path.as_ref(),
+            crate::media_player::MediaPlayer::Nuke => self.media_applications.nuke_path.as_ref(),
+        };
+        let executable = match configured {
+            Some(path) => path.as_path().to_path_buf(),
+            None if player == crate::media_player::MediaPlayer::Djv => PathBuf::from("djv"),
+            None if player == crate::media_player::MediaPlayer::Mrv2 => PathBuf::from("mrv2"),
+            None => {
+                self.nuke_notice = Some("Set the Nuke application path in Settings first.".into());
+                return;
+            }
+        };
+        let (sender, receiver) = channel();
+        match jobs.start(&self.ctx, format!("Open in {}", player.label()), move |job| {
+            if job.control.checkpoint() == Checkpoint::Cancelled {
+                let _ = sender.send(Err("Player launch cancelled before starting.".into()));
+                job.events.finish(JobOutcome::Cancelled, JobProgress::default()); return;
+            }
+            let result = crate::media_player::launch(&item, player, &executable).map(|_|format!("{} launch accepted. The player reports any media-loading errors in its own window.", player.label()));
+            let outcome = if result.is_ok() { JobOutcome::Succeeded } else { JobOutcome::Failed };
+            let _ = sender.send(result); job.events.finish(outcome, JobProgress::default());
+        }) {
+            Ok(_) => { self.player_run = Some(receiver); self.nuke_notice = Some(format!("Starting {}…", player.label())); }
+            Err(error) => self.nuke_notice = Some(format!("The player launch could not start: {error}")),
+        }
+    }
+
+    fn poll_player(&mut self) {
+        let Some(receiver) = &self.player_run else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.nuke_notice = Some(result.unwrap_or_else(|e| e));
+                self.player_run = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.nuke_notice = Some("The player launch ended without a result.".into());
+                self.player_run = None;
+            }
+            Err(TryRecvError::Empty) => {}
         }
     }
 
@@ -568,6 +672,10 @@ impl OrganizeIncomingState {
         self.poll_execute(jobs);
         self.poll_preview();
         self.poll_ai();
+        self.poll_nuke();
+        self.poll_player();
+        self.media.poll();
+        self.poll_rematch();
         self.sync_draft();
         self.invalidate_review();
     }
@@ -581,12 +689,77 @@ impl OrganizeIncomingState {
         self.pick.is_some() || self.config_run.is_some()
     }
 
+    pub fn is_nuke_job(&self, id: JobId) -> bool {
+        self.nuke_run.as_ref().is_some_and(|(job, _)| *job == id)
+    }
+
     pub fn is_ai_job(&self, id: JobId) -> bool {
         self.ai_run.as_ref().is_some_and(|run| run.job == id)
     }
 
+    fn poll_nuke(&mut self) {
+        let Some((_, receiver)) = &self.nuke_run else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(reply) => {
+                self.nuke_notice = Some(reply.message);
+                self.nuke_run = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.nuke_notice = Some(
+                    "Nuke request stopped without a result. Check Nuke before sending again."
+                        .into(),
+                );
+                self.nuke_run = None;
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn send_to_nuke(&mut self, item: usize, jobs: &mut Jobs) {
+        if self.busy() || jobs.is_shutting_down() {
+            return;
+        }
+        let Some(item) = self
+            .scanned
+            .as_ref()
+            .and_then(|scan| scan.analysis.items.get(item))
+            .cloned()
+        else {
+            return;
+        };
+        let (sender, receiver) = channel();
+        match jobs.start(&self.ctx, "Send to Nuke", move |job| {
+            let reply = crate::nuke_socket::send(&item, &job.control);
+            let outcome = if reply.submission == crate::nuke_socket::Submission::Confirmed {
+                JobOutcome::Succeeded
+            } else if reply.submission == crate::nuke_socket::Submission::NotSubmitted
+                && job.control.is_cancelled()
+            {
+                JobOutcome::Cancelled
+            } else {
+                JobOutcome::Failed
+            };
+            let _ = sender.send(reply);
+            job.events.finish(outcome, JobProgress::default());
+        }) {
+            Ok(id) => {
+                self.nuke_run = Some((id, receiver));
+                self.nuke_notice = Some("Sending to the running Nuke session…".into());
+            }
+            Err(error) => {
+                self.nuke_notice = Some(format!("The Nuke request could not start: {error}"))
+            }
+        }
+    }
+
     fn busy(&self) -> bool {
         self.ai_run.is_some()
+            || self.player_run.is_some()
+            || self.nuke_run.is_some()
+            || self.match_run.is_some()
+            || self.match_requested
             || self.pick.is_some()
             || self.config_run.is_some()
             || self.scan_run.is_some()
@@ -636,6 +809,8 @@ impl OrganizeIncomingState {
     }
 
     fn forget_scan(&mut self) {
+        self.media.clear();
+        self.media_target = None;
         self.scanned = None;
         self.proposals.clear();
         self.rows.clear();
@@ -808,7 +983,7 @@ impl OrganizeIncomingState {
                 profiles,
                 seeded,
             }) => {
-                self.compiled = Some(patterns.compile());
+                self.compiled = None;
                 self.patterns = Some(patterns);
                 if profiles.find(&self.profile_name).is_none() {
                     self.profile_name = profiles
@@ -961,6 +1136,7 @@ impl OrganizeIncomingState {
                     && current_profile.as_deref() == Some(run.profile.as_str());
                 if fresh {
                     self.proposals = analyzed.proposals;
+                    self.last_matched = Some(self.match_key());
                     self.rebuild_rows();
                 } else {
                     // The rules or the chosen layout changed while the scan ran.
@@ -1141,7 +1317,7 @@ impl OrganizeIncomingState {
         if self.patterns.as_ref() == Some(&set) {
             return;
         }
-        self.compiled = Some(set.compile());
+        self.compiled = None;
         self.patterns = Some(set);
         self.patterns_revision += 1;
         self.rematch();
@@ -1163,28 +1339,129 @@ impl OrganizeIncomingState {
         self.rematch();
     }
 
-    /// Recomputes every proposal from the current patterns, profile and edits.
-    /// Pure matching over the analyzed items: no filesystem work.
+    fn match_key(&self) -> MatchKey {
+        (
+            self.scan_generation,
+            self.patterns_revision,
+            self.edit_generation,
+            self.profile_name.clone(),
+            self.source.trim().to_owned(),
+        )
+    }
+
     fn rematch(&mut self) {
-        let compiled = self.compiled.clone();
-        let profile = self.active_profile().cloned();
-        let (Some(analysis), Some(compiled), Some(profile)) = (
-            self.scanned.as_ref().map(|scanned| &scanned.analysis),
-            compiled,
-            profile,
-        ) else {
-            self.proposals.clear();
-            self.rows.clear();
+        self.last_matched = None;
+        self.match_requested = true;
+        self.review = None;
+    }
+
+    fn begin_rematch(&mut self, jobs: &mut Jobs) {
+        if !self.match_requested || self.match_run.is_some() || jobs.is_shutting_down() {
+            return;
+        }
+        let Some(patterns) = self.patterns.clone() else {
             return;
         };
-        let edits: Vec<ItemEdit> = (0..analysis.items.len())
-            .map(|index| self.edits.get(&index).cloned().unwrap_or_default())
-            .collect();
-        self.proposals =
-            incoming::propose_incoming(&analysis.items, &compiled, &profile, &edits, |_| {});
-        self.review = None;
-        self.rebuild_rows();
-        self.sync_editor();
+        let profile = self.active_profile().cloned();
+        let analysis = self.scanned.as_ref().map(|s| s.analysis.clone());
+        let edits = self.edits.clone();
+        let key = self.match_key();
+        let (sender, replies) = channel();
+        match jobs.start(&self.ctx, "Matching filenames", move |job| {
+            let compiled = patterns.compile();
+            let issues = patterns.dialect_issues();
+            let mut proposals = Vec::new();
+            let mut cancelled = job.control.checkpoint() == Checkpoint::Cancelled;
+            if let (Some(analysis), Some(profile)) = (analysis, profile) {
+                for (index, item) in analysis.items.iter().enumerate() {
+                    if job.control.checkpoint() == Checkpoint::Cancelled {
+                        cancelled = true;
+                        break;
+                    }
+                    let edit = edits.get(&index).cloned().unwrap_or_default();
+                    let mut result = incoming::propose_incoming(
+                        std::slice::from_ref(item),
+                        &compiled,
+                        &profile,
+                        &[edit],
+                        |_| {},
+                    );
+                    if let Some(mut proposal) = result.pop() {
+                        proposal.item = index;
+                        proposals.push(proposal);
+                    }
+                }
+            }
+            let result = if cancelled {
+                Err(
+                    "Filename matching was cancelled; change the rules or scan again to retry."
+                        .into(),
+                )
+            } else {
+                Ok((compiled, issues, proposals))
+            };
+            let _ = sender.send(result);
+            job.events.finish(
+                if cancelled {
+                    JobOutcome::Cancelled
+                } else {
+                    JobOutcome::Succeeded
+                },
+                JobProgress::default(),
+            );
+        }) {
+            Ok(_) => {
+                self.match_requested = false;
+                self.match_run = Some(MatchRun { key, replies });
+            }
+            Err(error) => {
+                self.match_requested = false;
+                self.proposals.clear();
+                self.rows.clear();
+                self.last_matched = None;
+                self.message = Some(format!(
+                    "Filename matching could not start: {error}. Scan again to retry."
+                ));
+            }
+        }
+    }
+
+    fn poll_rematch(&mut self) {
+        let Some(run) = self.match_run.take() else {
+            return;
+        };
+        let result = match run.replies.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                self.match_run = Some(run);
+                return;
+            }
+            Err(TryRecvError::Disconnected) => {
+                Err("Filename matching ended without a result.".into())
+            }
+        };
+        if run.key != self.match_key() {
+            self.match_requested = true;
+            return;
+        }
+        match result {
+            Ok((compiled, issues, proposals)) => {
+                self.last_matched = Some(self.match_key());
+                self.compiled = Some(compiled);
+                self.compiled_issues = issues;
+                self.proposals = proposals;
+                self.match_requested = false;
+                self.review = None;
+                self.rebuild_rows();
+                self.sync_editor();
+            }
+            Err(message) => {
+                self.compiled = None;
+                self.proposals.clear();
+                self.rows.clear();
+                self.message = Some(message);
+            }
+        }
     }
 
     fn rebuild_rows(&mut self) {
@@ -1377,7 +1654,9 @@ impl OrganizeIncomingState {
             return;
         }
         let Some(compiled) = self.compiled.clone() else {
-            self.message = Some("The incoming rules are still opening.".to_string());
+            self.rematch();
+            self.message =
+                Some("Matching the rules again; scan once matching finishes.".to_string());
             return;
         };
         let Some(profile) = self.active_profile().cloned() else {
@@ -1811,6 +2090,17 @@ impl OrganizeIncomingState {
     }
 
     fn validate_blocked(&self) -> Option<String> {
+        if self.last_matched.as_ref() != Some(&self.match_key()) || self.compiled.is_none() {
+            return Some("Destinations have not been matched to the current rules and edits. Wait for matching, or scan again after an error.".into());
+        }
+        if !self.compiled_issues.is_empty()
+            || self
+                .compiled
+                .as_ref()
+                .is_some_and(|c| !c.bounded_issues().is_empty())
+        {
+            return Some("Some filename rules could not run. Open Rules and fix the reported expressions before reviewing destinations.".into());
+        }
         if let Some(reason) = self.live_reason() {
             return Some(reason);
         }
@@ -2122,6 +2412,17 @@ impl OrganizeIncomingState {
     /// files with their destinations, the destination preview and the progress
     /// and report dock.
     pub fn view(&mut self, ui: &mut egui::Ui, jobs: &mut Jobs) {
+        self.begin_rematch(jobs);
+        let target = self.focus.map(|item| (self.scan_generation, item));
+        if target != self.media_target {
+            let item = self.focus.and_then(|index| {
+                self.scanned
+                    .as_ref()
+                    .and_then(|scan| scan.analysis.items.get(index))
+            });
+            self.media.set_item(item, self.scan_generation);
+            self.media_target = target;
+        }
         if self.patterns.is_none() && !self.load_attempted {
             self.begin_load_patterns(jobs);
         }
@@ -2272,7 +2573,18 @@ impl OrganizeIncomingState {
                 .default_size(250.0)
                 .min_size(120.0)
                 .max_size(destination_max)
-                .show(ui, |ui| self.destination_dock(ui));
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.media_tab, false, "Destination");
+                        ui.selectable_value(&mut self.media_tab, true, "Media");
+                    });
+                    ui.separator();
+                    if self.media_tab {
+                        self.media.ui(ui, jobs);
+                    } else {
+                        self.destination_dock(ui);
+                    }
+                });
 
             egui::Panel::left("incoming_source_pane")
                 .resizable(true)
@@ -2289,7 +2601,7 @@ impl OrganizeIncomingState {
                     .min_size(80.0)
                     .max_size(editor_max)
                     .show(ui, |ui| self.item_editor_pane(ui));
-                self.items_pane(ui);
+                self.items_pane(ui, jobs);
             });
         });
 
@@ -2840,7 +3152,7 @@ impl OrganizeIncomingState {
     /// The working list: one row per analyzed item, with its exact destination
     /// folder, type and frame count and, only when a gap exists, an orange
     /// missing-frame warning.
-    fn items_pane(&mut self, ui: &mut egui::Ui) {
+    fn items_pane(&mut self, ui: &mut egui::Ui, jobs: &mut Jobs) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Files and destinations").small().weak());
             if ui.small_button("Select all").clicked() {
@@ -2949,6 +3261,8 @@ impl OrganizeIncomingState {
                     self.sync_editor();
                 }
                 RowAction::Frames(item) => self.frames_open = Some(item),
+                RowAction::Nuke(item) => self.send_to_nuke(item, jobs),
+                RowAction::Player(item, player) => self.launch_player(item, player, jobs),
             }
         }
     }
@@ -2993,11 +3307,47 @@ impl OrganizeIncomingState {
             if response.clicked() {
                 action = Some(RowAction::Focus(row.item));
             }
-            response.on_hover_text(format!(
+            response.clone().on_hover_text(format!(
                 "{}\n{}",
                 row.source_dir.display(),
                 size_text(row.bytes)
             ));
+            let keyboard = response.has_focus()
+                && ui.input(|input| {
+                    input.key_pressed(egui::Key::Menu)
+                        || (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
+                });
+            let open = (response.secondary_clicked() || keyboard)
+                .then_some(egui::SetOpenCommand::Bool(true));
+            let mut menu = egui::Popup::menu(&response).open_memory(open);
+            if !keyboard {
+                menu = menu.at_pointer_fixed();
+            }
+            menu.show(|ui| {
+                ui.menu_button("Open in", |ui| {
+                    for player in [
+                        crate::media_player::MediaPlayer::Djv,
+                        crate::media_player::MediaPlayer::Mrv2,
+                        crate::media_player::MediaPlayer::Nuke,
+                    ] {
+                        if ui
+                            .add_enabled(!self.busy(), egui::Button::new(player.label()))
+                            .clicked()
+                        {
+                            action = Some(RowAction::Player(row.item, player));
+                            ui.close();
+                        }
+                    }
+                });
+
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new("Send to Nuke"))
+                    .clicked()
+                {
+                    action = Some(RowAction::Nuke(row.item));
+                    ui.close();
+                }
+            });
         });
         table_row.col(|ui| {
             ui.label(egui::RichText::new(&row.kind).small().color(MUTED));
@@ -3363,6 +3713,23 @@ impl OrganizeIncomingState {
     /// Scan, match and transfer progress with the real counts behind them, then
     /// the run report and every error and recovery path.
     fn progress_dock(&mut self, ui: &mut egui::Ui, jobs: &Jobs) {
+        let failed_rules = self.compiled_issues.len()
+            + self
+                .compiled
+                .as_ref()
+                .map(|c| c.bounded_issues().len())
+                .unwrap_or(0);
+        if failed_rules > 0 {
+            ui.horizontal_wrapped(|ui| {
+            ui.colored_label(WARNING, format!("{failed_rules} filename rule(s) could not run; destination review is blocked."));
+            if ui.button("Open Rules").clicked() { self.rules_open = true; }
+        });
+        }
+        if let Some(message) = &self.nuke_notice {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(message);
+            });
+        }
         let scan_job = self.scan_run.as_ref().map(|run| run.job);
         let validate_job = self.validate_run.as_ref().map(|run| run.job);
         let execute_job = self.execute_run.as_ref().map(|run| run.job);
@@ -4043,12 +4410,15 @@ impl OrganizeIncomingState {
                 });
         }
 
-        let issues = patterns.dialect_issues();
+        let mut issues = self.compiled_issues.clone();
+        if let Some(compiled) = &self.compiled {
+            issues.extend(compiled.bounded_issues());
+        }
         if !issues.is_empty() {
             ui.separator();
             ui.label(
                 egui::RichText::new(format!(
-                    "{} pattern(s) use syntax this dialect cannot run; they match as plain text instead",
+                    "{} pattern(s) could not run; fix them or explicitly choose Literal",
                     issues.len()
                 ))
                 .small()
@@ -4072,6 +4442,8 @@ enum RowAction {
     Select(usize, bool),
     Focus(usize),
     Frames(usize),
+    Nuke(usize),
+    Player(usize, crate::media_player::MediaPlayer),
 }
 
 fn size_text(bytes: u64) -> String {

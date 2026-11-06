@@ -7,10 +7,47 @@ use eframe::egui;
 struct Activity {
     id: i64,
     at: String,
-    user: String,
+    user: ActivityUser,
     action: String,
     description: String,
 }
+
+/// The identity an action was recorded for. The id is retained because a
+/// username can be removed and then recreated as a different identity, so the
+/// name alone no longer says who acted.
+struct ActivityUser {
+    id: Option<i64>,
+    /// The name stored with the action, exactly as it was recorded then.
+    recorded: String,
+    /// The name that identity has now, when its row is still in the user list.
+    current: Option<String>,
+    removed: bool,
+}
+
+impl ActivityUser {
+    fn label(&self) -> String {
+        let Some(id) = self.id else {
+            return format!(
+                "{} (user unresolved: this legacy entry recorded no user id)",
+                self.recorded
+            );
+        };
+        let mut label = format!("{} (user #{id}", self.recorded);
+        match &self.current {
+            Some(current) if *current != self.recorded => {
+                label.push_str(&format!(", now named {current}"))
+            }
+            Some(_) => {}
+            None => label.push_str(", no longer in the user list"),
+        }
+        if self.removed {
+            label.push_str(", removed");
+        }
+        label.push(')');
+        label
+    }
+}
+
 struct RunHead {
     id: i64,
     at: String,
@@ -68,8 +105,8 @@ impl HistoryWindow {
             return;
         }
         match catalog.submit(|connection| {
-            let mut activity_query = connection.prepare("SELECT id,at,username,action_type,description FROM user_activity_log ORDER BY id DESC LIMIT 1000").map_err(error)?;
-            let activity = activity_query.query_map([], |row| Ok(Activity { id: row.get(0)?, at: row.get(1)?, user: row.get(2)?, action: row.get(3)?, description: row.get(4)? })).map_err(error)?.collect::<Result<Vec<_>,_>>().map_err(error)?;
+            let mut activity_query = connection.prepare("SELECT a.id, a.at, a.user_id, a.username, u.username, u.deleted_at, a.action_type, a.description FROM user_activity_log a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.id DESC LIMIT 1000").map_err(error)?;
+            let activity = activity_query.query_map([], |row| Ok(Activity { id: row.get(0)?, at: row.get(1)?, user: ActivityUser { id: row.get(2)?, recorded: row.get(3)?, current: row.get(4)?, removed: row.get::<_, Option<String>>(5)?.is_some() }, action: row.get(6)?, description: row.get(7)? })).map_err(error)?.collect::<Result<Vec<_>,_>>().map_err(error)?;
             let mut runs_query = connection.prepare("SELECT id,started_at,kind,state FROM operation_runs ORDER BY id DESC LIMIT 500").map_err(error)?;
             let runs = runs_query.query_map([], |row| Ok(RunHead { id: row.get(0)?, at: row.get(1)?, kind: row.get(2)?, state: row.get(3)? })).map_err(error)?.collect::<Result<Vec<_>,_>>().map_err(error)?;
             Ok(Snapshot { activity, runs })
@@ -111,10 +148,10 @@ impl HistoryWindow {
             egui::ScrollArea::vertical().id_salt("history_scroll").show(ui, |ui| {
                 if let Some(snapshot) = &self.snapshot {
                     ui.collapsing("Recorded actions", |ui| {
-                        let rows: Vec<_> = snapshot.activity.iter().filter(|entry| entry.id > self.cleared_through && format!("{} {} {}", entry.user, entry.action, entry.description).to_lowercase().contains(&needle)).collect();
+                        let rows: Vec<_> = snapshot.activity.iter().filter(|entry| entry.id > self.cleared_through).map(|entry| (entry, entry.user.label())).filter(|(entry, user)| format!("{user} {} {}", entry.action, entry.description).to_lowercase().contains(&needle)).collect();
                         if rows.is_empty() { ui.label("No matching recorded actions."); }
-                        for entry in rows {
-                            ui.horizontal_wrapped(|ui| { ui.label(&entry.at); ui.label(&entry.user); ui.label(&entry.description); });
+                        for (entry, user) in rows {
+                            ui.horizontal_wrapped(|ui| { ui.label(&entry.at); ui.label(user); ui.label(&entry.description); });
                         }
                     });
                     ui.collapsing("File operations", |ui| {

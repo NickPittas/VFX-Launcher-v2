@@ -347,6 +347,10 @@ impl Ini {
     /// Raw (uninterpolated) value, section first, then `[DEFAULT]`, exactly the
     /// `ChainMap` a `ConfigParser.get` interpolates against.
     fn option(&self, section: &str, option: &str) -> Option<&str> {
+        // `optionxform` lowercases option names while parsing, so a lookup is
+        // matched case-insensitively regardless of the spelling used by the caller.
+        let option = option.to_lowercase();
+        let option = option.as_str();
         if section != DEFAULT_SECTION && !self.sections.contains_key(section) {
             return None;
         }

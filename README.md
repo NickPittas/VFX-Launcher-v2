@@ -1,9 +1,9 @@
 # VFX Project Launcher
 
-The merged Rust/egui application is now version **0.2.0**, packaged for Linux
+The merged Rust/egui application is now version **0.3.0**, packaged for Linux
 x86_64 as an AppImage. See [Linux installation and build instructions](docs/LINUX-APPIMAGE.md)
-and [0.2.0 release notes](docs/RELEASE-0.2.0.md).
-There is also a [Windows x64 portable package](docs/WINDOWS.md) with native file operations.
+and [0.3.0 release notes](docs/RELEASE-0.3.0.md).
+Version 0.2.0 also has a [Windows x64 portable package](docs/WINDOWS.md) with native file operations.
 
 The Python Windows application remains available. The sections below describe
 that legacy application.
@@ -98,7 +98,7 @@ The executable will be created at `dist/VFX_Launcher.exe` (~47 MB single file).
 ./build_appimage.sh
 ```
 This builds the merged Rust application and creates
-`artifacts/releases/VFX-Launcher-0.2.0-x86_64.AppImage` plus its SHA-256 checksum.
+`artifacts/releases/VFX-Launcher-0.3.0-x86_64.AppImage` plus its SHA-256 checksum.
 It requires the Linux build dependencies listed in
 [the packaging guide](docs/LINUX-APPIMAGE.md). Templates are embedded; PyInstaller
 and a Python environment are not used by this build.

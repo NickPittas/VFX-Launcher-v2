@@ -197,6 +197,8 @@ impl LogLevel {
 pub struct Applications {
     pub nuke_path: Option<JsonPath>,
     pub after_effects_path: Option<JsonPath>,
+    pub djv_path: Option<JsonPath>,
+    pub mrv2_path: Option<JsonPath>,
     /// Legacy Linux Nuke launch command. Tokenized at launch time (P2), never
     /// executed through a shell.
     pub nuke_launch_cmd_linux: Option<String>,

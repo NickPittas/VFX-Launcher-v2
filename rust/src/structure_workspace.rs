@@ -3341,11 +3341,12 @@ impl StructureWorkspace {
                     });
                 });
 
+                let review_max = (ui.available_height() - 220.0).clamp(100.0, 560.0);
                 egui::Panel::bottom("new_project_review")
                     .resizable(true)
                     .default_size(300.0)
-                    .min_size(140.0)
-                    .max_size(560.0)
+                    .min_size(100.0)
+                    .max_size(review_max)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Review and report").small().weak());
@@ -3639,6 +3640,8 @@ impl StructureWorkspace {
                             ui.add_space(4.0);
                             ui.separator();
                             dialog.nuke.ui(ui, editing, None);
+                            // Leave the final wrapped row fully reachable above the dock edge.
+                            ui.add_space(ui.spacing().interact_size.y);
                         });
                 });
             });

@@ -76,10 +76,26 @@ enum SettingsCommand {
 enum SettingsEvent {
     Loaded(Result<Settings, ConfigError>),
     Saved {
-        result: Result<(), ConfigError>,
+        outcome: SaveOutcome,
         settings: Settings,
         token: Option<u64>,
     },
+}
+
+/// What the settings thread could establish about one write. An atomic write can
+/// report an error after the new file already replaced the old one (a directory
+/// flush failure), so a failed save is reread before the UI decides what to keep:
+/// acknowledging exactly the attempted settings without claiming their durability
+/// is a different result from keeping the previous settings because the file holds
+/// something else.
+enum SaveOutcome {
+    /// The write reported success.
+    Saved,
+    /// The write reported an error, and a reread shows exactly the attempted
+    /// settings on disk: they are in use, with durability explicitly unconfirmed.
+    SavedUnconfirmed(String),
+    /// The write failed and the file does not hold the attempted settings.
+    Failed(String),
 }
 
 impl SettingsWorker {
@@ -93,14 +109,11 @@ impl SettingsWorker {
                 while let Ok(command) = command_rx.recv() {
                     let event = match command {
                         SettingsCommand::Load => SettingsEvent::Loaded(store.load()),
-                        SettingsCommand::Save { settings, token } => {
-                            let result = store.save(&settings);
-                            SettingsEvent::Saved {
-                                result,
-                                settings,
-                                token,
-                            }
-                        }
+                        SettingsCommand::Save { settings, token } => SettingsEvent::Saved {
+                            outcome: save_outcome(&store, &settings),
+                            settings,
+                            token,
+                        },
                     };
                     if event_tx.send(event).is_err() {
                         break;
@@ -148,11 +161,45 @@ impl SettingsWorker {
     }
 }
 
+/// One write's outcome, established on the settings thread. A save that reports an
+/// error is reread, so a rename whose directory flush failed is acknowledged as
+/// saved-with-unknown-durability instead of being reported as a lost change.
+fn save_outcome(store: &SettingsStore, settings: &Settings) -> SaveOutcome {
+    match store.save(settings) {
+        Ok(()) => SaveOutcome::Saved,
+        Err(error) => {
+            if !store.path().exists() {
+                return SaveOutcome::Failed(format!(
+                    "The settings could not be saved: {}. The settings file could not be confirmed at its path; the previously acknowledged values remain active.",
+                    error.message()
+                ));
+            }
+            match store.load() {
+                Ok(persisted) if persisted == *settings => SaveOutcome::SavedUnconfirmed(format!(
+                    "Saved, but its durability could not be confirmed: {}. The new values are in use; confirm them after restarting.",
+                    error.message()
+                )),
+                Ok(_) => SaveOutcome::Failed(format!(
+                    "The settings could not be saved: {}. The file does not hold the attempted values, so the previous settings remain active.",
+                    error.message()
+                )),
+                Err(read_error) => SaveOutcome::Failed(format!(
+                    "The settings could not be saved: {}. The file could not be read back to confirm what it holds ({}), so the previous settings remain active; check the file before restarting.",
+                    error.message(),
+                    read_error.message()
+                )),
+            }
+        }
+    }
+}
+
 /// One editable application path on the Settings page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPath {
     Nuke,
     AfterEffects,
+    Djv,
+    Mrv2,
 }
 
 /// A settings write the worker is executing. Identity writes and the Settings page
@@ -174,6 +221,8 @@ enum SettingsWrite {
 pub struct SettingsDraft {
     pub nuke_application: String,
     pub after_effects_application: String,
+    pub djv_application: String,
+    pub mrv2_application: String,
     pub nuke_launch_command: String,
     pub project_folder_names: String,
 }
@@ -192,6 +241,18 @@ impl SettingsDraft {
                 .after_effects_path
                 .as_ref()
                 .map(|path| path.as_path().display().to_string())
+                .unwrap_or_default(),
+            djv_application: settings
+                .applications
+                .djv_path
+                .as_ref()
+                .map(|p| p.as_path().display().to_string())
+                .unwrap_or_default(),
+            mrv2_application: settings
+                .applications
+                .mrv2_path
+                .as_ref()
+                .map(|p| p.as_path().display().to_string())
                 .unwrap_or_default(),
             nuke_launch_command: settings
                 .applications
@@ -224,6 +285,8 @@ impl SettingsDraft {
                     &self.after_effects_application,
                     "After Effects",
                 )?,
+                djv_path: application_path(&self.djv_application, "DJV")?,
+                mrv2_path: application_path(&self.mrv2_application, "MRV2")?,
                 nuke_launch_cmd_linux: launch_command(&self.nuke_launch_command)?,
             },
             project_discovery: ProjectDiscovery {
@@ -236,10 +299,12 @@ impl SettingsDraft {
 
     /// Text compared without rejecting anything: an invalid entry still counts as
     /// an edit instead of comparing equal to an empty field.
-    fn comparable(&self) -> (String, String, String, Vec<String>) {
+    fn comparable(&self) -> (String, String, String, String, String, Vec<String>) {
         (
             self.nuke_application.trim().to_string(),
             self.after_effects_application.trim().to_string(),
+            self.djv_application.trim().to_string(),
+            self.mrv2_application.trim().to_string(),
             self.nuke_launch_command.trim().to_string(),
             folder_names(&self.project_folder_names),
         )
@@ -255,6 +320,8 @@ impl SettingsDraft {
         match field {
             SettingsPath::Nuke => self.nuke_application = text,
             SettingsPath::AfterEffects => self.after_effects_application = text,
+            SettingsPath::Djv => self.djv_application = text,
+            SettingsPath::Mrv2 => self.mrv2_application = text,
         }
         Ok(())
     }
@@ -438,6 +505,10 @@ pub struct ProjectWorkspace {
     users_list: Vec<UserRecord>,
     user_write: Option<Pending<UserRecord>>,
     user_delete: Option<(UserId, Pending<()>)>,
+    /// A removal accepted while an accepted launch or access write still carried
+    /// the identity. It starts once those finish, so the record they owe is not
+    /// refused by a tombstoned user; until then it counts as accepted work.
+    user_delete_deferred: Option<UserId>,
     user: Option<UserRecord>,
     tab: ProjectList,
     filter_edit: String,
@@ -462,7 +533,9 @@ pub struct ProjectWorkspace {
     scan: Scan,
     launches: Vec<LaunchRequest>,
     reveals: Vec<RevealRequest>,
-    access: Vec<Pending<()>>,
+    /// Accepted file-access writes, each with the identity it was recorded for: a
+    /// removal of that identity waits for them.
+    access: Vec<(UserId, Pending<()>)>,
     favorites: Vec<FavoriteWrite>,
     removals: Vec<Pending<RemovalSummary>>,
     /// A coordinated stop started: no new request is accepted any more.
@@ -498,6 +571,7 @@ impl ProjectWorkspace {
             users_list: Vec::new(),
             user_write: None,
             user_delete: None,
+            user_delete_deferred: None,
             user: None,
             tab: ProjectList::All,
             filter_edit: String::new(),
@@ -589,10 +663,10 @@ impl ProjectWorkspace {
             match worker.events.try_recv() {
                 Ok(SettingsEvent::Loaded(result)) => loaded = Some(result),
                 Ok(SettingsEvent::Saved {
-                    result,
+                    outcome,
                     settings,
                     token,
-                }) => saved.push((result, settings, token)),
+                }) => saved.push((outcome, settings, token)),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     stopped = true;
@@ -611,8 +685,8 @@ impl ProjectWorkspace {
             }
         }
 
-        for (result, settings, token) in saved {
-            self.apply_settings_saved(result, settings, token);
+        for (outcome, settings, token) in saved {
+            self.apply_settings_saved(outcome, settings, token);
         }
 
         if stopped && self.settings_loaded && !self.closing {
@@ -648,52 +722,51 @@ impl ProjectWorkspace {
         }
     }
 
-    /// Applies one acknowledged write. An acknowledged save is the only point at
-    /// which the settings a launch reads change; a failed one leaves the previous
-    /// values active and the draft on screen for correction.
+    /// Applies one write. An acknowledged save is the only point at which the
+    /// settings a launch reads change; a failed one leaves the previous values
+    /// active and the draft on screen for correction. A write that reported an
+    /// error but stored exactly the attempted settings is acknowledged with its
+    /// durability left explicitly unconfirmed.
     fn apply_settings_saved(
         &mut self,
-        result: Result<(), ConfigError>,
+        outcome: SaveOutcome,
         settings: Settings,
         token: Option<u64>,
     ) {
-        match result {
-            Ok(()) => {
-                // A draft that still matches the old acknowledged settings carries
-                // no separate intent (the user cancelled while saving), so it
-                // follows the values that are now on disk.
-                let draft_was_clean = self
-                    .settings_draft
-                    .as_ref()
-                    .is_some_and(|draft| !draft.is_dirty(&self.settings));
-                // Only the fields this write owned are installed. An identity
-                // change can arrive while the draft write is in flight, and it is
-                // persisted by the identity write queued behind it, so installing
-                // the whole snapshot would silently undo the newer choice.
-                match token {
-                    Some(_) => {
-                        self.settings.applications = settings.applications;
-                        self.settings.project_discovery = settings.project_discovery;
-                    }
-                    None if !self.settings_identity_queued => {
-                        self.settings.selected_username = settings.selected_username
-                    }
-                    None => {}
+        let (acknowledged, warning) = match outcome {
+            SaveOutcome::Saved => (true, None),
+            SaveOutcome::SavedUnconfirmed(warning) => (true, Some(warning)),
+            SaveOutcome::Failed(message) => (false, Some(message)),
+        };
+        if acknowledged {
+            // A draft that still matches the old acknowledged settings carries
+            // no separate intent (the user cancelled while saving), so it
+            // follows the values that are now on disk.
+            let draft_was_clean = self
+                .settings_draft
+                .as_ref()
+                .is_some_and(|draft| !draft.is_dirty(&self.settings));
+            // Only the fields this write owned are installed. An identity
+            // change can arrive while the draft write is in flight, and it is
+            // persisted by the identity write queued behind it, so installing
+            // the whole snapshot would silently undo the newer choice.
+            match token {
+                Some(_) => {
+                    self.settings.applications = settings.applications;
+                    self.settings.project_discovery = settings.project_discovery;
                 }
-                self.settings_save_error = None;
-                if token.is_some() && draft_was_clean {
-                    if let Some(draft) = &mut self.settings_draft {
-                        *draft = SettingsDraft::from_settings(&self.settings);
-                    }
+                None if !self.settings_identity_queued => {
+                    self.settings.selected_username = settings.selected_username
                 }
+                None => {}
             }
-            Err(error) => {
-                self.settings_save_error = Some(format!(
-                    "The settings could not be saved: {}",
-                    error.message()
-                ));
+            if token.is_some() && draft_was_clean {
+                if let Some(draft) = &mut self.settings_draft {
+                    *draft = SettingsDraft::from_settings(&self.settings);
+                }
             }
         }
+        self.settings_save_error = warning;
         if matches!(
             (self.settings_in_flight, token),
             (Some(SettingsWrite::Draft(_)), Some(_)) | (Some(SettingsWrite::Identity), None)
@@ -798,6 +871,8 @@ impl ProjectWorkspace {
         let title = match field {
             SettingsPath::Nuke => "Select the Nuke application",
             SettingsPath::AfterEffects => "Select the After Effects application",
+            SettingsPath::Djv => "Select the DJV application",
+            SettingsPath::Mrv2 => "Select the MRV2 application",
         };
         let worker = std::thread::Builder::new()
             .name("vfx-settings-dialog".to_string())
@@ -855,8 +930,13 @@ impl ProjectWorkspace {
         }
     }
 
+    /// Queues the identity write. Queueing is allowed while closing on purpose: an
+    /// identity change acknowledged during the coordinated stop must still reach
+    /// the file, and the close-time flush persists it once the user writes it
+    /// followed have drained. Issuing stays refused during closing, so that flush
+    /// remains the single writer.
     fn save_settings(&mut self) {
-        if !self.settings_loaded || self.closing {
+        if !self.settings_loaded {
             return;
         }
         self.settings_identity_queued = true;
@@ -1103,6 +1183,17 @@ impl ProjectWorkspace {
         if !self.actions_enabled() || self.users_busy() {
             return;
         }
+        if let Some(pending) = self.user_delete_deferred {
+            if pending == id {
+                return;
+            }
+            self.push_notice(Notice {
+                title: "Another name removal is already waiting for accepted launches.".into(),
+                detail: Some("Wait for it to finish before removing another name.".into()),
+                error: true,
+            });
+            return;
+        }
         if self.users_list.len() <= 1 || self.user.as_ref().is_some_and(|user| user.id == id) {
             self.push_notice(Notice {
                 title: "Choose another user before removing this name.".into(),
@@ -1113,13 +1204,69 @@ impl ProjectWorkspace {
             });
             return;
         }
+        if self.removal_waits_for(id) {
+            self.user_delete_deferred = Some(id);
+            self.push_notice(Notice {
+                title: "Removing this user waits for accepted launches.".into(),
+                detail: Some(
+                    "A launch or file-access record accepted for this name has not finished, and that record needs the name. The removal starts as soon as it does."
+                        .into(),
+                ),
+                error: false,
+            });
+            return;
+        }
+        self.issue_user_delete(id);
+    }
+
+    /// True while accepted work still carries this identity.
+    fn removal_waits_for(&self, id: UserId) -> bool {
+        self.launches.iter().any(|launch| launch.user == id)
+            || self.access.iter().any(|(user, _)| *user == id)
+            || (self.registration_busy() && self.registration_user == Some(id))
+    }
+
+    fn issue_user_delete(&mut self, id: UserId) {
         let Some(catalog) = &self.catalog else {
+            self.user_delete_deferred = None;
+            self.push_notice(Notice {
+                title: "The user was not removed.".into(),
+                detail: Some("The catalog is no longer open.".into()),
+                error: true,
+            });
             return;
         };
         match catalog.delete_user(id) {
             Ok(pending) => self.user_delete = Some((id, pending)),
             Err(error) => self.push_notice(notice_from_error("User", &error)),
         }
+    }
+
+    /// Starts a deferred removal once nothing accepted still carries the identity,
+    /// and drops it only for a reason the user can read.
+    fn issue_deferred_user_delete(&mut self) {
+        let Some(id) = self.user_delete_deferred else {
+            return;
+        };
+        if self.users_busy() || self.removal_waits_for(id) {
+            return;
+        }
+        self.user_delete_deferred = None;
+        if self.user.as_ref().is_some_and(|user| user.id == id)
+            || self.users_list.len() <= 1
+            || !self.users_list.iter().any(|user| user.id == id)
+        {
+            self.push_notice(Notice {
+                title: "The user was not removed.".into(),
+                detail: Some(
+                    "The name is now the current user, is the last user, or is no longer in the user list. Earlier history is retained."
+                        .into(),
+                ),
+                error: false,
+            });
+            return;
+        }
+        self.issue_user_delete(id);
     }
 
     fn poll_user_changes(&mut self) {
@@ -1161,6 +1308,7 @@ impl ProjectWorkspace {
                 ReplyState::Finished => {}
             }
         }
+        self.issue_deferred_user_delete();
     }
 
     // ---------------------------------------------------------------- projects
@@ -1959,7 +2107,7 @@ impl ProjectWorkspace {
         };
         match crate::projects::log_file_access(catalog, user, file) {
             Ok(pending) => {
-                self.access.push(pending);
+                self.access.push((user, pending));
                 // Kept until answered: dropping a reply would lose a write failure.
                 self.ctx.request_repaint_after(Duration::from_millis(40));
             }
@@ -1972,7 +2120,7 @@ impl ProjectWorkspace {
     fn poll_access(&mut self) {
         let mut index = 0;
         while index < self.access.len() {
-            let reply = self.access[index].try_poll();
+            let reply = self.access[index].1.try_poll();
             match reply {
                 ReplyState::Waiting => index += 1,
                 ReplyState::Ready(()) => {
@@ -2118,6 +2266,7 @@ impl ProjectWorkspace {
         !self.launches.is_empty()
             || !self.reveals.is_empty()
             || !self.access.is_empty()
+            || self.user_delete_deferred.is_some()
             || self.settings_browse.is_some()
             || self.users_busy()
             || !self.removals.is_empty()

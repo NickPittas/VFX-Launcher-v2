@@ -229,6 +229,8 @@ impl eframe::App for VfxLauncherApp {
             self.workspace.user().map(|user| user.id),
             &mut self.jobs,
         );
+        self.incoming
+            .set_media_applications(self.workspace.settings().applications.clone());
         self.incoming.poll(
             self.workspace.catalog_client().as_ref(),
             self.workspace.user().map(|user| user.id),
@@ -477,6 +479,8 @@ impl VfxLauncherApp {
                             }
                             if self.incoming.is_ai_job(job.id) {
                                 ui.label("Waiting for Pi");
+                            } else if self.incoming.is_nuke_job(job.id) {
+                                ui.label("Waiting for Nuke");
                             } else if job.paused || job.pause_requested {
                                 if ui.button("Resume").clicked() {
                                     resume = Some(job.id);
@@ -670,12 +674,7 @@ impl VfxLauncherApp {
             );
         }
         if let Some(error) = self.workspace.settings_save_error() {
-            notice_row(
-                ui,
-                "The settings file could not be saved.",
-                Some(error),
-                true,
-            );
+            notice_row(ui, "Settings save notice", Some(error), true);
         }
         if self.workspace.user().is_none()
             && self.workspace.catalog_error().is_none()
@@ -1017,6 +1016,31 @@ impl VfxLauncherApp {
                     }
                     edited |= effects_edited;
                     ui.end_row();
+                    for (label, field, target) in [
+                        (
+                            "DJV application",
+                            &mut draft.djv_application,
+                            SettingsPath::Djv,
+                        ),
+                        (
+                            "MRV2 application",
+                            &mut draft.mrv2_application,
+                            SettingsPath::Mrv2,
+                        ),
+                    ] {
+                        let (picked, changed) = settings_path_row(
+                            ui,
+                            label,
+                            field,
+                            "Application path or program name",
+                            !browse_open && !saving,
+                        );
+                        if picked {
+                            browse = Some(target);
+                        }
+                        edited |= changed;
+                        ui.end_row();
+                    }
                     ui.label("Nuke launch command (Linux)");
                     edited |= ui
                         .add(

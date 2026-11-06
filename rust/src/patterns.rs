@@ -41,10 +41,22 @@
 //! - rule paths are split into segments on both separators and validated, so
 //!   an imported `..` or drive-absolute rule is refused instead of escaping the
 //!   destination root at join time;
-//! - the regex dialect difference is reported instead of being invisible: a
-//!   Python-only construct (look-around, backtracking reference) is listed as an
-//!   actionable issue for the affected rule while the literal fallback keeps
-//!   the legacy behavior;
+//! - the expressions are compiled by a backtracking engine, not by the linear
+//!   automaton alone, so a pattern the legacy tool accepted keeps its meaning:
+//!   look-around, backreferences (`\1`, `\k<name>`, `(?P=name)`), named groups
+//!   (`(?P<name>…)`), atomic groups and the `\A`/`\Z` anchors all run. Search
+//!   semantics are unchanged: `re.search` first at the leftmost position, and
+//!   group 0 is the value a shot/version/resolution rule reports;
+//! - that engine is bounded. Every expression is built with an explicit
+//!   compile-size limit and an explicit backtracking-step limit, so a
+//!   pathological rule cannot stall a worker and the UI thread never runs one.
+//!   A rule that hits the step limit matches nothing *for that filename* and is
+//!   reported by [`CompiledPatterns::bounded_issues`]; its text is never
+//!   reinterpreted as plain text and never rewritten;
+//! - a pattern the engine refuses to compile is reported and then matches
+//!   nothing. It is not converted into a plain-text comparison: switching an
+//!   expression to containment changes what it means, so that step stays the
+//!   user's explicit choice through `RuleMode::Literal`;
 //! - the pattern file gains one additive `ruleModes` object so a rule the user
 //!   marked literal stays literal across a save. The reference loader reads only
 //!   the six pattern keys, so the extra object is ignored there;
@@ -62,8 +74,10 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use regex::{Regex, RegexBuilder};
+use fancy_regex::{Regex, RegexBuilder};
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -718,7 +732,8 @@ impl PatternRule {
     }
 }
 
-/// One actionable problem with a pattern in this dialect.
+/// One actionable problem with a rule: syntax this dialect refuses, or an
+/// expression that hit the bounded execution limit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DialectIssue {
     pub kind: TagKind,
@@ -863,14 +878,15 @@ impl PatternSet {
         }
         compile_rule(rule).err().map(|error| {
             format!(
-                "{error}; kept as a literal match like the reference fallback — rewrite it for this dialect to use captures"
+                "{error}; this rule is skipped until it is rewritten for this dialect or marked Literal — it is not matched as plain text"
             )
         })
     }
 
-    /// Compiles every pattern once. Literal rules and expressions this dialect
-    /// cannot compile become literal matchers, which reproduces the reference
-    /// `re.error` fallback without re-compiling per file.
+    /// Compiles every pattern once, so a directory of thousands of members still
+    /// pays for parsing each expression only once. Explicit literal rules are
+    /// containment matchers; an expression the engine refuses is reported by
+    /// [`Self::dialect_issues`] and matches nothing.
     pub fn compile(&self) -> CompiledPatterns {
         let mut task: Vec<(String, Vec<CompiledRule>)> = Vec::new();
         for rule in &self.task {
@@ -1111,39 +1127,58 @@ where
     deserializer.deserialize_map(Lists)
 }
 
-/// One compiled pattern: a cached expression, or the literal fallback.
+/// One compiled pattern: a cached expression, an explicit literal rule, or an
+/// expression the engine refused (which matches nothing).
 #[derive(Clone, Debug)]
 struct CompiledRule {
     text: String,
     matcher: Matcher,
+    /// Set when running this rule hit the engine's bounded execution limit. It
+    /// describes the pattern, not one filename, so it stays set and is reported
+    /// by [`CompiledPatterns::bounded_issues`].
+    bounded: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
 enum Matcher {
+    /// A compiled expression. `is_match`/`find` are searches, like `re.search`:
+    /// the first match may start anywhere in the filename.
     Regex(Regex),
+    /// Explicit literal mode: case-insensitive containment of the rule text.
     Literal(String),
+    /// The engine refused the expression. It matches nothing and the rule is
+    /// reported; the text is never reinterpreted as containment.
+    Unsupported,
 }
 
 impl CompiledRule {
     fn new(rule: &PatternRule) -> Self {
-        match compile_rule(rule) {
-            Ok(regex) => Self {
-                text: rule.text.clone(),
-                matcher: Matcher::Regex(regex),
+        let matcher = match rule.mode {
+            RuleMode::Literal => Matcher::Literal(rule.text.to_lowercase()),
+            RuleMode::Regex => match compile_rule(rule) {
+                Ok(regex) => Matcher::Regex(regex),
+                Err(_) => Matcher::Unsupported,
             },
-            Err(_) => Self {
-                text: rule.text.clone(),
-                // The reference `re.error` branch compares lowercased text.
-                matcher: Matcher::Literal(rule.text.to_lowercase()),
-            },
+        };
+        Self {
+            text: rule.text.clone(),
+            matcher,
+            bounded: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// The reference "regex" answer: group 0 of the search.
+    /// The reference "regex" answer: whether the expression matched anywhere.
     fn matched(&self, filename: &str) -> bool {
         match &self.matcher {
-            Matcher::Regex(regex) => regex.is_match(filename),
+            Matcher::Regex(regex) => match regex.is_match(filename) {
+                Ok(matched) => matched,
+                Err(_) => {
+                    self.stop_on_bound();
+                    false
+                }
+            },
             Matcher::Literal(folded) => filename.to_lowercase().contains(folded),
+            Matcher::Unsupported => false,
         }
     }
 
@@ -1153,15 +1188,29 @@ impl CompiledRule {
     }
 
     /// The reference regex answer for shot/version/resolution: the matched
-    /// substring, or the pattern text when the literal fallback matched.
+    /// substring, or the pattern text when an explicit literal rule matched.
     fn value_on_match(&self, filename: &str) -> Option<String> {
         match &self.matcher {
-            Matcher::Regex(regex) => regex.find(filename).map(|hit| hit.as_str().to_string()),
+            Matcher::Regex(regex) => match regex.find(filename) {
+                Ok(hit) => hit.map(|hit| hit.as_str().to_string()),
+                Err(_) => {
+                    self.stop_on_bound();
+                    None
+                }
+            },
             Matcher::Literal(folded) => filename
                 .to_lowercase()
                 .contains(folded)
                 .then(|| self.text.clone()),
+            Matcher::Unsupported => None,
         }
+    }
+
+    /// Records that the bound stopped this rule. The runtime limit is not a
+    /// reason to invent a different meaning for the expression, so the filename
+    /// simply gets no answer from this rule.
+    fn stop_on_bound(&self) {
+        self.bounded.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1169,13 +1218,26 @@ fn compile_rules(rules: &[PatternRule]) -> Vec<CompiledRule> {
     rules.iter().map(CompiledRule::new).collect()
 }
 
+/// Backtracking steps allowed for one rule against one filename. A rule is
+/// attempted at most once per filename and filenames are a few hundred bytes, so
+/// a legitimate look-around or backreference expression needs a small fraction of
+/// this. Reaching it never changes the pattern: the rule has no answer for that
+/// filename and is reported instead.
+const BACKTRACK_LIMIT: usize = 200_000;
+
+/// Compile bounds, in delegated-automaton bytes and VM instructions. A pattern
+/// that needs more is refused and reported rather than turning the configuration
+/// load into an unbounded compile.
+const DELEGATE_SIZE_LIMIT: usize = 1 << 20;
+const MAX_PROGRAM_SIZE: usize = 20_000;
+
 fn compile_rule(rule: &PatternRule) -> Result<Regex, String> {
-    if rule.mode == RuleMode::Literal {
-        return Err("this rule is marked literal".to_string());
-    }
     // The reference compiled every pattern with `re.IGNORECASE`.
     RegexBuilder::new(&rule.text)
         .case_insensitive(true)
+        .delegate_size_limit(DELEGATE_SIZE_LIMIT)
+        .max_prog_size(MAX_PROGRAM_SIZE)
+        .backtrack_limit(BACKTRACK_LIMIT)
         .build()
         .map_err(|error| {
             error
@@ -1199,6 +1261,40 @@ pub struct CompiledPatterns {
 }
 
 impl CompiledPatterns {
+    /// Rules that hit the bounded execution limit while matching. Each one
+    /// answered "no match" for the affected filenames; no expression was
+    /// rewritten and no rule was converted to plain text.
+    pub fn bounded_issues(&self) -> Vec<DialectIssue> {
+        let mut issues = Vec::new();
+        let mut collect = |kind: TagKind, task: Option<String>, rule: &CompiledRule| {
+            if rule.bounded.load(Ordering::Relaxed) {
+                issues.push(DialectIssue {
+                    kind,
+                    task,
+                    text: rule.text.clone(),
+                    message: bounded_message(),
+                });
+            }
+        };
+        for (kind, rules) in [
+            (TagKind::Shot, &self.shot),
+            (TagKind::Stage, &self.stage),
+            (TagKind::Asset, &self.asset),
+            (TagKind::Resolution, &self.resolution),
+            (TagKind::Version, &self.version),
+        ] {
+            for rule in rules {
+                collect(kind, None, rule);
+            }
+        }
+        for (label, rules) in &self.task {
+            for rule in rules {
+                collect(TagKind::Task, Some(label.clone()), rule);
+            }
+        }
+        issues
+    }
+
     /// Extracts every category from one filename. Only the filename is
     /// consulted, per the reference rule.
     pub fn extract(&self, filename: &str) -> TagSet {
@@ -1215,6 +1311,12 @@ impl CompiledPatterns {
             version: first_value(&self.version, filename),
         }
     }
+}
+
+fn bounded_message() -> String {
+    format!(
+        "stopped at the bounded execution limit ({BACKTRACK_LIMIT} backtracking steps per filename) and matched nothing there — the expression is unchanged; simplify it, or mark it Literal if plain-text matching is what was meant"
+    )
 }
 
 fn first_value(rules: &[CompiledRule], filename: &str) -> Option<String> {

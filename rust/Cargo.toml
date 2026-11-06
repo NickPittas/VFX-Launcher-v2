@@ -1,6 +1,6 @@
 [package]
 name = "vfx-launcher"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "VFX Launcher desktop application (Rust/egui migration)"
@@ -39,12 +39,11 @@ encoding_rs = "=0.8.35"
 # not a hand-written quote parser, and never a shell.
 shlex = "=2.0.1"
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
-# I5 Incoming patterns: patterns.json entries are real Python-dialect regular
-# expressions (captures, inline flags, alternation) that must keep working, so
-# the port compiles them with the standard Rust engine instead of a hand-written
-# matcher. `regex` has no backtracking or lookaround; unsupported constructs are
-# reported as actionable import errors rather than silently matching nothing.
-regex = "=1.12.2"
+# Python-style lookarounds and backreferences; patterns.rs bounds VM work.
+fancy-regex = "=0.20.0"
+
+# Native image previews work without an external decoder; FFmpeg handles other formats.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "hdr"] }
 
 # U1 "Add existing folder": native folder picker, always on a worker thread, never
 # in a frame. Linux selects rfd's GTK3 backend because the desktop portal has no

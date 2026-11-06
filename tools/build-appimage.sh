@@ -48,7 +48,7 @@ mkdir -p "$appdir/usr/share/X11"
 cp -a /usr/share/X11/locale "$appdir/usr/share/X11/locale"
 mkdir -p "$appdir/usr/lib/gio/modules" "$appdir/usr/share/doc/vfx-launcher"
 printf '\nX-AppImage-Version=%s\n' "$version" >> "$appdir/usr/share/applications/vfx-launcher.desktop"
-install -m644 docs/RELEASE-0.2.0.md "$appdir/usr/share/doc/vfx-launcher/RELEASE.md"
+install -m644 "docs/RELEASE-$version.md" "$appdir/usr/share/doc/vfx-launcher/RELEASE.md"
 # Retain the copyright notices supplied with the Ubuntu build dependencies.
 for notice in /usr/share/doc/*/copyright; do
     package=$(basename "$(dirname "$notice")")

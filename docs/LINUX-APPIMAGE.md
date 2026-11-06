@@ -1,16 +1,16 @@
 # Linux AppImage
 
-The Rust application is distributed as `VFX-Launcher-0.2.0-x86_64.AppImage`.
+The Rust application is distributed as `VFX-Launcher-0.3.0-x86_64.AppImage`.
 No Python checkout or Rust installation is required to run it.
 
 ```sh
-chmod +x VFX-Launcher-0.2.0-x86_64.AppImage
-./VFX-Launcher-0.2.0-x86_64.AppImage
+chmod +x VFX-Launcher-0.3.0-x86_64.AppImage
+./VFX-Launcher-0.3.0-x86_64.AppImage
 ```
 
 `--version`, `--help`, `--data-dir /absolute/path` and the backup CLI are available
 through the same AppImage. On systems without working FUSE, use
-`APPIMAGE_EXTRACT_AND_RUN=1 ./VFX-Launcher-0.2.0-x86_64.AppImage`.
+`APPIMAGE_EXTRACT_AND_RUN=1 ./VFX-Launcher-0.3.0-x86_64.AppImage`.
 
 The compatibility build uses Ubuntu 22.04 libraries (glibc 2.35), x86_64 and a
 desktop OpenGL driver. File transfers require Linux 5.6+ and filesystems that
@@ -19,8 +19,8 @@ already be mounted. Nuke, Pi and file managers are launched with their original
 host library/GTK environment. No bundled library paths are installed globally.
 
 Keep the `.sha256` file beside the AppImage and run
-`sha256sum --check VFX-Launcher-0.2.0-x86_64.AppImage.sha256` to verify it.
-See [release notes](RELEASE-0.2.0.md) for current limitations.
+`sha256sum --check VFX-Launcher-0.3.0-x86_64.AppImage.sha256` to verify it.
+See [release notes](RELEASE-0.3.0.md) for current limitations.
 
 ## Build
 

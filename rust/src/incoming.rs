@@ -570,6 +570,7 @@ fn path_bytes(path: &Path) -> &[u8] {
 }
 
 struct FrameInfo {
+    span: std::ops::Range<usize>,
     prefix: String,
     suffix: String,
     frame: i64,
@@ -642,7 +643,9 @@ fn extract_frame_info(name: &str) -> Option<FrameInfo> {
         if frame > 999_999 {
             continue;
         }
+        let start = candidate.prefix.len() + 1;
         return Some(FrameInfo {
+            span: start..start + candidate.digits.len(),
             prefix,
             // The legacy `base_name` + suffix pair re-joins as
             // `base.####.exr`: the suffix keeps its leading dot, and ASCII
@@ -1326,4 +1329,44 @@ fn resolved_key(path: &Path, what: &str) -> Result<paths::PathKey, String> {
         .map_err(|error| format!("the {what} cannot be resolved through links: {error}"))?;
     paths::path_key(&resolved, &resolved)
         .map_err(|error| format!("the resolved {what} is unusable: {error}"))
+}
+
+/// A verified Nuke frame token from actual member names, never the display label.
+pub fn nuke_sequence_path(sequence: &IncomingSequence) -> Result<PathBuf, String> {
+    sequence_pattern_path(sequence, &"#".repeat(sequence.padding))
+}
+
+/// Reuse the same verified frame span for each external player's notation.
+pub fn sequence_pattern_path(sequence: &IncomingSequence, token: &str) -> Result<PathBuf, String> {
+    if !sequence.duplicate_frames.is_empty() || sequence.pattern.is_none() {
+        return Err("This sequence has duplicate frames or mixed filename patterns; choose a single file instead.".into());
+    }
+    let first = sequence
+        .members
+        .first()
+        .ok_or("This sequence has no frame files.")?;
+    let name = first
+        .file
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Nuke needs a UTF-8 filename.")?;
+    let info = extract_frame_info(name).ok_or("The sequence frame digits cannot be identified.")?;
+    let before = &name[..info.span.start];
+    let after = &name[info.span.end..];
+    for member in &sequence.members {
+        let expected = format!(
+            "{before}{:0width$}{after}",
+            member.frame,
+            width = sequence.padding
+        );
+        if member.file.path.parent() != Some(sequence.directory.as_path())
+            || member.file.path.file_name().and_then(|n| n.to_str()) != Some(expected.as_str())
+        {
+            return Err(
+                "The actual frame filenames do not share one unambiguous Nuke pattern.".into(),
+            );
+        }
+    }
+    Ok(sequence.directory.join(format!("{before}{token}{after}")))
 }

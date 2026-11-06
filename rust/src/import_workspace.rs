@@ -1,6 +1,6 @@
 //! Explicit prepare, inspect, and adopt flow; source data is never modified.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui;
@@ -45,6 +45,10 @@ enum Reply {
     Adopted(Result<(), String>),
 }
 
+/// Result text for a selection stopped before the workspace selector is written.
+const CANCELLED_ADOPT: &str =
+    "Selecting the imported workspace was cancelled; the current workspace selection is unchanged.";
+
 pub struct ImportWorkspace {
     data_root: PathBuf,
     database: PathField,
@@ -56,6 +60,72 @@ pub struct ImportWorkspace {
     reviewed: bool,
     adopted: bool,
     message: Option<String>,
+}
+
+/// Proves the prepared workspace can be opened before the selector points at it:
+/// the staged settings must load and the staged catalog must open, answer an
+/// `info` request and close again. Nothing is written until all of that succeeds,
+/// so a preparation this build cannot open is reported instead of being selected.
+fn verify_staged_workspace(data_root: &Path, directory: &Path) -> Result<(), String> {
+    let relative = directory
+        .strip_prefix(data_root)
+        .map_err(|_| "The prepared workspace is outside the application data folder.")?;
+    crate::paths::validate_destination(data_root, relative).map_err(|error| error.to_string())?;
+    let mut held = Vec::new();
+    for name in ["settings.json", "catalog.sqlite3"] {
+        let path = directory.join(name);
+        crate::paths::validate_destination(directory, Path::new(name))
+            .map_err(|error| error.to_string())?;
+        let file = std::fs::File::open(&path).map_err(|error| {
+            format!("The prepared {name} is missing or unreadable: {error}. Nothing was selected.")
+        })?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("The prepared {name} is not a regular file."));
+        }
+        let identity = crate::paths::FileIdentity::from_file(&file)
+            .ok_or("The prepared file identity could not be established.")?;
+        held.push((path, file, identity));
+    }
+    crate::config::SettingsStore::new(directory.join("settings.json"))
+        .load()
+        .map_err(|error| {
+            format!(
+                "The prepared workspace settings cannot be read: {}. The current workspace selection is unchanged.",
+                error.message()
+            )
+        })?;
+    let catalog = crate::storage::Catalog::open(directory.join("catalog.sqlite3"))
+        .map_err(|error| {
+            format!(
+                "The prepared workspace catalog cannot be opened: {}. The current workspace selection is unchanged.",
+                error.message()
+            )
+        })?;
+    let probed = catalog
+        .info()
+        .map_err(|error| error.message().to_string())
+        .and_then(|info| {
+            info.wait()
+                .map(|_| ())
+                .map_err(|error| error.message().to_string())
+        });
+    catalog.shutdown().join();
+    for (path, _file, identity) in held {
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("A prepared file disappeared during verification: {error}"))?;
+        let fresh = crate::paths::FileIdentity::from_path(&path, &metadata);
+        if !fresh
+            .as_ref()
+            .is_some_and(|fresh| identity.same_file(fresh))
+        {
+            return Err("A prepared file was replaced during verification; the current workspace selection is unchanged.".into());
+        }
+    }
+    probed.map_err(|message| {
+        format!(
+            "The prepared workspace catalog did not open: {message}. The current workspace selection is unchanged."
+        )
+    })
 }
 
 impl ImportWorkspace {
@@ -100,6 +170,9 @@ impl ImportWorkspace {
         self.worker = None;
         match reply {
             Reply::Picked(kind, paths) => {
+                // A cancelled dialog returns no path at all. It is not a choice and
+                // must not discard a prepared import whose report was already read.
+                let picked = !paths.is_empty();
                 match kind {
                     Pick::Database => {
                         if let Some(path) = paths.into_iter().next() {
@@ -119,8 +192,15 @@ impl ImportWorkspace {
                         }
                     }
                 }
-                self.prepared = None;
-                self.reviewed = false;
+                if picked {
+                    self.prepared = None;
+                    self.reviewed = false;
+                } else {
+                    self.message = Some(
+                        "No file was chosen; the prepared import and your review are unchanged."
+                            .into(),
+                    );
+                }
             }
             Reply::Prepared(result) => match result {
                 Ok(prepared) => {
@@ -230,9 +310,21 @@ impl ImportWorkspace {
         let root = self.data_root.clone();
         let (tx, rx) = channel();
         match jobs.start(ui.ctx(), "Select imported workspace", move |context| {
-            let result = if context.control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
-                Err("Selecting the imported workspace was cancelled.".to_string())
-            } else {
+            let mut cancelled = false;
+            let result = (|| {
+                if context.control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                    cancelled = true;
+                    return Err(CANCELLED_ADOPT.to_string());
+                }
+                verify_staged_workspace(&root, &directory)?;
+                // Verification reads the prepared workspace, so it can be stopped
+                // while it runs; the selector is written only after the last
+                // checkpoint, so a cancellation reported as such really stopped
+                // before it.
+                if context.control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                    cancelled = true;
+                    return Err(CANCELLED_ADOPT.to_string());
+                }
                 crate::config::adopt_workspace(&root, &directory).map_err(|error| {
                     match crate::config::resolve_workspace(&root) {
                         Ok(selected) if selected == directory => format!("The new workspace selection was saved, but its durability could not be confirmed: {error}. Keep the prepared folder; the next launch currently selects it."),
@@ -240,8 +332,16 @@ impl ImportWorkspace {
                         Err(read_error) => format!("The workspace selection cannot be read after the write error: {error}. Read error: {read_error}. Keep both workspaces; resolve the selection error before restarting."),
                     }
                 })
+            })();
+            // A cancellation that arrives after the selection was saved does not
+            // rewrite that result: a saved selection stays a success.
+            let outcome = if result.is_ok() {
+                JobOutcome::Succeeded
+            } else if cancelled {
+                JobOutcome::Cancelled
+            } else {
+                JobOutcome::Failed
             };
-            let outcome = if result.is_ok() { JobOutcome::Succeeded } else { JobOutcome::Failed };
             let _ = tx.send(Reply::Adopted(result));
             context.events.finish(outcome, JobProgress::default());
         }) {
