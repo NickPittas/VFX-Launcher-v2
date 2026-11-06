@@ -35,7 +35,9 @@ use crate::incoming::{
     self, IncomingAnalysis, IncomingItem, IncomingPlanRequest, ItemEdit, MappingProposal,
     SingleKind,
 };
-use crate::jobs::{JobContext, JobId, JobOutcome, JobPhase, JobProgress, JobStatus, Jobs};
+use crate::jobs::{
+    Checkpoint, JobContext, JobControl, JobId, JobOutcome, JobPhase, JobProgress, JobStatus, Jobs,
+};
 use crate::patterns::{
     CompiledPatterns, IncomingProfile, IncomingRule, MappingState, PatternRule, PatternSet,
     PatternStore, ProfileSet, RuleMode, TagEdits, TagKind,
@@ -64,6 +66,12 @@ const POLICIES: [ConflictPolicy; 4] = [
 /// inventory, so a huge root cannot stall the page.
 const PREVIEW_MAX_DEPTH: usize = 8;
 const PREVIEW_MAX_ENTRIES: usize = 4000;
+/// How many reviewed items or preview entries pass between two cancellation
+/// checkpoints in a UI worker.
+const CHECKPOINT_STRIDE: usize = 64;
+/// Reply of a validation the user cancelled before it finished.
+const CANCELLED_VALIDATION: &str =
+    "The validation was cancelled before it finished; validate the selection again.";
 /// Longest list of missing frame numbers spelled out in one row.
 const MISSING_FRAMES_SHOWN: usize = 6;
 /// Height of the member list inside one expanded row.
@@ -169,6 +177,11 @@ struct ConfigRun {
 struct ScanRun {
     job: JobId,
     replies: Receiver<Result<Analyzed, String>>,
+    /// Pattern revision and profile the worker matched with, so a reply taken
+    /// with rules the user has since edited is matched again instead of
+    /// installed as if it were current.
+    patterns_revision: u64,
+    profile: String,
 }
 
 /// Everything a completed scan produced for the configuration it was taken with.
@@ -191,10 +204,13 @@ struct ValidateRun {
 }
 
 /// Where one reviewed item writes, so a run report can name it after the review
-/// is gone.
+/// is gone. One label per reviewed ordinal, directories included: the journal
+/// numbers every plan item, so dropping an ordinal here would shift every later
+/// row onto the wrong source and destination.
 struct ItemLabel {
     source: PathBuf,
     destination: String,
+    directory: bool,
 }
 
 struct ExecuteRun {
@@ -228,8 +244,14 @@ struct Review {
 
 /// One destination-tree preview.
 struct PreviewRun {
-    replies: Receiver<Result<PreviewTree, String>>,
+    replies: Receiver<Result<PreviewOutcome, String>>,
     destination: String,
+}
+
+enum PreviewOutcome {
+    Tree(PreviewTree),
+    /// The worker was cancelled; nothing is installed.
+    Cancelled,
 }
 
 #[derive(Default)]
@@ -237,6 +259,9 @@ struct PreviewTree {
     /// Destination-relative display spellings and whether each is a directory.
     entries: BTreeMap<String, bool>,
     truncated: bool,
+    /// Entries read_dir could not resolve, or whose name is not UTF-8 text and
+    /// so cannot be spelled here. Counted, never invented or dropped silently.
+    unlisted: usize,
 }
 
 /// One node of the merged existing/proposed destination tree.
@@ -265,6 +290,8 @@ struct RunDone {
     progress: JobProgress,
     state: RunState,
     counts: RunCounts,
+    /// Reviewed files, excluding the directory actions the plan also carries.
+    files: usize,
     rows: Vec<ReportRow>,
     warnings: Vec<String>,
     recovery: Vec<String>,
@@ -908,7 +935,6 @@ impl OrganizeIncomingState {
                 self.edits.clear();
                 self.expanded.clear();
                 self.selected = (0..analyzed.analysis.items.len()).collect();
-                self.proposals = analyzed.proposals;
                 self.scanned = Some(ScanResult {
                     snapshot: analyzed.snapshot,
                     analysis: analyzed.analysis,
@@ -916,7 +942,18 @@ impl OrganizeIncomingState {
                 self.folder_scope = None;
                 self.scan_error = None;
                 self.message = None;
-                self.rebuild_rows();
+                let current_profile = self.active_profile().map(|profile| profile.name.clone());
+                let fresh = run.patterns_revision == self.patterns_revision
+                    && current_profile.as_deref() == Some(run.profile.as_str());
+                if fresh {
+                    self.proposals = analyzed.proposals;
+                    self.rebuild_rows();
+                } else {
+                    // The rules or the chosen layout changed while the scan ran.
+                    // Match the accepted analysis with the rules in force now
+                    // instead of installing routing the user has already edited.
+                    self.rematch();
+                }
                 self.preview_requested = true;
             }
             Err(message) => {
@@ -1031,6 +1068,7 @@ impl OrganizeIncomingState {
                     progress: report_progress(&report),
                     state: report.summary.state,
                     counts: report.summary.counts,
+                    files: file_labels(&run.labels),
                     rows,
                     warnings,
                     recovery,
@@ -1063,7 +1101,11 @@ impl OrganizeIncomingState {
             }
         };
         match result {
-            Ok(tree) => {
+            Ok(PreviewOutcome::Cancelled) => {
+                // Cancelled: install nothing and keep whatever tree is already
+                // shown for this destination instead of claiming a failure.
+            }
+            Ok(PreviewOutcome::Tree(tree)) => {
                 if run.destination == self.destination.trim() {
                     self.preview = Some(tree);
                     self.preview_for = Some(run.destination);
@@ -1327,15 +1369,22 @@ impl OrganizeIncomingState {
             return;
         };
         let root = PathBuf::from(self.source.trim());
+        // The reference scanner listed every non-skipped entry and classified it
+        // afterwards, so extensionless files and unknown types stay in the scan.
+        // `^\\.` is the scanner's own hidden-name skip (`skip_patterns`); the rest
+        // of its component skips come from the analysis module. Both apply to
+        // Incoming only, never to the project or copy scans.
+        let mut excludes = incoming::scan_excludes();
+        excludes.push(".*".to_string());
         let request = ScanRequest {
             root: root.clone(),
             purpose: ScanPurpose::Incoming,
             recursive: true,
             filters: ScanFilters {
-                suffixes: incoming::scan_suffixes(),
-                mode: SuffixMode::LastExtension,
+                suffixes: Vec::new(),
+                mode: SuffixMode::MatchAll,
                 excluded_name_suffixes: Vec::new(),
-                excludes: incoming::scan_excludes(),
+                excludes,
             },
         };
         let start_title = format!(
@@ -1345,6 +1394,8 @@ impl OrganizeIncomingState {
                 .unwrap_or_else(|| root.display().to_string())
         );
         let (tx, rx) = channel();
+        let patterns_revision = self.patterns_revision;
+        let profile_name = profile.name.clone();
         let started = jobs.start(&self.ctx, start_title, move |context| {
             let JobContext {
                 control, events, ..
@@ -1409,7 +1460,12 @@ impl OrganizeIncomingState {
         });
         match started {
             Ok(job) => {
-                self.scan_run = Some(ScanRun { job, replies: rx });
+                self.scan_run = Some(ScanRun {
+                    job,
+                    replies: rx,
+                    patterns_revision,
+                    profile: profile_name,
+                });
                 self.scanned = None;
                 self.proposals.clear();
                 self.rows.clear();
@@ -1462,8 +1518,21 @@ impl OrganizeIncomingState {
         let id = format!("incoming-{revision}");
         let (tx, rx) = channel();
         let started = jobs.start(&self.ctx, "Validating selection", move |context| {
-            let JobContext { events, .. } = context;
-            let files: u64 = proposals.iter().map(|p| p.frames() as u64).sum();
+            let JobContext {
+                control, events, ..
+            } = context;
+            let mut files: u64 = 0;
+            let mut cancelled = false;
+            // Checkpoint while walking the reviewed selection: a cancelled job
+            // never reaches the planner at entry, and stops early if the user
+            // cancels mid-walk.
+            for (index, proposal) in proposals.iter().enumerate() {
+                if index % CHECKPOINT_STRIDE == 0 && control.checkpoint() == Checkpoint::Cancelled {
+                    cancelled = true;
+                    break;
+                }
+                files += proposal.frames() as u64;
+            }
             events.progress(
                 JobPhase::Validating,
                 JobProgress {
@@ -1474,17 +1543,31 @@ impl OrganizeIncomingState {
                     current: None,
                 },
             );
-            let result = incoming::plan_incoming(IncomingPlanRequest {
-                id: &id,
-                revision,
-                snapshot: &snapshot,
-                destination_root: &destination,
-                policy,
-                file_action: action,
-                proposals: &proposals,
-            })
-            .map_err(|error| describe_transfer(&error))
-            .map(|plan| transfers::validate_plan(&plan));
+            let result = if cancelled {
+                Err(CANCELLED_VALIDATION.to_string())
+            } else {
+                incoming::plan_incoming(IncomingPlanRequest {
+                    id: &id,
+                    revision,
+                    snapshot: &snapshot,
+                    destination_root: &destination,
+                    policy,
+                    file_action: action,
+                    proposals: &proposals,
+                })
+                .map_err(|error| describe_transfer(&error))
+                .map(|plan| transfers::validate_plan(&plan))
+            };
+            // Checkpoint after validation as well: a plan validated while the
+            // user was cancelling is dropped instead of being offered for
+            // execution.
+            let result = match result {
+                Ok(report) if control.checkpoint() == Checkpoint::Cancelled => {
+                    drop(report);
+                    Err(CANCELLED_VALIDATION.to_string())
+                }
+                other => other,
+            };
             let (outcome, progress) = match &result {
                 Ok(report) => {
                     let outcome = if report.counts.blocked > 0 {
@@ -1506,7 +1589,12 @@ impl OrganizeIncomingState {
                 }
                 Err(message) => {
                     events.diagnostic(JobPhase::Validating, message.clone());
-                    (JobOutcome::Failed, JobProgress::default())
+                    let outcome = if *message == CANCELLED_VALIDATION {
+                        JobOutcome::Cancelled
+                    } else {
+                        JobOutcome::Failed
+                    };
+                    (outcome, JobProgress::default())
                 }
             };
             let _ = tx.send(result);
@@ -1537,10 +1625,13 @@ impl OrganizeIncomingState {
             self.message = Some(NO_CATALOG.to_string());
             return;
         };
-        if self.user.is_none() {
+        // The run records who accepted it, so the identity is read here, on the
+        // UI thread, and travels with the plan instead of being re-derived (or
+        // lost) inside the worker.
+        let Some(user) = self.user else {
             self.message = Some(NO_USER.to_string());
             return;
-        }
+        };
         let Some(mut review) = self.review.take() else {
             return;
         };
@@ -1551,17 +1642,18 @@ impl OrganizeIncomingState {
         let labels: Vec<ItemLabel> = review
             .items
             .iter()
-            .filter(|item| item.kind != ActionKind::Directory)
-            .filter_map(|item| {
-                let source = item.source.as_ref()?.path().to_path_buf();
-                Some(ItemLabel {
-                    source,
-                    destination: item
-                        .destination
-                        .as_ref()
-                        .map(|path| path.display().unwrap_or("—").to_string())
-                        .unwrap_or_else(|| "—".to_string()),
-                })
+            .map(|item| ItemLabel {
+                source: item
+                    .source
+                    .as_ref()
+                    .map(|path| path.path().to_path_buf())
+                    .unwrap_or_default(),
+                destination: item
+                    .destination
+                    .as_ref()
+                    .map(|path| path.display().unwrap_or("—").to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                directory: item.kind == ActionKind::Directory,
             })
             .collect();
         let draft = review.draft.clone();
@@ -1574,25 +1666,30 @@ impl OrganizeIncomingState {
                 control, events, ..
             } = context;
             let result =
-                transfers::execute(&catalog, validated, &control, &events).map_err(|error| {
-                    let mut message = describe_transfer(&error);
-                    let inspection = error.run_id().and_then(|run_id| {
-                        match transfers::read_run(&catalog, run_id).and_then(|reply| reply.wait()) {
-                            Ok(inspection) => inspection,
-                            Err(read_error) => {
-                                message
-                                    .push_str(&format!(" Journal inspection failed: {read_error}"));
-                                None
-                            }
+                transfers::execute(&catalog, validated.attribute_to(user), &control, &events)
+                    .map_err(|error| {
+                        let mut message = describe_transfer(&error);
+                        let inspection =
+                            error.run_id().and_then(|run_id| {
+                                match transfers::read_run(&catalog, run_id)
+                                    .and_then(|reply| reply.wait())
+                                {
+                                    Ok(inspection) => inspection,
+                                    Err(read_error) => {
+                                        message.push_str(&format!(
+                                            " Journal inspection failed: {read_error}"
+                                        ));
+                                        None
+                                    }
+                                }
+                            });
+                        ExecuteFailure {
+                            message,
+                            run_id: error.run_id(),
+                            inspection,
+                            progress: events.last_progress(),
                         }
                     });
-                    ExecuteFailure {
-                        message,
-                        run_id: error.run_id(),
-                        inspection,
-                        progress: events.last_progress(),
-                    }
-                });
             let (outcome, progress) = match &result {
                 Ok(report) => {
                     let progress = report_progress(report);
@@ -1640,18 +1737,24 @@ impl OrganizeIncomingState {
         let root = PathBuf::from(&destination);
         let (tx, rx) = channel();
         let started = jobs.start(&self.ctx, "Reading the destination", move |context| {
-            let result = read_preview(&root);
+            let JobContext {
+                control, events, ..
+            } = context;
+            let result = match read_preview(&root, &control) {
+                Ok(tree) => Ok(PreviewOutcome::Tree(tree)),
+                Err(PreviewRead::Cancelled) => Ok(PreviewOutcome::Cancelled),
+                Err(PreviewRead::Failed(message)) => Err(message),
+            };
             let (outcome, progress) = match &result {
-                Ok(_) => (JobOutcome::Succeeded, JobProgress::default()),
+                Ok(PreviewOutcome::Tree(_)) => (JobOutcome::Succeeded, JobProgress::default()),
+                Ok(PreviewOutcome::Cancelled) => (JobOutcome::Cancelled, JobProgress::default()),
                 Err(message) => {
-                    context
-                        .events
-                        .diagnostic(JobPhase::Scanning, message.clone());
+                    events.diagnostic(JobPhase::Scanning, message.clone());
                     (JobOutcome::Failed, JobProgress::default())
                 }
             };
             let _ = tx.send(result);
-            context.events.finish(outcome, progress);
+            events.finish(outcome, progress);
         });
         match started {
             Ok(_job) => {
@@ -1806,9 +1909,12 @@ impl OrganizeIncomingState {
         };
         let edit = self.edit_from_editor(&proposal);
         if edit.is_empty() {
-            return;
+            // Applying an empty editor clears the edit this item still carries;
+            // leaving it in place would keep a destination the UI no longer shows.
+            self.edits.remove(&item);
+        } else {
+            self.edits.insert(item, edit);
         }
-        self.edits.insert(item, edit);
         self.edit_generation += 1;
         self.rematch();
     }
@@ -1828,17 +1934,21 @@ impl OrganizeIncomingState {
         let mut changed = false;
         for proposal in selected {
             let mut edit = self.edit_from_editor(&proposal);
-            if !with_folder {
-                let kept = self
-                    .edits
-                    .get(&proposal.item)
-                    .map(|existing| existing.folder.clone())
+            let existing = self.edits.get(&proposal.item);
+            // The name field belongs to the focused item only. A selection-wide
+            // apply therefore never renames anything: every item keeps its own
+            // filename (or the edit it already had).
+            edit.filename = existing
+                .map(|existing| existing.filename.clone())
+                .unwrap_or_default();
+            if with_folder {
+                edit.tags = existing
+                    .map(|existing| existing.tags.clone())
                     .unwrap_or_default();
-                edit.folder = kept;
-                edit.filename = self
-                    .edits
-                    .get(&proposal.item)
-                    .map(|existing| existing.filename.clone())
+            }
+            if !with_folder {
+                edit.folder = existing
+                    .map(|existing| existing.folder.clone())
                     .unwrap_or_default();
             }
             if edit.is_empty() {
@@ -1940,6 +2050,7 @@ impl OrganizeIncomingState {
                     let length = profiles.profiles.len();
                     if let Some(target) = offset(index, delta, length) {
                         profiles.profiles.swap(index, target);
+                        profile_changed = true;
                     }
                 }
                 ListAction::MoveRule(profile, index, delta) => {
@@ -1962,8 +2073,10 @@ impl OrganizeIncomingState {
                     }
                 }
                 ListAction::DeleteProfile(name) => {
-                    profiles.profiles.retain(|profile| profile.name != name);
-                    profile_changed = true;
+                    if profiles.profiles.len() > 1 {
+                        profiles.profiles.retain(|profile| profile.name != name);
+                        profile_changed = true;
+                    }
                 }
             }
         }
@@ -2320,6 +2433,11 @@ fn report_progress(report: &RunReport) -> JobProgress {
     }
 }
 
+/// Reviewed files, excluding the directory actions every plan also carries.
+fn file_labels(labels: &[ItemLabel]) -> usize {
+    labels.iter().filter(|label| !label.directory).count()
+}
+
 fn report_rows(report: &RunReport, labels: &[ItemLabel]) -> (Vec<ReportRow>, Vec<String>) {
     let mut rows = Vec::with_capacity(report.items.len());
     let mut recovery = Vec::new();
@@ -2327,6 +2445,21 @@ fn report_rows(report: &RunReport, labels: &[ItemLabel]) -> (Vec<ReportRow>, Vec
         let label = usize::try_from(item.ordinal)
             .ok()
             .and_then(|index| labels.get(index));
+        // A directory action is evidence, not a file row; it still occupies its
+        // ordinal in the journal, so the label list keeps it and only the row is
+        // left out. A folder action that did not simply succeed keeps its row:
+        // nothing else would report it.
+        if label.is_some_and(|label| label.directory)
+            && matches!(item.state, ItemState::Created | ItemState::Skipped)
+        {
+            for path in &item.recovery {
+                let text = path.display().to_string();
+                if !recovery.contains(&text) {
+                    recovery.push(text);
+                }
+            }
+            continue;
+        }
         let mut paths = Vec::new();
         for path in &item.recovery {
             let text = path.display().to_string();
@@ -2338,7 +2471,7 @@ fn report_rows(report: &RunReport, labels: &[ItemLabel]) -> (Vec<ReportRow>, Vec
         rows.push(ReportRow {
             source: label
                 .map(|label| label.source.clone())
-                .unwrap_or_else(|| PathBuf::new()),
+                .unwrap_or_else(PathBuf::new),
             destination: label
                 .map(|label| label.destination.clone())
                 .unwrap_or_else(|| "—".to_string()),
@@ -2361,7 +2494,7 @@ fn failed_run(
     mut warnings: Vec<String>,
 ) -> RunDone {
     let mut counts = RunCounts {
-        total: labels.len(),
+        total: file_labels(labels),
         ..RunCounts::default()
     };
     let mut state = RunState::Interrupted;
@@ -2388,13 +2521,22 @@ fn failed_run(
     let rows = labels
         .iter()
         .enumerate()
-        .map(|(ordinal, label)| {
+        .filter_map(|(ordinal, label)| {
             let item = inspected.get(&(ordinal as i64)).copied();
             let confirmed = item.filter(|item| {
                 trustworthy
                     && item.message_error.is_none()
                     && !matches!(item.state, ItemState::Pending | ItemState::Running)
             });
+            // Failed or unresolved folder actions keep their row; a folder that
+            // simply was created stays out of the file list.
+            if label.directory
+                && confirmed.is_some_and(|item| {
+                    matches!(item.state, ItemState::Created | ItemState::Skipped)
+                })
+            {
+                return None;
+            }
             let mut messages = Vec::new();
             let mut paths = Vec::new();
             if let Some(item) = item {
@@ -2420,7 +2562,7 @@ fn failed_run(
                         .to_string(),
                 );
             }
-            ReportRow {
+            Some(ReportRow {
                 source: label.source.clone(),
                 destination: label.destination.clone(),
                 state: confirmed
@@ -2434,7 +2576,7 @@ fn failed_run(
                 }),
                 message: Some(messages.join("\n")).filter(|text| !text.is_empty()),
                 recovery: paths,
-            }
+            })
         })
         .collect();
     RunDone {
@@ -2444,6 +2586,7 @@ fn failed_run(
         progress: failure.progress,
         state,
         counts,
+        files: file_labels(labels),
         rows,
         warnings,
         recovery,
@@ -2451,39 +2594,59 @@ fn failed_run(
 }
 
 /// Read-only bounded destination walk for the preview: display spellings and
-/// directory flags only, never written anywhere.
-fn read_preview(root: &Path) -> Result<PreviewTree, String> {
+/// directory flags only, never written anywhere. Entries that cannot be read or
+/// spelled are counted in `unlisted` instead of vanishing from the tree.
+fn read_preview(root: &Path, control: &JobControl) -> Result<PreviewTree, PreviewRead> {
+    if control.checkpoint() == Checkpoint::Cancelled {
+        return Err(PreviewRead::Cancelled);
+    }
     let mut tree = PreviewTree::default();
     if !root.is_dir() {
-        return Err(format!(
+        return Err(PreviewRead::Failed(format!(
             "{} is not a folder, so it has nothing to preview",
             root.display()
-        ));
+        )));
     }
     let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut walked = 0usize;
     while let Some((directory, depth)) = pending.pop() {
+        if control.checkpoint() == Checkpoint::Cancelled {
+            return Err(PreviewRead::Cancelled);
+        }
         if depth > PREVIEW_MAX_DEPTH {
             tree.truncated = true;
             continue;
         }
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
-            Err(error) => {
+            Err(_) => {
                 tree.truncated = true;
-                let _ = error;
+                tree.unlisted += 1;
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             if tree.entries.len() >= PREVIEW_MAX_ENTRIES {
                 tree.truncated = true;
                 break;
             }
+            if walked % CHECKPOINT_STRIDE == 0 && control.checkpoint() == Checkpoint::Cancelled {
+                return Err(PreviewRead::Cancelled);
+            }
+            walked += 1;
+            let Ok(entry) = entry else {
+                tree.unlisted += 1;
+                continue;
+            };
             let path = entry.path();
             let Ok(relative) = path.strip_prefix(root) else {
+                tree.unlisted += 1;
                 continue;
             };
             let Some(spelling) = relative.to_str() else {
+                // The native name is untouched; only its display spelling is
+                // impossible here, so it is reported rather than hidden.
+                tree.unlisted += 1;
                 continue;
             };
             let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
@@ -2497,7 +2660,16 @@ fn read_preview(root: &Path) -> Result<PreviewTree, String> {
             break;
         }
     }
+    if control.checkpoint() == Checkpoint::Cancelled {
+        return Err(PreviewRead::Cancelled);
+    }
     Ok(tree)
+}
+
+/// Why a preview walk produced no tree.
+enum PreviewRead {
+    Cancelled,
+    Failed(String),
 }
 // ---------------------------------------------------------------------------
 // Panes
@@ -2922,6 +3094,21 @@ impl OrganizeIncomingState {
                 )
                 .on_hover_text("Only the first part of the destination tree is shown.");
             }
+            if let Some(unlisted) = self
+                .preview
+                .as_ref()
+                .map(|tree| tree.unlisted)
+                .filter(|unlisted| *unlisted > 0)
+            {
+                ui.label(
+                    egui::RichText::new(format!("{unlisted} entries not shown"))
+                        .small()
+                        .color(WARNING),
+                )
+                .on_hover_text(
+                    "The destination holds entries that could not be listed here: an unreadable folder, or a name that is not UTF-8 text. Nothing was changed; check the folder itself.",
+                );
+            }
             if self.preview_for.is_none() && self.destination.trim().is_empty() {
                 ui.label(
                     egui::RichText::new("choose a destination folder")
@@ -2957,12 +3144,17 @@ impl OrganizeIncomingState {
     }
 
     fn preview_key(&self) -> String {
+        // The proposed half of the tree is derived from the current rules and
+        // edits, so a rule or profile edit must rebuild it even when the
+        // selection and the edit set are unchanged.
         format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             self.preview_for.as_deref().unwrap_or_default(),
             self.review.is_some(),
             self.selection_generation,
-            self.edit_generation
+            self.edit_generation,
+            self.patterns_revision,
+            self.scan_generation
         )
     }
 
@@ -3065,9 +3257,9 @@ impl OrganizeIncomingState {
                 .as_ref()
                 .map(|report| {
                     format!(
-                        "{} of {} files · {} skipped",
-                        report.counts.completed(),
-                        report.counts.total,
+                        "{} of {} files copied or moved · {} skipped",
+                        report.counts.copied + report.counts.moved,
+                        report.files,
                         report.counts.skipped
                     )
                 })
@@ -3338,24 +3530,53 @@ impl OrganizeIncomingState {
                 actions.push(ListAction::MoveProfile(selected, 1));
             }
             if ui
-                .small_button("Delete layout")
+                .add_enabled(
+                    profiles.profiles.len() > 1,
+                    egui::Button::new("Delete layout").small(),
+                )
                 .on_hover_text("Remove this layout from the file")
                 .clicked()
             {
                 actions.push(ListAction::DeleteProfile(self.profile_name.clone()));
             }
-            ui.label(egui::RichText::new("Add layout").small().weak());
+            ui.label(egui::RichText::new("Layout name").small().weak());
             ui.add(
                 egui::TextEdit::singleline(&mut self.profile_entry)
                     .hint_text("name")
                     .desired_width(140.0),
             );
-            if ui.small_button("＋").clicked() {
+            if ui.small_button("Add").clicked() {
                 let name = self.profile_entry.trim().to_string();
                 if !name.is_empty() && profiles.find(&name).is_none() {
                     profiles.upsert(IncomingProfile::new(name, Vec::new()));
                     self.profile_entry.clear();
                 }
+            }
+            let name = self.profile_entry.trim().to_string();
+            let available = !name.is_empty() && profiles.find(&name).is_none();
+            if ui
+                .add_enabled(
+                    available && !profiles.profiles.is_empty(),
+                    egui::Button::new("Rename").small(),
+                )
+                .clicked()
+            {
+                profiles.profiles[selected].name = name.clone();
+                self.profile_name = name.clone();
+                self.profile_entry.clear();
+            }
+            if ui
+                .add_enabled(
+                    available && !profiles.profiles.is_empty(),
+                    egui::Button::new("Duplicate").small(),
+                )
+                .clicked()
+            {
+                let mut profile = profiles.profiles[selected].clone();
+                profile.name = name.clone();
+                profiles.profiles.push(profile);
+                self.profile_name = name;
+                self.profile_entry.clear();
             }
         });
 
@@ -3630,10 +3851,9 @@ fn report_headline(report: &RunDone) -> String {
         RunState::Interrupted => "Interrupted",
     };
     format!(
-        "{state}: {} of {} files · {} copied or moved · {} skipped · {} unfinished",
-        counts.completed(),
-        counts.total,
-        counts.completed(),
+        "{state}: {} of {} files copied or moved · {} skipped · {} unfinished",
+        counts.copied + counts.moved,
+        report.files,
         counts.skipped,
         counts.unfinished()
     )

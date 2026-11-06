@@ -62,7 +62,10 @@
 //!   rather than an evidence-free identity.
 //! - [`ScanPurpose::Incoming`] and [`ScanPurpose::StructureExport`] have no
 //!   filter preset here: their pattern/sequence discovery belongs to later
-//!   packets and is not approximated.
+//!   packets and is not approximated. Incoming asks for
+//!   [`SuffixMode::MatchAll`] explicitly, because the reference scanner kept
+//!   every non-skipped entry — extensionless files and unknown types included —
+//!   and classified them after the walk.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -106,10 +109,13 @@ pub enum ScanPurpose {
 /// How suffixes are matched, mirroring the two legacy filter styles:
 /// project scans compared the file's last extension (`splitext`), extension
 /// copy and backup matched the whole name suffix case-insensitively.
+/// [`SuffixMode::MatchAll`] keeps every name and exists for the incoming
+/// scanner, which enumerated every non-skipped file and classified it later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SuffixMode {
     LastExtension,
     NameSuffix,
+    MatchAll,
 }
 
 /// Suffix filter plus exclusions for one scan. Suffix matching is
@@ -140,13 +146,15 @@ impl ScanFilters {
                 .suffixes
                 .iter()
                 .any(|suffix| name_ends_with_case_insensitive(bytes, suffix.as_bytes())),
+            SuffixMode::MatchAll => true,
         }
     }
 }
 
-/// Legacy tool filter defaults. `None` means "configured elsewhere, later
-/// packet" — callers must not treat `None` as an empty (match-everything)
-/// filter.
+/// Legacy tool filter defaults. `None` means "the caller supplies the filter"
+/// — callers must not treat `None` as an empty (match-everything) filter.
+/// `Incoming` has no preset: its caller passes [`SuffixMode::MatchAll`] with
+/// the reference scanner's exclusions.
 pub fn default_filters(purpose: ScanPurpose) -> Option<ScanFilters> {
     match purpose {
         ScanPurpose::Projects => Some(ScanFilters {

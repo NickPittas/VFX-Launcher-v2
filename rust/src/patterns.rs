@@ -896,15 +896,25 @@ impl PatternSet {
     /// The `patterns.json` text: the six reference keys in reference order,
     /// plus the additive `ruleModes` record.
     pub fn to_json(&self) -> String {
-        let tasks = self.task_json();
+        let groups = self.task_groups();
         let modes = RuleModes {
             shot: modes(&self.shot),
             stage: modes(&self.stage),
-            task: modes(&self.task),
+            // The reference file can only express task rules grouped by label, so
+            // this flat list follows the serialized `taskPatterns` order. A list
+            // in edit order would re-attach modes to the wrong rules on load.
+            task: groups
+                .iter()
+                .flat_map(|(_, _, modes)| modes.clone())
+                .collect(),
             asset: modes(&self.asset),
             resolution: modes(&self.resolution),
             version: modes(&self.version),
         };
+        let tasks: Vec<(String, Vec<String>)> = groups
+            .into_iter()
+            .map(|(label, texts, _)| (label, texts))
+            .collect();
         let document = PatternsDocument {
             shot: texts(&self.shot),
             task: OrderedPairs(&tasks),
@@ -917,15 +927,21 @@ impl PatternSet {
         serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_string())
     }
 
-    fn task_json(&self) -> Vec<(String, Vec<String>)> {
-        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    /// Task rules grouped by configured label, each with its mode in the same
+    /// order: exactly the shape `taskPatterns` + `ruleModes.task` round-trips.
+    fn task_groups(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+        let mut grouped: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
         for rule in &self.task {
             let Some(label) = rule.task.clone() else {
                 continue;
             };
-            match grouped.iter_mut().find(|(known, _)| known == &label) {
-                Some((_, texts)) => texts.push(rule.text.clone()),
-                None => grouped.push((label, vec![rule.text.clone()])),
+            let mode = rule.mode.name().to_string();
+            match grouped.iter_mut().find(|(known, _, _)| known == &label) {
+                Some((_, texts, modes)) => {
+                    texts.push(rule.text.clone());
+                    modes.push(mode);
+                }
+                None => grouped.push((label, vec![rule.text.clone()], vec![mode])),
             }
         }
         grouped
@@ -1639,16 +1655,6 @@ impl Route {
 /// Resolves a destination folder from a profile and one item's tags, following
 /// `generate_simple_target_path` step by step.
 pub fn route(profile: &IncomingProfile, tags: &TagSet) -> Route {
-    if profile.rules.is_empty() {
-        return Route {
-            state: MappingState::Unmatched,
-            segments: Vec::new(),
-            base: None,
-            alternatives: Vec::new(),
-            used_footage_fallback: false,
-            reason: format!("profile '{}' has no destination rules", profile.name),
-        };
-    }
     let task = normalized(tags.task.as_deref());
     let asset = normalized(tags.asset.as_deref());
 
@@ -1731,11 +1737,16 @@ pub fn route(profile: &IncomingProfile, tags: &TagSet) -> Route {
     }
 
     // 4. Footage fallback: the documented default rule, then any rule holding a
-    // default keyword, then the visible unmapped folder.
-    let default_set: Vec<String> = DEFAULT_FOOTAGE_KEYWORDS
+    // default keyword, then the visible unmapped folder. The reference compared
+    // the rule's keyword *set* with the documented set, so both sides are
+    // compared order-free; a profile with no rules at all falls through to the
+    // same visible fallback folder instead of being refused outright.
+    let mut default_set: Vec<String> = DEFAULT_FOOTAGE_KEYWORDS
         .iter()
         .map(|word| word.to_lowercase())
         .collect();
+    default_set.sort();
+    default_set.dedup();
     if let Some(rule) = profile.rules.iter().find(|rule| {
         let mut words: Vec<String> = rule
             .keywords
@@ -1846,6 +1857,9 @@ fn dynamic_segments(tags: &TagSet) -> Vec<String> {
 /// Splits a rule path on either separator into validated relative segments:
 /// empty and `.` are dropped, `..` and anything absolute is refused.
 pub fn split_relative(path: &str) -> Result<Vec<String>, String> {
+    if path.trim_start().starts_with(['/', '\\']) {
+        return Err("Choose a folder inside the destination, using a relative path.".to_string());
+    }
     let mut segments = Vec::new();
     for part in path.split(['/', '\\']) {
         let part = part.trim();
