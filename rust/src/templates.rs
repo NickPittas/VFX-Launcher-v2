@@ -191,6 +191,7 @@ impl TemplateLibrary {
     /// data area does not exist yet (first run), never that a file is missing.
     fn read_below(&self, relative: &Path, what: &str) -> Result<Option<PathBuf>, TransferError> {
         let anchor = self.anchor()?;
+        let relative = Path::new(STRUCTURE_DIR).join(relative);
         match fs::symlink_metadata(anchor) {
             Ok(meta) => check_anchor_meta(anchor, &meta)?,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -201,7 +202,7 @@ impl TemplateLibrary {
                 ));
             }
         }
-        paths::validate_destination(anchor, relative)
+        paths::validate_destination(anchor, &relative)
             .map(Some)
             .map_err(|error| {
                 TransferError::new(
@@ -216,6 +217,7 @@ impl TemplateLibrary {
     /// area when the first run has not created it yet and re-checking it after.
     fn write_below(&self, relative: &Path, what: &str) -> Result<PathBuf, TransferError> {
         let anchor = self.anchor()?.to_path_buf();
+        let relative = Path::new(STRUCTURE_DIR).join(relative);
         if fs::symlink_metadata(&anchor).is_err() {
             fs::create_dir_all(&anchor).map_err(|error| {
                 unavailable(
@@ -231,7 +233,7 @@ impl TemplateLibrary {
             )
         })?;
         check_anchor_meta(&anchor, &meta)?;
-        paths::validate_destination(&anchor, relative).map_err(|error| {
+        paths::validate_destination(&anchor, &relative).map_err(|error| {
             TransferError::new(
                 TransferCategory::Refused,
                 error.path(),

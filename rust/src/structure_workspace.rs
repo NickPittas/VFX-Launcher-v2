@@ -3709,187 +3709,201 @@ impl StructureWorkspace {
                         .id_salt("manager_body")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.horizontal_top(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.set_width(300.0);
-                                    ui.set_min_height(PANES);
-                                    ui.label(egui::RichText::new("Templates").small().weak());
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("template_list")
-                                        .max_height(PANES)
-                                        .min_scrolled_height(PANES)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            for entry in self.snapshot.templates.clone() {
-                                                let selected = self.dialog.selected == entry.id;
-                                                if ui
-                                                    .add_enabled(
-                                                        editable,
-                                                        egui::Button::selectable(
-                                                            selected,
-                                                            &entry.name,
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.dialog.selected = entry.id.clone();
-                                                    self.dialog.folder = PathBuf::new();
-                                                    self.dialog.confirm = None;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), PANES + 110.0),
+                                egui::Layout::left_to_right(egui::Align::Min),
+                                |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(300.0);
+                                        ui.set_min_height(PANES);
+                                        ui.label(egui::RichText::new("Templates").small().weak());
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("template_list")
+                                            .max_height(PANES)
+                                            .min_scrolled_height(PANES)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for entry in self.snapshot.templates.clone() {
+                                                    let selected = self.dialog.selected == entry.id;
+                                                    if ui
+                                                        .add_enabled(
+                                                            editable,
+                                                            egui::Button::selectable(
+                                                                selected,
+                                                                &entry.name,
+                                                            ),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.dialog.selected = entry.id.clone();
+                                                        self.dialog.folder = PathBuf::new();
+                                                        self.dialog.confirm = None;
+                                                    }
                                                 }
-                                            }
-                                            if self.snapshot.templates.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new("No templates yet.")
-                                                        .small()
-                                                        .weak(),
-                                                );
-                                            }
-                                        });
-                                    ui.horizontal(|ui| {
-                                        ui.add_enabled(
-                                            editable,
-                                            egui::TextEdit::singleline(&mut self.dialog.new_name)
+                                                if self.snapshot.templates.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new("No templates yet.")
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                }
+                                            });
+                                        ui.horizontal(|ui| {
+                                            ui.add_enabled(
+                                                editable,
+                                                egui::TextEdit::singleline(
+                                                    &mut self.dialog.new_name,
+                                                )
                                                 .hint_text("New template name")
                                                 .desired_width(150.0),
-                                        );
-                                        if ui
-                                            .add_enabled(editable, egui::Button::new("Create"))
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::CreateTemplate);
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                editable,
-                                                egui::Button::new("Import folder…"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::ImportTemplate);
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                editable && !self.dialog.selected.is_empty(),
-                                                egui::Button::new("Delete template"),
-                                            )
-                                            .on_hover_text("Delete the template and its folder.")
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::AskDeleteTemplate);
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.add_enabled(
-                                            editable,
-                                            egui::TextEdit::singleline(&mut self.dialog.rename)
-                                                .hint_text("Rename to")
-                                                .desired_width(150.0),
-                                        );
-                                        if ui
-                                            .add_enabled(
-                                                editable && !self.dialog.selected.is_empty(),
-                                                egui::Button::new("Rename"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::RenameTemplate);
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                editable && !self.dialog.selected.is_empty(),
-                                                egui::Button::new("Move up"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::MoveUp);
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                editable && !self.dialog.selected.is_empty(),
-                                                egui::Button::new("Move down"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::MoveDown);
-                                        }
-                                    });
-                                });
-                                ui.separator();
-                                ui.vertical(|ui| {
-                                    ui.set_min_height(PANES);
-                                    ui.label(egui::RichText::new("Folders").small().weak());
-                                    let rows = self.selected_template_rows();
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("template_folders")
-                                        .max_height(PANES)
-                                        .min_scrolled_height(PANES)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            for (relative, depth, markers) in &rows {
-                                                ui.push_id(("template_folder", relative), |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.add_space(*depth as f32 * 12.0);
-                                                        let label =
-                                                            format!("{}/", file_label(relative));
-                                                        if ui
-                                                            .add_enabled(
-                                                                editable,
-                                                                egui::Button::selectable(
-                                                                    self.dialog.folder == *relative,
-                                                                    label,
-                                                                ),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            self.dialog.folder = relative.clone();
-                                                            self.dialog.markers_sequences =
-                                                                markers.sequences;
-                                                            self.dialog.markers_shots =
-                                                                markers.shots;
-                                                        }
-                                                        let mut flags = Vec::new();
-                                                        if markers.sequences {
-                                                            flags.push("sequences");
-                                                        }
-                                                        if markers.shots {
-                                                            flags.push("shots");
-                                                        }
-                                                        if !flags.is_empty() {
-                                                            ui.label(
-                                                                egui::RichText::new(
-                                                                    flags.join(" + "),
-                                                                )
-                                                                .small()
-                                                                .weak(),
-                                                            );
-                                                        }
-                                                    });
-                                                });
-                                            }
-                                            if rows.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "No folders in this template.",
-                                                    )
-                                                    .small()
-                                                    .weak(),
-                                                );
+                                            );
+                                            if ui
+                                                .add_enabled(editable, egui::Button::new("Create"))
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::CreateTemplate);
                                             }
                                         });
-                                    ui.horizontal(|ui| {
-                                        ui.add_enabled(
-                                            editable,
-                                            egui::TextEdit::singleline(
-                                                &mut self.dialog.folder_name,
-                                            )
-                                            .hint_text("New folder name")
-                                            .desired_width(150.0),
-                                        );
-                                        if ui
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    editable,
+                                                    egui::Button::new("Import folder…"),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::ImportTemplate);
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    editable && !self.dialog.selected.is_empty(),
+                                                    egui::Button::new("Delete template"),
+                                                )
+                                                .on_hover_text(
+                                                    "Delete the template and its folder.",
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::AskDeleteTemplate);
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.add_enabled(
+                                                editable,
+                                                egui::TextEdit::singleline(&mut self.dialog.rename)
+                                                    .hint_text("Rename to")
+                                                    .desired_width(150.0),
+                                            );
+                                            if ui
+                                                .add_enabled(
+                                                    editable && !self.dialog.selected.is_empty(),
+                                                    egui::Button::new("Rename"),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::RenameTemplate);
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    editable && !self.dialog.selected.is_empty(),
+                                                    egui::Button::new("Move up"),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::MoveUp);
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    editable && !self.dialog.selected.is_empty(),
+                                                    egui::Button::new("Move down"),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::MoveDown);
+                                            }
+                                        });
+                                    });
+                                    ui.separator();
+                                    ui.vertical(|ui| {
+                                        ui.set_min_height(PANES);
+                                        ui.label(egui::RichText::new("Folders").small().weak());
+                                        let rows = self.selected_template_rows();
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("template_folders")
+                                            .max_height(PANES)
+                                            .min_scrolled_height(PANES)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for (relative, depth, markers) in &rows {
+                                                    ui.push_id(
+                                                        ("template_folder", relative),
+                                                        |ui| {
+                                                            ui.horizontal(|ui| {
+                                                                ui.add_space(*depth as f32 * 12.0);
+                                                                let label = format!(
+                                                                    "{}/",
+                                                                    file_label(relative)
+                                                                );
+                                                                if ui
+                                                                    .add_enabled(
+                                                                        editable,
+                                                                        egui::Button::selectable(
+                                                                            self.dialog.folder
+                                                                                == *relative,
+                                                                            label,
+                                                                        ),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    self.dialog.folder =
+                                                                        relative.clone();
+                                                                    self.dialog.markers_sequences =
+                                                                        markers.sequences;
+                                                                    self.dialog.markers_shots =
+                                                                        markers.shots;
+                                                                }
+                                                                let mut flags = Vec::new();
+                                                                if markers.sequences {
+                                                                    flags.push("sequences");
+                                                                }
+                                                                if markers.shots {
+                                                                    flags.push("shots");
+                                                                }
+                                                                if !flags.is_empty() {
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            flags.join(" + "),
+                                                                        )
+                                                                        .small()
+                                                                        .weak(),
+                                                                    );
+                                                                }
+                                                            });
+                                                        },
+                                                    );
+                                                }
+                                                if rows.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "No folders in this template.",
+                                                        )
+                                                        .small()
+                                                        .weak(),
+                                                    );
+                                                }
+                                            });
+                                        ui.horizontal(|ui| {
+                                            ui.add_enabled(
+                                                editable,
+                                                egui::TextEdit::singleline(
+                                                    &mut self.dialog.folder_name,
+                                                )
+                                                .hint_text("New folder name")
+                                                .desired_width(150.0),
+                                            );
+                                            if ui
                                             .add_enabled(editable, egui::Button::new("Add folder"))
                                             .on_hover_text(
                                                 "Add inside the selected folder, or at the top.",
@@ -3898,110 +3912,131 @@ impl StructureWorkspace {
                                         {
                                             actions.push(DialogAction::AddFolder);
                                         }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.add_enabled(
-                                            editable,
-                                            egui::TextEdit::singleline(
-                                                &mut self.dialog.folder_rename,
-                                            )
-                                            .hint_text("Rename folder to")
-                                            .desired_width(150.0),
-                                        );
-                                        if ui
-                                            .add_enabled(
-                                                editable
-                                                    && !self.dialog.folder.as_os_str().is_empty(),
-                                                egui::Button::new("Rename folder"),
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::RenameFolder);
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        let mut markers_changed = false;
-                                        markers_changed |= ui
-                                            .add_enabled(
-                                                editable
-                                                    && !self.dialog.folder.as_os_str().is_empty(),
-                                                egui::Checkbox::new(
-                                                    &mut self.dialog.markers_sequences,
-                                                    "Sequence folders",
-                                                ),
-                                            )
-                                            .on_hover_text(
-                                                "sequences.txt: one folder per named sequence",
-                                            )
-                                            .changed();
-                                        markers_changed |= ui
-                                            .add_enabled(
-                                                editable
-                                                    && !self.dialog.folder.as_os_str().is_empty(),
-                                                egui::Checkbox::new(
-                                                    &mut self.dialog.markers_shots,
-                                                    "Shot folders",
-                                                ),
-                                            )
-                                            .on_hover_text("shots.txt: shots inside this folder")
-                                            .changed();
-                                        if markers_changed {
-                                            actions.push(DialogAction::SetMarkers);
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                editable
-                                                    && !self.dialog.folder.as_os_str().is_empty(),
-                                                egui::Button::new("Delete folder"),
-                                            )
-                                            .on_hover_text("Delete this folder and its contents.")
-                                            .clicked()
-                                        {
-                                            actions.push(DialogAction::AskDeleteFolder);
-                                        }
-                                    });
-                                    if let Some(confirm) = self.dialog.confirm.clone() {
+                                        });
                                         ui.horizontal(|ui| {
-                                            let what = match &confirm {
-                                                Confirm::Template(_) => {
-                                                    "this template and its folder"
-                                                }
-                                                Confirm::Folder(_) => {
-                                                    "this template folder and its contents"
-                                                }
-                                            };
-                                            ui.label(
-                                                egui::RichText::new(format!("Delete {what}?"))
-                                                    .small()
-                                                    .color(WARNING),
+                                            ui.add_enabled(
+                                                editable,
+                                                egui::TextEdit::singleline(
+                                                    &mut self.dialog.folder_rename,
+                                                )
+                                                .hint_text("Rename folder to")
+                                                .desired_width(150.0),
                                             );
                                             if ui
                                                 .add_enabled(
-                                                    editable,
-                                                    egui::Button::new("Delete").small(),
+                                                    editable
+                                                        && !self
+                                                            .dialog
+                                                            .folder
+                                                            .as_os_str()
+                                                            .is_empty(),
+                                                    egui::Button::new("Rename folder"),
                                                 )
                                                 .clicked()
                                             {
-                                                actions.push(DialogAction::ConfirmDelete);
+                                                actions.push(DialogAction::RenameFolder);
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            let mut markers_changed = false;
+                                            markers_changed |= ui
+                                                .add_enabled(
+                                                    editable
+                                                        && !self
+                                                            .dialog
+                                                            .folder
+                                                            .as_os_str()
+                                                            .is_empty(),
+                                                    egui::Checkbox::new(
+                                                        &mut self.dialog.markers_sequences,
+                                                        "Sequence folders",
+                                                    ),
+                                                )
+                                                .on_hover_text(
+                                                    "sequences.txt: one folder per named sequence",
+                                                )
+                                                .changed();
+                                            markers_changed |= ui
+                                                .add_enabled(
+                                                    editable
+                                                        && !self
+                                                            .dialog
+                                                            .folder
+                                                            .as_os_str()
+                                                            .is_empty(),
+                                                    egui::Checkbox::new(
+                                                        &mut self.dialog.markers_shots,
+                                                        "Shot folders",
+                                                    ),
+                                                )
+                                                .on_hover_text(
+                                                    "shots.txt: shots inside this folder",
+                                                )
+                                                .changed();
+                                            if markers_changed {
+                                                actions.push(DialogAction::SetMarkers);
                                             }
                                             if ui
                                                 .add_enabled(
-                                                    editable,
-                                                    egui::Button::new("Keep").small(),
+                                                    editable
+                                                        && !self
+                                                            .dialog
+                                                            .folder
+                                                            .as_os_str()
+                                                            .is_empty(),
+                                                    egui::Button::new("Delete folder"),
+                                                )
+                                                .on_hover_text(
+                                                    "Delete this folder and its contents.",
                                                 )
                                                 .clicked()
                                             {
-                                                actions.push(DialogAction::CancelDelete);
+                                                actions.push(DialogAction::AskDeleteFolder);
                                             }
                                         });
-                                    }
-                                    if !blocked.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(blocked).small().color(WARNING),
-                                        );
-                                    }
-                                });
-                            });
+                                        if let Some(confirm) = self.dialog.confirm.clone() {
+                                            ui.horizontal(|ui| {
+                                                let what = match &confirm {
+                                                    Confirm::Template(_) => {
+                                                        "this template and its folder"
+                                                    }
+                                                    Confirm::Folder(_) => {
+                                                        "this template folder and its contents"
+                                                    }
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(format!("Delete {what}?"))
+                                                        .small()
+                                                        .color(WARNING),
+                                                );
+                                                if ui
+                                                    .add_enabled(
+                                                        editable,
+                                                        egui::Button::new("Delete").small(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    actions.push(DialogAction::ConfirmDelete);
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        editable,
+                                                        egui::Button::new("Keep").small(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    actions.push(DialogAction::CancelDelete);
+                                                }
+                                            });
+                                        }
+                                        if !blocked.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(blocked).small().color(WARNING),
+                                            );
+                                        }
+                                    });
+                                },
+                            );
 
                             ui.separator();
                             ui.horizontal(|ui| {
