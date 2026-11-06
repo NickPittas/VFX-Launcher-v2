@@ -25,6 +25,7 @@ pub mod history;
 pub mod incoming;
 pub mod jobs;
 pub mod launch;
+pub mod legacy_import;
 pub mod nuke;
 pub mod paths;
 pub mod project_discovery;
