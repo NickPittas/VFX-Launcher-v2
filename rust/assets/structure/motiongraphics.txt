@@ -1,0 +1,32 @@
+# Built-in MotionGraphics template, copied from the FolderStructurer reference
+# tree (gitclones/FolderStructurer/Templates/MotionGraphics). One entry per
+# line: a plain path is a directory, a tab introduces directives (`file` for a
+# regular empty file, `seq`/`shot` for the sequences.txt/shots.txt markers).
+# `.gitkeep` files are packaging placeholders and are not part of the template.
+2D
+2D/Illustrations
+2D/Images
+2D/Storyboard
+3D
+3D/Models
+3D/Previz
+3D/Renders
+3D/Textures
+Audio
+Deliverables
+Deliverables/Finals
+Deliverables/Review
+Documents
+Projects
+Projects/AfterEffects
+Projects/Davinci
+Projects/Nuke	seq,shot
+Projects/Premiere
+Projects/Tracking
+Renders
+Renders/AE
+Renders/Nuke
+Video
+Video/Footage
+Video/Guides
+Video/XML-EDL-AAF

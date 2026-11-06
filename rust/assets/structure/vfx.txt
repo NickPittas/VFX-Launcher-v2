@@ -1,0 +1,32 @@
+# Built-in VFX template, copied from the FolderStructurer reference tree
+# (gitclones/FolderStructurer/Templates/VFX). Same line grammar as
+# `motiongraphics.txt`; `08_output/[date]` is the literal folder name the
+# source created (no date substitution happens anywhere in that tree).
+01_plates	seq,shot
+01_plates/Aspera
+01_plates/plate_manifest.txt	file
+02_support
+02_support/camera_data
+02_support/edl_xml
+02_support/guides
+02_support/luts
+02_support/luts/camera
+02_support/luts/show
+03_references
+03_references/artwork
+03_references/client_brief
+03_references/style_guides
+04_vfx	seq,shot
+05_comp	seq,shot
+06_mograph
+06_mograph/projects
+06_mograph/render
+07_shared
+07_shared/fonts
+07_shared/graphics
+07_shared/stock_footage
+07_shared/templates
+08_output
+08_output/[date]
+08_output/[date]/full_res
+08_output/[date]/proxy

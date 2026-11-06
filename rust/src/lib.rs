@@ -17,6 +17,7 @@ pub mod app;
 pub mod backup;
 pub mod backup_cli;
 pub mod backup_workspace;
+pub mod builtin_templates;
 pub mod config;
 pub mod copy_workspace;
 pub mod discovery;
