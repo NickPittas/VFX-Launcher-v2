@@ -774,7 +774,7 @@ pub fn read_template_directory(
     name: impl Into<String>,
     dir: &Path,
 ) -> Result<StructureTemplate, TransferError> {
-    let meta = fs::metadata(dir).map_err(|error| {
+    let meta = fs::symlink_metadata(dir).map_err(|error| {
         TransferError::new(
             TransferCategory::Unavailable,
             Some(dir),
@@ -1006,7 +1006,13 @@ pub fn launcher_default_template() -> StructureTemplate {
         // Static manifest: every line is validated once here; a bad constant is
         // a build-time bug, not a runtime condition.
         template
-            .add_directory(Path::new(line), TemplateMarkers::default())
+            .add_directory(
+                Path::new(line),
+                TemplateMarkers {
+                    sequences: *line == "Projects/Nuke",
+                    shots: *line == "Projects/Nuke",
+                },
+            )
             .expect("launcher manifest constants are plain relative paths");
     }
     template
@@ -1282,6 +1288,7 @@ pub fn plan_structure(
     )?;
     let final_name = format!("{base}_{date}");
     let tree = SequenceShotTree::from_groups(&input.shots)?;
+    require_marker_coverage(&tree, template)?;
     if let Some(settings) = &input.nuke {
         validate_nuke_settings(settings)?;
     }
@@ -1297,13 +1304,45 @@ pub fn plan_structure(
         scripts,
         &mut warnings,
     )?;
-    if !tree.is_empty() && !template.has_marker_directories() {
-        warnings.push(
-            "the template has no sequence/shot markers, so no shots were expanded into it"
-                .to_string(),
-        );
-    }
     acc.finish(id, revision, warnings)
+}
+
+fn require_marker_coverage(
+    tree: &SequenceShotTree,
+    template: &StructureTemplate,
+) -> Result<(), TransferError> {
+    if tree.is_empty() {
+        return Ok(());
+    }
+    let markers = template
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.kind {
+            TemplateEntryKind::Directory { markers } => Some(markers),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let has_shots = !tree.independent_shots().is_empty()
+        || tree
+            .named()
+            .iter()
+            .any(|sequence| !sequence.shots.is_empty());
+    if has_shots && !markers.iter().any(|marker| marker.shots) {
+        return Err(invalid(
+            "This template has no shot destination. Set a Shots marker in Templates & clients before creating these shots.",
+        ));
+    }
+    if tree
+        .named()
+        .iter()
+        .any(|sequence| sequence.shots.is_empty())
+        && !markers.iter().any(|marker| marker.sequences)
+    {
+        return Err(invalid(
+            "This template has no sequence destination. Set a Sequences marker in Templates & clients before adding an empty sequence.",
+        ));
+    }
+    Ok(())
 }
 
 /// Replicates the template snapshot into planned actions under the project
@@ -1483,6 +1522,7 @@ pub fn plan_add_shots(
     if tree.is_empty() {
         return Err(invalid("no sequences or shots were provided"));
     }
+    require_marker_coverage(&tree, template)?;
     if let Some(settings) = nuke {
         validate_nuke_settings(settings)?;
     }

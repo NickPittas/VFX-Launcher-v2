@@ -885,6 +885,9 @@ impl PlanSession {
     }
 
     fn clear(&mut self) {
+        if self.busy() {
+            return;
+        }
         *self = Self {
             counter: self.counter,
             ..Self::default()
@@ -968,10 +971,7 @@ impl PlanSession {
                         });
                         self.completion = Some(CompletedRun {
                             root: run.root,
-                            succeeded: !matches!(
-                                report.summary.state,
-                                RunState::Failed | RunState::Cancelled
-                            ),
+                            succeeded: report.summary.state == RunState::Succeeded,
                             created: counts.created,
                             failed: counts.failed,
                         });
@@ -1133,8 +1133,12 @@ impl PlanSession {
                 Err(failure) => failure.progress.clone(),
             };
             let outcome = match &result {
-                Ok(report) if report.summary.counts.failed > 0 => JobOutcome::Partial,
-                Ok(_) => JobOutcome::Succeeded,
+                Ok(report) => match report.summary.state {
+                    RunState::Succeeded => JobOutcome::Succeeded,
+                    RunState::Partial => JobOutcome::Partial,
+                    RunState::Cancelled => JobOutcome::Cancelled,
+                    _ => JobOutcome::Failed,
+                },
                 Err(_) => JobOutcome::Failed,
             };
             if let Err(failure) = &result {
@@ -2505,6 +2509,7 @@ impl StructureWorkspace {
         // never eats a keystroke the user meant for a name.
         if ctx.input(|input| input.key_pressed(egui::Key::Escape))
             && ctx.memory(|memory| memory.focused().is_none())
+            && !dialog.busy()
         {
             return;
         }
@@ -2824,7 +2829,10 @@ impl StructureWorkspace {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").clicked() {
+                        if ui
+                            .add_enabled(!dialog.busy(), egui::Button::new("Cancel"))
+                            .clicked()
+                        {
                             cancel = true;
                         }
                         let execute_reason = if dialog.busy() {
@@ -2871,7 +2879,7 @@ impl StructureWorkspace {
                 });
             });
 
-        if !cancel && open {
+        if dialog.busy() || (!cancel && open) {
             self.new_project = Some(dialog);
         }
     }
@@ -2903,6 +2911,7 @@ impl StructureWorkspace {
                     notice(ui, error, true);
                 }
                 ui.horizontal_top(|ui| {
+                    ui.set_max_height(360.0);
                     ui.vertical(|ui| {
                         ui.set_width(250.0);
                         ui.label(egui::RichText::new("Templates").small().weak());

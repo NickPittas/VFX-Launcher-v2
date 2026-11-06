@@ -1428,6 +1428,7 @@ impl ProjectWorkspace {
         if !self.actions_enabled() || self.registration_busy() {
             return;
         }
+        self.created_root = None;
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         let start = self
@@ -1540,6 +1541,7 @@ impl ProjectWorkspace {
         }
         if !self.registration_busy() {
             self.registration_user = None;
+            self.created_root = None;
         }
     }
 
