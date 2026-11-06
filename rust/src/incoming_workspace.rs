@@ -74,6 +74,12 @@ const CANCELLED_VALIDATION: &str =
     "The validation was cancelled before it finished; validate the selection again.";
 /// Longest list of missing frame numbers spelled out in one row.
 const MISSING_FRAMES_SHOWN: usize = 6;
+
+/// Smallest folder field the toolbar still lays out on one row.
+const PATH_MIN_WIDTH: f32 = 150.0;
+/// Working list and run report row heights.
+const ITEM_ROW_HEIGHT: f32 = 22.0;
+const REPORT_ROW_HEIGHT: f32 = 18.0;
 /// Height of the member list inside one expanded row.
 const MEMBER_SCROLL_HEIGHT: f32 = 120.0;
 
@@ -275,6 +281,8 @@ struct PreviewNode {
 }
 
 struct ReportRow {
+    directory: bool,
+    outcome: Option<ItemState>,
     source: PathBuf,
     destination: String,
     state: &'static str,
@@ -327,11 +335,16 @@ struct Row {
     source_dir: PathBuf,
     label: String,
     kind: String,
+    /// True for a grouped frame sequence, false for one single file.
+    sequence: bool,
     frames: usize,
     bytes: u64,
     folder: String,
     state: MappingState,
     reason: String,
+    /// Frames absent from a sequence; zero when there is no gap.
+    gaps: usize,
+    /// The exact missing frame numbers, shown on demand beside the count.
     missing: Option<String>,
 }
 
@@ -424,7 +437,8 @@ pub struct OrganizeIncomingState {
     patterns_revision: u64,
     filter: String,
     folder_scope: Option<PathBuf>,
-    expanded: HashSet<usize>,
+    /// Item whose exact member files are open in the frames dialog.
+    frames_open: Option<usize>,
     focus: Option<usize>,
     editor: ItemEditor,
 
@@ -501,7 +515,7 @@ impl OrganizeIncomingState {
             patterns_revision: 0,
             filter: String::new(),
             folder_scope: None,
-            expanded: HashSet::new(),
+            frames_open: None,
             focus: None,
             editor: ItemEditor::default(),
             plan_counter: 0,
@@ -627,7 +641,7 @@ impl OrganizeIncomingState {
         self.rows.clear();
         self.selected.clear();
         self.edits.clear();
-        self.expanded.clear();
+        self.frames_open = None;
         self.focus = None;
         self.editor = ItemEditor::default();
         self.review = None;
@@ -933,7 +947,7 @@ impl OrganizeIncomingState {
                 self.scan_generation += 1;
                 self.selection_generation += 1;
                 self.edits.clear();
-                self.expanded.clear();
+                self.frames_open = None;
                 self.selected = (0..analyzed.analysis.items.len()).collect();
                 self.scanned = Some(ScanResult {
                     snapshot: analyzed.snapshot,
@@ -1192,7 +1206,7 @@ impl OrganizeIncomingState {
                     .unwrap_or_default(),
                 IncomingItem::Sequence(sequence) => sequence.directory.clone(),
             };
-            let (kind, missing) = match item {
+            let (kind, sequence_item, gaps, missing) = match item {
                 IncomingItem::Single(single) => {
                     let name = single.file.path.file_name();
                     let extension = name
@@ -1201,12 +1215,12 @@ impl OrganizeIncomingState {
                         .map(|(_, extension)| extension.to_uppercase())
                         .unwrap_or_default();
                     let label = match (extension.is_empty(), single.kind) {
-                        (false, _) => format!("{extension} file"),
-                        (true, SingleKind::Project) => "Project file".to_string(),
-                        (true, SingleKind::Cache) => "Cache file".to_string(),
+                        (false, _) => extension,
+                        (true, SingleKind::Project) => "Project".to_string(),
+                        (true, SingleKind::Cache) => "Cache".to_string(),
                         (true, _) => "File".to_string(),
                     };
-                    (label, None)
+                    (label, false, 0usize, None)
                 }
                 IncomingItem::Sequence(sequence) => {
                     let extension = sequence.suffix.trim_start_matches('.').to_uppercase();
@@ -1243,7 +1257,7 @@ impl OrganizeIncomingState {
                                 .join(", ")
                         ))
                     };
-                    (format!("{extension} sequence"), text)
+                    (format!("{extension} sequence"), true, gap_frames, text)
                 }
             };
             rows.push(Row {
@@ -1251,11 +1265,13 @@ impl OrganizeIncomingState {
                 source_dir,
                 label: proposal.label.clone(),
                 kind,
+                sequence: sequence_item,
                 frames: proposal.frames(),
                 bytes: proposal.bytes(),
                 folder: proposal.folder_display(),
                 state: proposal.state,
                 reason: proposal.reason.clone(),
+                gaps,
                 missing,
             });
         }
@@ -2116,6 +2132,16 @@ impl OrganizeIncomingState {
         let mut rules_open = false;
 
         egui::Panel::top("incoming_toolbar").show(ui, |ui| {
+            // Both folder fields share the width the Scan control leaves, so a
+            // wide window does not strand two 240px inputs at the left. The
+            // measurements decide whether one row fits; a narrow window stacks
+            // the fields instead of squeezing a path below its useful minimum.
+            let gap = ui.spacing().item_spacing.x;
+            let scan_width = button_width(ui, "Scan folders");
+            let browse_width = button_width(ui, "Browse…");
+            let label_width = small_width(ui, "Destination");
+            let fixed = scan_width + 2.0 * browse_width + 2.0 * label_width + 8.0 * gap + 24.0;
+            let wide = ui.available_width() - fixed >= 2.0 * PATH_MIN_WIDTH;
             ui.horizontal(|ui| {
                 let blocked = self.scan_blocked();
                 let response = accent_button(ui, "Scan folders", blocked.is_none());
@@ -2127,37 +2153,74 @@ impl OrganizeIncomingState {
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("Source").small().weak());
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.source)
-                            .hint_text("Incoming folder")
-                            .desired_width(240.0),
-                    )
-                    .changed()
-                {
+                let room = ui.available_width();
+                let field = if wide {
+                    let tail = 2.0 * browse_width + label_width + 4.0 * gap + 20.0;
+                    ((room - tail) / 2.0).max(PATH_MIN_WIDTH)
+                } else {
+                    (room - browse_width - gap).max(PATH_MIN_WIDTH)
+                };
+                let source = ui.add(
+                    egui::TextEdit::singleline(&mut self.source)
+                        .hint_text("Incoming folder")
+                        .desired_width(field),
+                );
+                let source_path = self.source.trim().to_owned();
+                if !source_path.is_empty() {
+                    source.clone().on_hover_text(source_path);
+                }
+                if source.changed() {
                     self.folder_scope = None;
                 }
                 if ui.button("Browse…").clicked() {
                     pick = Some(PickTask::Folder(Field::Source));
                 }
-                ui.separator();
-                ui.label(egui::RichText::new("Destination").small().weak());
-                if ui
-                    .add(
+                if wide {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Destination").small().weak());
+                    let width = (ui.available_width() - browse_width - gap).max(PATH_MIN_WIDTH);
+                    let destination = ui.add(
                         egui::TextEdit::singleline(&mut self.destination)
                             .hint_text("Destination folder")
-                            .desired_width(240.0),
-                    )
-                    .changed()
-                {
-                    self.preview = None;
-                    self.preview_for = None;
-                    self.tree = None;
-                }
-                if ui.button("Browse…").clicked() {
-                    pick = Some(PickTask::Folder(Field::Destination));
+                            .desired_width(width),
+                    );
+                    let destination_path = self.destination.trim().to_owned();
+                    if !destination_path.is_empty() {
+                        destination.clone().on_hover_text(destination_path);
+                    }
+                    if destination.changed() {
+                        self.preview = None;
+                        self.preview_for = None;
+                        self.tree = None;
+                    }
+                    if ui.button("Browse…").clicked() {
+                        pick = Some(PickTask::Folder(Field::Destination));
+                    }
                 }
             });
+            if !wide {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Destination").small().weak());
+                    let width = (ui.available_width() - browse_width - gap).max(PATH_MIN_WIDTH);
+                    let destination = ui.add(
+                        egui::TextEdit::singleline(&mut self.destination)
+                            .hint_text("Destination folder")
+                            .desired_width(width),
+                    );
+                    let destination_path = self.destination.trim().to_owned();
+                    if !destination_path.is_empty() {
+                        destination.clone().on_hover_text(destination_path);
+                    }
+                    if destination.changed() {
+                        self.preview = None;
+                        self.preview_for = None;
+                        self.tree = None;
+                    }
+                    if ui.button("Browse…").clicked() {
+                        pick = Some(PickTask::Folder(Field::Destination));
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Folder layout").small().weak());
                 profile_combo(ui, &mut self.profile_name, self.profiles.as_ref());
@@ -2194,19 +2257,21 @@ impl OrganizeIncomingState {
             });
         });
 
+        let progress_max = (ui.available_height() - 420.0).clamp(150.0, 560.0);
         egui::Panel::bottom("incoming_progress_dock")
             .resizable(true)
             .default_size(230.0)
             .min_size(150.0)
-            .max_size(560.0)
+            .max_size(progress_max)
             .show(ui, |ui| self.progress_dock(ui, jobs));
 
         egui::CentralPanel::default().show(ui, |ui| {
+            let destination_max = (ui.available_height() - 260.0).clamp(120.0, 520.0);
             egui::Panel::bottom("incoming_destination_dock")
                 .resizable(true)
                 .default_size(250.0)
                 .min_size(120.0)
-                .max_size(520.0)
+                .max_size(destination_max)
                 .show(ui, |ui| self.destination_dock(ui));
 
             egui::Panel::left("incoming_source_pane")
@@ -2217,17 +2282,19 @@ impl OrganizeIncomingState {
                 .show(ui, |ui| self.source_pane(ui));
 
             egui::CentralPanel::default().show(ui, |ui| {
+                let editor_max = (ui.available_height() - 150.0).clamp(80.0, 360.0);
                 egui::Panel::bottom("incoming_item_editor")
                     .resizable(true)
                     .default_size(170.0)
-                    .min_size(110.0)
-                    .max_size(360.0)
+                    .min_size(80.0)
+                    .max_size(editor_max)
                     .show(ui, |ui| self.item_editor_pane(ui));
                 self.items_pane(ui);
             });
         });
 
         self.rules_window(ui.ctx(), jobs);
+        self.frames_window(ui.ctx());
 
         if scan {
             self.begin_scan(jobs);
@@ -2469,6 +2536,8 @@ fn report_rows(report: &RunReport, labels: &[ItemLabel]) -> (Vec<ReportRow>, Vec
             paths.push(text);
         }
         rows.push(ReportRow {
+            directory: label.is_some_and(|label| label.directory),
+            outcome: Some(item.state),
             source: label
                 .map(|label| label.source.clone())
                 .unwrap_or_else(PathBuf::new),
@@ -2563,6 +2632,8 @@ fn failed_run(
                 );
             }
             Some(ReportRow {
+                directory: label.directory,
+                outcome: confirmed.map(|item| item.state),
                 source: label.source.clone(),
                 destination: label.destination.clone(),
                 state: confirmed
@@ -2801,17 +2872,73 @@ impl OrganizeIncomingState {
         }
         let mut actions: Vec<RowAction> = Vec::new();
         let rows = std::mem::take(&mut self.rows);
-        egui::ScrollArea::vertical()
+        let visible: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| self.row_visible(row))
+            .map(|(index, _)| index)
+            .collect();
+        if visible.is_empty() {
+            self.rows = rows;
+            empty_state(
+                ui,
+                "No item matches the current filter.",
+                "Clear the filter or choose another source folder.",
+            );
+            return;
+        }
+        let height = ui.available_height().max(ITEM_ROW_HEIGHT * 4.0);
+        egui::ScrollArea::horizontal()
+            .id_salt("incoming_items_horizontal")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for row in &rows {
-                    if !self.row_visible(row) {
-                        continue;
-                    }
-                    if let Some(action) = self.row_ui(ui, row) {
-                        actions.push(action);
-                    }
-                }
+                ui.set_min_width(960.0);
+                egui_extras::TableBuilder::new(ui)
+                    .id_salt("incoming_items_table")
+                    .resizable(true)
+                    .striped(true)
+                    .min_scrolled_height(ITEM_ROW_HEIGHT * 4.0)
+                    .max_scroll_height(height)
+                    .auto_shrink([false, false])
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(egui_extras::Column::auto())
+                    .column(
+                        egui_extras::Column::initial(260.0)
+                            .at_least(120.0)
+                            .clip(true),
+                    )
+                    .column(
+                        egui_extras::Column::initial(110.0)
+                            .at_least(64.0)
+                            .clip(true),
+                    )
+                    .column(egui_extras::Column::initial(70.0).at_least(48.0))
+                    .column(
+                        egui_extras::Column::initial(240.0)
+                            .at_least(110.0)
+                            .clip(true),
+                    )
+                    .column(egui_extras::Column::remainder().at_least(180.0))
+                    .header(20.0, |mut header| {
+                        for title in ["", "File", "Type", "Frames", "Destination", "State"] {
+                            header.col(|ui| {
+                                ui.label(egui::RichText::new(title).small().weak());
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(ITEM_ROW_HEIGHT, visible.len(), |mut table_row| {
+                            let Some(row) = visible
+                                .get(table_row.index())
+                                .and_then(|index| rows.get(*index))
+                            else {
+                                return;
+                            };
+                            if let Some(action) = self.row_cells(&mut table_row, row) {
+                                actions.push(action);
+                            }
+                        });
+                    });
             });
         self.rows = rows;
         for action in actions {
@@ -2821,11 +2948,7 @@ impl OrganizeIncomingState {
                     self.focus = Some(item);
                     self.sync_editor();
                 }
-                RowAction::Toggle(item) => {
-                    if !self.expanded.remove(&item) {
-                        self.expanded.insert(item);
-                    }
-                }
+                RowAction::Frames(item) => self.frames_open = Some(item),
             }
         }
     }
@@ -2845,79 +2968,114 @@ impl OrganizeIncomingState {
             || row.kind.to_lowercase().contains(&filter)
     }
 
-    fn row_ui(&mut self, ui: &mut egui::Ui, row: &Row) -> Option<RowAction> {
+    /// One working-list row. Columns are the table's, not a stretched line: the
+    /// file name stays next to its type and frames, the planned folder is its
+    /// own column, and details wait on hover or in the frames dialog.
+    fn row_cells(
+        &self,
+        table_row: &mut egui_extras::TableRow<'_, '_>,
+        row: &Row,
+    ) -> Option<RowAction> {
         let mut action = None;
         let mut checked = self.selected.contains(&row.item);
-        ui.horizontal(|ui| {
+        table_row.col(|ui| {
             if ui.checkbox(&mut checked, "").changed() {
                 action = Some(RowAction::Select(row.item, checked));
             }
-            let focused = self.focus == Some(row.item);
+        });
+        let focused = self.focus == Some(row.item);
+        table_row.col(|ui| {
             let mut label = egui::RichText::new(&row.label);
             if focused {
                 label = label.strong();
             }
-            if ui.selectable_label(focused, label).clicked() {
+            let response = ui.selectable_label(focused, label);
+            if response.clicked() {
                 action = Some(RowAction::Focus(row.item));
             }
+            response.on_hover_text(format!(
+                "{}\n{}",
+                row.source_dir.display(),
+                size_text(row.bytes)
+            ));
+        });
+        table_row.col(|ui| {
             ui.label(egui::RichText::new(&row.kind).small().color(MUTED));
-            ui.label(
-                egui::RichText::new(format!(
-                    "· {} · {}",
-                    frames_text(row.frames),
-                    size_text(row.bytes)
-                ))
-                .small()
-                .color(MUTED),
-            );
-            if let Some(missing) = &row.missing {
-                ui.label(egui::RichText::new(missing).small().color(WARNING));
+        });
+        table_row.col(|ui| {
+            if row.sequence {
+                ui.label(
+                    egui::RichText::new(row.frames.to_string())
+                        .small()
+                        .color(MUTED),
+                );
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let expanded = self.expanded.contains(&row.item);
-                if ui
-                    .small_button(if expanded { "Hide files" } else { "Files" })
-                    .clicked()
-                {
-                    action = Some(RowAction::Toggle(row.item));
-                }
-                let folder = if row.folder.is_empty() {
-                    "—".to_string()
-                } else {
-                    row.folder.clone()
-                };
-                ui.label(egui::RichText::new(folder).small().color(MUTED));
+        });
+        table_row.col(|ui| {
+            let folder = if row.folder.is_empty() {
+                "—".to_string()
+            } else {
+                row.folder.clone()
+            };
+            let response = ui.label(egui::RichText::new(folder).small().color(MUTED));
+            let root = self.destination.trim();
+            if !root.is_empty() && !row.folder.is_empty() {
+                response.on_hover_text(Path::new(root).join(&row.folder).display().to_string());
+            }
+        });
+        table_row.col(|ui| {
+            ui.horizontal(|ui| {
+                // The footage rule is expected routing, so it stays quiet; a
+                // conflict or a broken destination is the only loud state.
                 if row.state != MappingState::Matched {
                     let color = match row.state {
                         MappingState::Ambiguous | MappingState::Invalid => DANGER,
-                        MappingState::FootageFallback => WARNING,
                         _ => MUTED,
                     };
                     ui.label(egui::RichText::new(row.state.label()).small().color(color))
                         .on_hover_text(&row.reason);
                 }
+                if row.gaps > 0 {
+                    let response = ui.label(
+                        egui::RichText::new(format!("missing {}", row.gaps))
+                            .small()
+                            .color(WARNING),
+                    );
+                    if let Some(detail) = &row.missing {
+                        response.on_hover_text(detail);
+                    }
+                }
+                let label = if row.sequence { "Frames" } else { "Files" };
+                if ui.small_button(label).clicked() {
+                    action = Some(RowAction::Frames(row.item));
+                }
             });
         });
-        if row.state != MappingState::Matched {
-            ui.horizontal(|ui| {
-                ui.add_space(22.0);
-                let color = if matches!(row.state, MappingState::Ambiguous | MappingState::Invalid)
-                {
-                    DANGER
-                } else {
-                    WARNING
-                };
-                ui.label(egui::RichText::new(&row.reason).small().color(color));
-            });
-        }
-        if self.expanded.contains(&row.item) {
-            self.member_list(ui, row.item);
-        }
         action
     }
 
-    /// The exact member files of one expanded row. A sequence lists its actual
-    /// frames, never a range, inside its own bounded scroll area.
+    /// The exact frames dialog: every member file of one item, never a range.
+    fn frames_window(&mut self, ctx: &egui::Context) {
+        let Some(item) = self.frames_open else {
+            return;
+        };
+        let Some(proposal) = self.proposals.iter().find(|proposal| proposal.item == item) else {
+            self.frames_open = None;
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("{} · exact files", proposal.label))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([420.0, 300.0])
+            .show(ctx, |ui| self.member_list(ui, item));
+        if !open {
+            self.frames_open = None;
+        }
+    }
+
+    /// The exact member files of one item. A sequence lists its actual frames,
+    /// never a range, inside its own bounded scroll area.
     fn member_list(&self, ui: &mut egui::Ui, item: usize) {
         let Some(scanned) = &self.scanned else {
             return;
@@ -2925,39 +3083,41 @@ impl OrganizeIncomingState {
         let Some(analyzed) = scanned.analysis.items.get(item) else {
             return;
         };
-        ui.horizontal(|ui| {
-            ui.add_space(22.0);
-            ui.vertical(|ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(MEMBER_SCROLL_HEIGHT)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for file in analyzed.files() {
-                            let name = file
-                                .path
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| file.path.display().to_string());
-                            ui.label(egui::RichText::new(name).small().monospace().color(MUTED));
-                        }
-                    });
-                if let IncomingItem::Sequence(sequence) = analyzed {
-                    if !sequence.duplicate_frames.is_empty() {
-                        let frames = sequence
-                            .duplicate_frames
-                            .iter()
-                            .map(|duplicate| duplicate.frame.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        ui.label(
-                            egui::RichText::new(format!("duplicate frames: {frames}"))
-                                .small()
-                                .color(WARNING),
-                        );
-                    }
+        let files = analyzed.files();
+        ui.label(
+            egui::RichText::new(format!("{} exact files", files.len()))
+                .small()
+                .weak(),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("incoming_frames_list")
+            .max_height(MEMBER_SCROLL_HEIGHT)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for file in files {
+                    let name = file
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| file.path.display().to_string());
+                    ui.label(egui::RichText::new(name).small().monospace().color(MUTED));
                 }
             });
-        });
+        if let IncomingItem::Sequence(sequence) = analyzed {
+            if !sequence.duplicate_frames.is_empty() {
+                let frames = sequence
+                    .duplicate_frames
+                    .iter()
+                    .map(|duplicate| duplicate.frame.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(
+                    egui::RichText::new(format!("duplicate frames: {frames}"))
+                        .small()
+                        .color(WARNING),
+                );
+            }
+        }
     }
 
     /// The contextual editor for the focused item, plus the batch controls that
@@ -3240,6 +3400,12 @@ impl OrganizeIncomingState {
             _ if items > 0 => format!("{items} items matched"),
             _ => "waiting".to_string(),
         };
+        // Reviewing is validation work; the bar is labelled for the work it shows.
+        let review_label = if validate.is_some() {
+            "Review"
+        } else {
+            "Match"
+        };
         let match_fraction = match (scan, validate) {
             (Some(job), _) if job.phase == JobPhase::Validating => job.progress.fraction(),
             (_, Some(job)) => job.progress.fraction(),
@@ -3247,11 +3413,21 @@ impl OrganizeIncomingState {
             _ => 0.0,
         };
         let transfer_detail = match execute {
-            Some(job) => format!(
-                "{} of {} files",
-                job.progress.completed,
-                job.progress.total.unwrap_or(0)
-            ),
+            Some(job) => {
+                let mut detail = format!(
+                    "{} of {} operations",
+                    job.progress.completed,
+                    job.progress.total.unwrap_or(0)
+                );
+                if let Some(total) = job.progress.bytes_total.filter(|total| *total > 0) {
+                    detail.push_str(&format!(
+                        " · {} of {}",
+                        size_text(job.progress.bytes_done),
+                        size_text(total)
+                    ));
+                }
+                detail
+            }
             None => self
                 .report
                 .as_ref()
@@ -3260,7 +3436,7 @@ impl OrganizeIncomingState {
                         "{} of {} files copied or moved · {} skipped",
                         report.counts.copied + report.counts.moved,
                         report.files,
-                        report.counts.skipped
+                        report_file_counts(report).1
                     )
                 })
                 .unwrap_or_else(|| "waiting".to_string()),
@@ -3276,7 +3452,7 @@ impl OrganizeIncomingState {
 
         for (phase, fraction, detail) in [
             ("Scan", scan_fraction, scan_detail),
-            ("Match", match_fraction, match_detail),
+            (review_label, match_fraction, match_detail),
             (
                 if moving { "Move" } else { "Copy" },
                 transfer_fraction,
@@ -3304,13 +3480,23 @@ impl OrganizeIncomingState {
         if let Some(message) = &self.message {
             ui.label(egui::RichText::new(message).small().color(WARNING));
         }
-        for warning in self
+        let warnings = self
             .review
             .as_ref()
             .map(|review| review.warnings.clone())
-            .unwrap_or_default()
-        {
-            ui.label(egui::RichText::new(warning).small().color(WARNING));
+            .unwrap_or_default();
+        if !warnings.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("{} review warnings", warnings.len()))
+                    .small()
+                    .color(WARNING),
+            )
+            .id_salt("incoming_review_warnings")
+            .show(ui, |ui| {
+                for warning in &warnings {
+                    ui.label(egui::RichText::new(warning).small().color(WARNING));
+                }
+            });
         }
         ui.separator();
         if self.report.is_none() {
@@ -3353,64 +3539,136 @@ impl OrganizeIncomingState {
         if let Some(error) = &report.error {
             ui.label(egui::RichText::new(error).small().color(DANGER));
         }
-        for warning in &report.warnings {
-            ui.label(egui::RichText::new(warning).small().color(WARNING));
-        }
-        for path in &report.recovery {
-            ui.label(
-                egui::RichText::new(format!("kept aside: {path}"))
+        if !report.warnings.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("{} run warnings", report.warnings.len()))
                     .small()
-                    .monospace()
-                    .color(MUTED),
+                    .color(WARNING),
+            )
+            .id_salt("incoming_report_warnings")
+            .show(ui, |ui| {
+                for warning in &report.warnings {
+                    ui.label(egui::RichText::new(warning).small().color(WARNING));
+                }
+            });
+        }
+        if !report.recovery.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new(format!("{} kept-aside paths", report.recovery.len())).small(),
+            )
+            .id_salt("incoming_report_recovery")
+            .show(ui, |ui| {
+                for path in &report.recovery {
+                    ui.label(
+                        egui::RichText::new(format!("kept aside: {path}"))
+                            .small()
+                            .monospace()
+                            .color(MUTED),
+                    );
+                }
+            });
+        }
+        // A copy leaves the source untouched, so it needs no rescan warning; a
+        // move does change what the scan read.
+        if report.draft.action == FileAction::Move
+            && report
+                .rows
+                .iter()
+                .any(|row| row.outcome == Some(ItemState::Moved))
+        {
+            ui.label(
+                egui::RichText::new(
+                    "The moved source files are gone, so scan the source folder again before planning another run.",
+                )
+                .small()
+                .color(MUTED),
             );
         }
-        ui.label(
-            egui::RichText::new(
-                "Scan the source again to plan the next run: the folder it read has changed.",
+        let root = report.draft.destination.trim().to_string();
+        let rows = &report.rows;
+        let height = ui.available_height().max(REPORT_ROW_HEIGHT * 4.0);
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("incoming_report_table")
+            .resizable(true)
+            .striped(true)
+            .min_scrolled_height(REPORT_ROW_HEIGHT * 3.0)
+            .max_scroll_height(height)
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(
+                egui_extras::Column::initial(220.0)
+                    .at_least(110.0)
+                    .clip(true),
             )
-            .small()
-            .color(MUTED),
-        );
-        egui::ScrollArea::vertical()
-            .max_height(140.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for row in &report.rows {
-                    ui.horizontal(|ui| {
-                        let source = row
+            .column(
+                egui_extras::Column::initial(360.0)
+                    .at_least(140.0)
+                    .clip(true),
+            )
+            .column(egui_extras::Column::remainder().at_least(170.0))
+            .header(18.0, |mut header| {
+                for title in ["File", "Destination", "Result"] {
+                    header.col(|ui| {
+                        ui.label(egui::RichText::new(title).small().weak());
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(REPORT_ROW_HEIGHT, rows.len(), |mut table_row| {
+                    let Some(row) = rows.get(table_row.index()) else {
+                        return;
+                    };
+                    let color = if row.failed { DANGER } else { MUTED };
+                    table_row.col(|ui| {
+                        let name = row
                             .source
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        ui.label(egui::RichText::new(source).small().color(if row.failed {
-                            DANGER
+                        let text = if name.is_empty() {
+                            "—".to_string()
                         } else {
-                            MUTED
-                        }));
-                        ui.label(
-                            egui::RichText::new(&row.destination)
-                                .small()
-                                .monospace()
-                                .color(if row.failed { DANGER } else { MUTED }),
-                        );
-                        for path in &row.recovery {
-                            ui.label(
-                                egui::RichText::new(format!("aside: {path}"))
-                                    .small()
-                                    .monospace()
-                                    .color(MUTED),
-                            );
-                        }
-                        ui.label(egui::RichText::new(row.state).small().color(if row.failed {
-                            DANGER
-                        } else {
-                            NEW_ENTRY
-                        }));
-                        if let Some(message) = &row.message {
-                            ui.label(egui::RichText::new(message).small().color(WARNING));
+                            name
+                        };
+                        let response = ui.label(egui::RichText::new(text).small().color(color));
+                        if !row.source.as_os_str().is_empty() {
+                            response.on_hover_text(row.source.display().to_string());
                         }
                     });
-                }
+                    table_row.col(|ui| {
+                        let relative = run_relative(&root, &row.destination);
+                        ui.label(
+                            egui::RichText::new(relative)
+                                .small()
+                                .monospace()
+                                .color(color),
+                        )
+                        .on_hover_text(row.destination.clone());
+                    });
+                    table_row.col(|ui| {
+                        let mut hover: Vec<String> = Vec::new();
+                        if let Some(message) = &row.message {
+                            hover.push(message.clone());
+                        }
+                        for path in &row.recovery {
+                            hover.push(format!("kept aside: {path}"));
+                        }
+                        let text = if row.recovery.is_empty() {
+                            row.state.to_string()
+                        } else {
+                            format!("{} · kept aside", row.state)
+                        };
+                        let response =
+                            ui.label(egui::RichText::new(text).small().color(if row.failed {
+                                DANGER
+                            } else {
+                                NEW_ENTRY
+                            }));
+                        if !hover.is_empty() {
+                            response.on_hover_text(hover.join("\n"));
+                        }
+                    });
+                });
             });
     }
 
@@ -3813,15 +4071,7 @@ impl OrganizeIncomingState {
 enum RowAction {
     Select(usize, bool),
     Focus(usize),
-    Toggle(usize),
-}
-
-fn frames_text(frames: usize) -> String {
-    if frames == 1 {
-        "1 file".to_string()
-    } else {
-        format!("{frames} frames")
-    }
+    Frames(usize),
 }
 
 fn size_text(bytes: u64) -> String {
@@ -3840,7 +4090,7 @@ fn size_text(bytes: u64) -> String {
 }
 
 fn report_headline(report: &RunDone) -> String {
-    let counts = report.counts;
+    let (completed, skipped, unfinished) = report_file_counts(report);
     let state = match report.state {
         RunState::Succeeded => "Finished",
         RunState::Partial => "Finished with items left out",
@@ -3852,11 +4102,21 @@ fn report_headline(report: &RunDone) -> String {
     };
     format!(
         "{state}: {} of {} files copied or moved · {} skipped · {} unfinished",
-        counts.copied + counts.moved,
-        report.files,
-        counts.skipped,
-        counts.unfinished()
+        completed, report.files, skipped, unfinished
     )
+}
+
+fn report_file_counts(report: &RunDone) -> (usize, usize, usize) {
+    let mut counts = (0, 0, 0);
+    for row in report.rows.iter().filter(|row| !row.directory) {
+        match row.outcome {
+            Some(ItemState::Copied | ItemState::Moved) => counts.0 += 1,
+            Some(ItemState::Skipped) => counts.1 += 1,
+            Some(ItemState::Pending | ItemState::Running) | None => counts.2 += 1,
+            _ => {}
+        }
+    }
+    counts
 }
 
 fn accent_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
@@ -3870,6 +4130,38 @@ fn accent_text_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 
 fn explain(response: &egui::Response, reason: &str) {
     let _ = response.clone().on_hover_text(reason);
+}
+
+/// Width a button with this text takes, measured the way egui measures it, so a
+/// toolbar can reserve the space before laying out a field beside it.
+fn button_width(ui: &egui::Ui, label: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, egui::Color32::WHITE)
+        .size()
+        .x;
+    text + 2.0 * ui.spacing().button_padding.x
+}
+
+fn small_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font, MUTED)
+        .size()
+        .x
+}
+
+/// Destination spelling relative to the run's own destination root, so a report
+/// row stays readable after the user edits the destination field.
+fn run_relative(root: &str, path: &str) -> String {
+    if root.is_empty() {
+        return path.to_string();
+    }
+    match Path::new(path).strip_prefix(Path::new(root)) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.display().to_string(),
+        _ => path.to_string(),
+    }
 }
 
 fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {

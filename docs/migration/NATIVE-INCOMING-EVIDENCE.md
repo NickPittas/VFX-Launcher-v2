@@ -47,7 +47,34 @@ Move, conflict policies, user-edited patterns/profiles, batch edits, pause/cance
 failure recovery, native chooser shutdown and persisted-layout restoration still
 need their own localized manual checks. No automated tests or test suites ran.
 
-The live page still exposes duplicate technical continuity warnings and verbose
-footage-fallback explanations. Those need concise labels with collapsible details.
-The active progress label counts directory operations as files; the final report
-correctly separates the seven copied files. This is not full visual sign-off.
+## Presentation follow-up
+
+The integrated native build was opened again with the same disposable workspace.
+The working list now has resizable File, Type, Frames, Destination and State
+columns; single files leave Frames blank. The exact-files window listed only
+1001, 1003 and 1004. Continuity warnings remain available in counted collapsibles,
+and ordinary footage routing uses a quiet label with details on hover.
+
+Two all-Skip runs completed through the native UI. The first exposed a headline
+bug: seven existing folders were included in the skipped-file count. After the
+correction, the next run showed seven skipped files, zero copied/moved and zero
+unfinished. Expanding the results dock exposed all seven per-file rows with
+destinations relative to the original run root. Both sessions exited normally.
+
+Screenshots: `incoming-presentation-scan-result.png`,
+`incoming-presentation-frames-open.png`, `incoming-corrected-skip-report.png`,
+and `incoming-corrected-expanded-report.png` under `artifacts/screenshots/`.
+
+At the minimum 1080px window width both folder controls remained accessible.
+However, saved enlarged docks consumed too much vertical space and overlapped
+the working-list/editor headings. Dynamic dock height limits were added after
+this observation; their native recheck is recorded separately below. This is
+still not full visual or workflow sign-off.
+
+The next native session at 1080×900 confirmed distinct working-list and editor
+headings after the dock limits (`incoming-dock-limits-scanned.png` and
+`incoming-dock-limits-expanded.png`). Resizing docks remained responsive.
+It also exposed an inaccessible State column when saved column widths exceeded
+the pane. A horizontal scroll container was added; compilation is checked, but
+that last correction has not yet received its native recheck. This session also
+exited zero through File → Quit.

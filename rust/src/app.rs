@@ -1864,8 +1864,14 @@ fn status_text(job: Option<&JobStatus>, closing: bool, live_jobs: usize) -> Stri
 }
 
 fn progress_label(job: &JobStatus) -> String {
+    if let Some(outcome) = job.outcome {
+        return outcome.label().to_string();
+    }
     match job.progress.total {
         Some(total) => format!("{} {}/{}", job.phase.label(), job.progress.completed, total),
-        None => format!("{} {}", job.phase.label(), job.progress.completed),
+        None if job.progress.completed > 0 => {
+            format!("{} {}", job.phase.label(), job.progress.completed)
+        }
+        None => job.phase.label().to_string(),
     }
 }

@@ -87,12 +87,12 @@ fn notices(ui: &mut egui::Ui, title: &str, id: &str, lines: &[String]) {
     }
     egui::CollapsingHeader::new(format!("{title} ({})", lines.len()))
         .id_salt(id)
-        .default_open(lines.len() <= 6)
+        .default_open(false)
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt((id, "lines"))
                 .max_height(160.0)
-                .auto_shrink([false, false])
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for line in lines {
                         ui.label(egui::RichText::new(line).small().weak());
