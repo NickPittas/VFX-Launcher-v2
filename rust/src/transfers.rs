@@ -752,6 +752,41 @@ fn plan_relative_copy(
             continue;
         }
         let expected = expected_stamp(entry)?;
+        let source = match fs::symlink_metadata(&entry.path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let root = fs::canonicalize(&snapshot.root).map_err(|error| {
+                    TransferError::new(
+                        TransferCategory::Unavailable,
+                        Some(&snapshot.root),
+                        format!("source root cannot be resolved: {error}"),
+                    )
+                })?;
+                let target = fs::canonicalize(&entry.path).map_err(|error| {
+                    TransferError::new(
+                        TransferCategory::Unavailable,
+                        Some(&entry.path),
+                        format!("linked source cannot be resolved: {error}"),
+                    )
+                })?;
+                let target_relative = target.strip_prefix(&root).map_err(|_| {
+                    TransferError::new(
+                        TransferCategory::InvalidInput,
+                        Some(&entry.path),
+                        "linked source points outside the selected source folder",
+                    )
+                })?;
+                // Capture the contained target now; execution never follows the link.
+                snapshot.root.join(target_relative)
+            }
+            Ok(_) => entry.path.clone(),
+            Err(error) => {
+                return Err(TransferError::new(
+                    TransferCategory::Unavailable,
+                    Some(&entry.path),
+                    format!("source cannot be inspected: {error}"),
+                ));
+            }
+        };
         if expected.modified_ns.is_none() {
             missing_mtime += 1;
         }
@@ -769,7 +804,7 @@ fn plan_relative_copy(
             }
         }
         actions.push(PlannedAction::File {
-            source: StoredPath::from_native(&entry.path, &snapshot.root)?,
+            source: StoredPath::from_native(&source, &snapshot.root)?,
             relative: StoredPath::from_native(relative, &snapshot.root)?,
             action: FileAction::Copy,
             expected: Some(expected),

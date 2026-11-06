@@ -2183,6 +2183,17 @@ warnings. The 0.3.1 AppImage repeats that successful dry-run with one combined
 advisory; its version and checksum checks pass. These checks isolate the warnings
 from execution readiness, but do not reproduce or resolve the user's UI state.
 
+The source review found a concrete shared admission mismatch: discovery emits
+file links as selectable files, while transfer validation rejects link sources.
+Planning now captures an in-root link's resolved target, retaining its original
+destination spelling and UI row/result mapping. Validation/execution retain
+their no-follow, identity, size/mtime and containment checks. Outside-root links
+remain refused. The disposable `copy-disabled-0.3.1` fixture reproduced the
+failure with published 0.3.0; corrected 0.3.1 validated and copied both files
+(62 bytes, matching SHA-256 digests), and refused an outside-root link in a
+dry-run. No production data or GUI was used. This fixes that confirmed defect,
+without claiming it is the proven cause of the reported SMB UI incident.
+
 The latest repository changes add Incoming's image/sequence dock, exact-member
 navigation, bounded native image decoding and FFmpeg fallback, DJV/MRV2/Nuke
 Player context actions and settings, and the localhost NukeServerSocket client.

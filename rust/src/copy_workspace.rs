@@ -144,7 +144,12 @@ struct ScanRun {
 
 struct ValidateRun {
     draft: Draft,
-    replies: Receiver<Result<ValidationReport, String>>,
+    replies: Receiver<Result<ValidationDone, String>>,
+}
+
+struct ValidationDone {
+    report: ValidationReport,
+    original_sources: Vec<Option<PathBuf>>,
 }
 
 /// Where one reviewed item writes, so a run report can name its destination
@@ -174,6 +179,7 @@ struct CopyFailure {
 struct Review {
     draft: Draft,
     items: Vec<ItemValidation>,
+    original_sources: Vec<Option<PathBuf>>,
     folders: usize,
     files_copy: usize,
     files_skip: usize,
@@ -466,7 +472,10 @@ impl CopyByFileTypeState {
             return;
         }
         match result {
-            Ok(report) => {
+            Ok(ValidationDone {
+                report,
+                original_sources,
+            }) => {
                 let ValidationReport {
                     ready,
                     items,
@@ -479,6 +488,7 @@ impl CopyByFileTypeState {
                 self.review = Some(Review {
                     draft: run.draft,
                     items,
+                    original_sources,
                     folders: counted.folders,
                     files_copy: counted.copy,
                     files_skip: counted.skip,
@@ -785,11 +795,15 @@ impl CopyByFileTypeState {
                 if item.kind == ActionKind::Directory {
                     continue;
                 }
-                let Some(source) = &item.source else {
+                let Some(source) = review
+                    .original_sources
+                    .get(item.index)
+                    .and_then(Option::as_ref)
+                else {
                     continue;
                 };
                 self.row_states
-                    .insert(source.path().to_path_buf(), review_row_state(item));
+                    .insert(source.clone(), review_row_state(item));
             }
             return;
         }
@@ -1032,16 +1046,28 @@ impl CopyByFileTypeState {
                     policy,
                 )
             };
-            let result = planned
-                .map_err(|error| describe(&error))
-                .map(|plan| transfers::validate_plan(&plan));
+            let result = planned.map_err(|error| describe(&error)).map(|plan| {
+                let original_sources = plan
+                    .actions
+                    .iter()
+                    .map(|action| {
+                        action
+                            .source()
+                            .map(|_| manifest.root.join(action.relative().path()))
+                    })
+                    .collect();
+                ValidationDone {
+                    report: transfers::validate_plan(&plan),
+                    original_sources,
+                }
+            });
             let result = if control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
                 Err("Validation was cancelled; no copy was started.".into())
             } else {
                 result
             };
             let (outcome, progress) = match &result {
-                Ok(report) => {
+                Ok(ValidationDone { report, .. }) => {
                     let outcome = if report.counts.blocked > 0 {
                         JobOutcome::Partial
                     } else {
@@ -1106,7 +1132,7 @@ impl CopyByFileTypeState {
             .items
             .iter()
             .map(|item| ItemLabel {
-                source: item.source.as_ref().map(|path| path.path().to_path_buf()),
+                source: review.original_sources.get(item.index).cloned().flatten(),
                 destination: item
                     .destination
                     .as_ref()
