@@ -80,3 +80,15 @@ external Nuke/AE acceptance were not runtime verified. No hostile-writer or
 whole-batch atomicity guarantee. GUI captures prove the recorded workflows only;
 the New Project form's clipped lower controls at its initial size remain an
 existing layout issue, not a transfer-backend sign-off.
+
+## Final published package
+
+Clean build source: `6a3b2cf3a21a3c112d9be5b05639795d0803f128`.
+`VFX-Launcher-0.2.0-Windows-x86_64.zip`: 7,169,591 bytes; SHA-256
+`07e0ef99ebe65b2336020d61e0ac8369d186fcd435e66f16344f6c3098acdb2c`.
+BUILD-INFO.txt records `Uncommitted source changes: False`.
+The extracted final executable copied the generated 1,989-byte Nuke script in a
+separate disposable backup (run 3, succeeded). Native GUI startup, populated
+Projects/version row and obsolete-banner removal are captured in
+`artifacts/screenshots/windows-final-populated.png`; normal close was requested.
+No external Nuke process was launched.
