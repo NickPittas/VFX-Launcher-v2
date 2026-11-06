@@ -2,7 +2,7 @@
 
 [All guides](../README.md) · [Downloads](../../README.md#downloads)
 
-Install the package using the [Linux](../LINUX-APPIMAGE.md) or [Windows](../WINDOWS.md) guide. The guides describe the current 0.3.4 source/Linux interface; Windows 0.2.0 has the earlier desktop and may lack later controls and fixes.
+Install the package using the [Linux](../LINUX-APPIMAGE.md) or [Windows](../WINDOWS.md) guide. The guides describe the shared 0.3.4 desktop; consult the platform notes for external dependencies and verification limits.
 
 Use the top tabs to switch between Projects, Shots & Sequences, Organize Incoming, Copy by File Type and Back Up Projects. Settings is at the right. Drag panel dividers and column boundaries where available; right-click rows for context actions. Logs and file-operation history are under View.
 

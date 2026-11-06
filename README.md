@@ -7,9 +7,9 @@ A native Rust/egui desktop for VFX projects: browse and launch Nuke and After Ef
 | Platform | Published version | Download | Installation |
 | --- | --- | --- | --- |
 | Linux x86_64 | **0.3.4** | [AppImage](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-x86_64.AppImage) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-x86_64.AppImage.sha256) | [Linux guide](docs/LINUX-APPIMAGE.md) |
-| Windows 10/11 x64 | **0.2.0 prerelease** | [Portable ZIP](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.2.0/VFX-Launcher-0.2.0-Windows-x86_64.zip) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.2.0/VFX-Launcher-0.2.0-Windows-x86_64.zip.sha256) | [Windows guide](docs/WINDOWS.md) |
+| Windows 10/11 x64 | **0.3.4** | [Portable ZIP](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-Windows-x86_64.zip) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-Windows-x86_64.zip.sha256) | [Windows guide](docs/WINDOWS.md) |
 
-No Python or Rust installation is needed for these packages. Windows 0.2.0 is already published on GitHub; a Windows 0.3.4 package is not published. The later Linux changes listed below are not included in that Windows download.
+No Python or Rust installation is needed for these packages. Both platforms provide version 0.3.4. The Windows portable package is built natively on kamino-3.
 
 ## Screenshots
 

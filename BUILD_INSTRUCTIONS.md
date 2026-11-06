@@ -6,7 +6,7 @@ For the current Rust desktop, use the platform-specific recipes:
 - [Windows portable build and installation](docs/WINDOWS.md).
 - [Published downloads](README.md#downloads) and [release history](CHANGELOG.md).
 
-The scripts package the Rust application without running test suites. Linux 0.3.4 and Windows 0.2.0 are the currently published packages; do not infer Windows version parity from the shared source.
+The scripts package the Rust application without running test suites. Linux and Windows 0.3.4 are the current packages. Build Windows natively on kamino-3 using the existing checkout and `build_windows.ps1`; do not use GitHub-hosted builds.
 
 ## Legacy Python build
 

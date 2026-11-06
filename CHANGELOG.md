@@ -1,8 +1,8 @@
 # Release history
 
-## 0.3.4 — 2026-11-06 · Linux
+## 0.3.4 — 2026-11-06 · Linux and Windows
 
-Newer ARRI filenames, extension keywords such as `.cube`, Incoming resolution reads, robust ffprobe JSON parsing and explicit Pi model discovery/submission. Includes the 0.3.3 fixes. [Full notes and verification limits](docs/RELEASE-0.3.4.md).
+Newer ARRI filenames, extension keywords such as `.cube`, Incoming resolution reads, robust ffprobe JSON parsing and explicit Pi model discovery/submission. Includes the 0.3.3 fixes. Windows is built natively on kamino-3; the file-manager reveal fix is Linux-specific. [Full notes and verification limits](docs/RELEASE-0.3.4.md).
 
 ## 0.3.3 — Linux fixes included in 0.3.4
 

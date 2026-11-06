@@ -26,7 +26,7 @@ production catalog was used for validation. Previous runtime limitations apply.
 
 ## Downloads and included fixes
 
-[Linux AppImage and checksum](../README.md#downloads) are published on the [0.3.4 GitHub release](https://github.com/NickPittas/VFX-Launcher-v2/releases/tag/v0.3.4). Windows remains the separately published [0.2.0 portable prerelease](WINDOWS.md); no Windows 0.3.4 package is available.
+[Linux AppImage and checksum](../README.md#downloads) are published on the [0.3.4 GitHub release](https://github.com/NickPittas/VFX-Launcher-v2/releases/tag/v0.3.4). The [Windows 0.3.4 portable ZIP and checksum](WINDOWS.md) are built natively on kamino-3 from the shared source. The Linux file-manager reveal fix remains Linux-specific. Windows packaging verification and remaining runtime limits are recorded in [the packaging evidence](migration/WINDOWS-0.3.4-EVIDENCE.md).
 
 This package also includes the [0.3.3 fixes](RELEASE-0.3.3.md): Linux file-manager reveal/selection, retained copy/backup validation reasons, current blocked items above historical results, and clearing old approval after failed revalidation.
 
