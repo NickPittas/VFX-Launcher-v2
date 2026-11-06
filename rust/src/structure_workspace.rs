@@ -26,14 +26,15 @@
 //! through [`ProjectWorkspace::register_created_project`], which also selects and
 //! scans it.
 
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui;
 
-use crate::jobs::{JobContext, JobId, JobOutcome, JobPhase, JobProgress, Jobs};
+use crate::jobs::{
+    JobContext, JobControl, JobEvents, JobId, JobOutcome, JobPhase, JobProgress, Jobs,
+};
 use crate::nuke::{RESOLUTION_PRESETS, ScriptGenerator};
 use crate::project_workspace::ProjectWorkspace;
 use crate::storage::{CatalogClient, ProjectId, UserId};
@@ -50,10 +51,6 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
 const WARNING: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x6a);
 /// Frame rates the source widgets offered.
 const FPS_PRESETS: [f64; 9] = [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 120.0];
-/// A project with thousands of render folders must never turn one click into an
-/// unbounded walk, so both the folder count and the depth are bounded.
-const MAX_TREE_FOLDERS: usize = 2000;
-const MAX_TREE_DEPTH: usize = 6;
 const NO_PROJECT: &str = "Select a project in Projects first.";
 const BUSY: &str = "Wait for the current operation to finish.";
 const NO_CATALOG: &str = "The project catalog is not ready yet.";
@@ -841,6 +838,7 @@ struct RunDone {
 #[derive(Default)]
 struct PlanSession {
     counter: u64,
+    planning: Option<Receiver<Result<Preview, String>>>,
     preview: Option<Preview>,
     validate: Option<ValidateRun>,
     review: Option<ReviewView>,
@@ -857,7 +855,7 @@ impl PlanSession {
     }
 
     fn busy(&self) -> bool {
-        self.validate.is_some() || self.run.is_some()
+        self.planning.is_some() || self.validate.is_some() || self.run.is_some()
     }
 
     /// Drops results that no longer describe `draft`, as every edit must.
@@ -899,8 +897,65 @@ impl PlanSession {
     }
 
     fn poll(&mut self) {
+        if let Some(replies) = self.planning.take() {
+            match replies.try_recv() {
+                Ok(Ok(preview)) => {
+                    self.preview = Some(preview);
+                    self.message = None;
+                }
+                Ok(Err(message)) => self.message = Some(message),
+                Err(TryRecvError::Empty) => self.planning = Some(replies),
+                Err(TryRecvError::Disconnected) => {
+                    self.message =
+                        Some("Preparing the additions stopped without a result.".to_string())
+                }
+            }
+        }
         self.poll_validate();
         self.poll_run();
+    }
+
+    fn begin_preview(
+        &mut self,
+        ctx: &egui::Context,
+        jobs: &mut Jobs,
+        draft: StructureDraft,
+        build: impl FnOnce(&StructureDraft, u64) -> Result<OperationPlan, String> + Send + 'static,
+    ) -> Result<(), String> {
+        if self.busy() {
+            return Err(BUSY.to_string());
+        }
+        let revision = self.next_revision();
+        let (tx, rx) = channel();
+        jobs.start(ctx, "Preparing folders and scripts", move |context| {
+            let result = if context.control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                Err("Preparing additions was cancelled.".to_string())
+            } else {
+                build(&draft, revision).map(|plan| Preview::build(draft, plan))
+            };
+            let cancelled = context.control.checkpoint() == crate::jobs::Checkpoint::Cancelled;
+            let outcome = if cancelled {
+                JobOutcome::Cancelled
+            } else if result.is_ok() {
+                JobOutcome::Succeeded
+            } else {
+                JobOutcome::Failed
+            };
+            let result = if cancelled {
+                Err("Preparing additions was cancelled.".to_string())
+            } else {
+                result
+            };
+            let _ = tx.send(result);
+            context.events.finish(outcome, JobProgress::default());
+        })
+        .map_err(|error| format!("Preparing additions could not start: {error}"))?;
+        self.preview = None;
+        self.review = None;
+        self.report = None;
+        self.message = Some("Preparing the destination preview…".to_string());
+        self.planning = Some(rx);
+        Ok(())
     }
 
     fn poll_validate(&mut self) {
@@ -1296,65 +1351,79 @@ impl FolderTree {
     }
 }
 
-fn walk_project(root: &Path) -> Result<(Vec<FolderRow>, Option<String>), String> {
-    if let Err(error) = fs::read_dir(root) {
-        return Err(format!("{} cannot be listed: {error}", root.display()));
-    }
+fn walk_project(
+    root: &Path,
+    control: &JobControl,
+    events: &JobEvents,
+) -> Result<(Vec<FolderRow>, Option<String>), String> {
     let mut rows = Vec::new();
     let mut note = None;
-    walk_level(root, Path::new(""), 0, &mut rows, &mut note);
-    Ok((rows, note))
-}
-
-fn walk_level(
-    root: &Path,
-    relative: &Path,
-    depth: usize,
-    rows: &mut Vec<FolderRow>,
-    note: &mut Option<String>,
-) {
-    let dir = root.join(relative);
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            note.get_or_insert_with(|| {
-                format!("{} could not be listed: {error}", relative.display())
-            });
-            return;
+    let mut pending = vec![(PathBuf::new(), 0)];
+    while let Some((relative, depth)) = pending.pop() {
+        if control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+            return Err("Reading project folders was cancelled.".to_string());
         }
-    };
-    let mut names: Vec<OsString> = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-            continue;
+        let dir = root.join(&relative);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if relative.as_os_str().is_empty() => {
+                return Err(format!("{} cannot be listed: {error}", dir.display()));
+            }
+            Err(error) => {
+                note.get_or_insert_with(|| {
+                    format!("Some folders could not be read: {}: {error}", dir.display())
+                });
+                continue;
+            }
         };
-        // A symlinked folder is not a destination: the planner refuses links, so
-        // listing one would only offer an impossible target.
-        if meta.is_dir() && !meta.file_type().is_symlink() {
-            names.push(entry.file_name());
+        let mut children = Vec::new();
+        for entry in entries {
+            if control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                return Err("Reading project folders was cancelled.".to_string());
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    note.get_or_insert_with(|| {
+                        format!("Some folder entries could not be read: {error}")
+                    });
+                    continue;
+                }
+            };
+            match fs::symlink_metadata(entry.path()) {
+                Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+                    children.push(relative.join(entry.file_name()))
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    note.get_or_insert_with(|| {
+                        format!(
+                            "Some folders could not be inspected: {}: {error}",
+                            entry.path().display()
+                        )
+                    });
+                }
+            }
         }
-    }
-    names.sort();
-    for name in names {
-        if rows.len() >= MAX_TREE_FOLDERS {
-            note.get_or_insert_with(|| {
-                format!("only the first {MAX_TREE_FOLDERS} folders are listed")
+        children.sort();
+        for child in &children {
+            rows.push(FolderRow {
+                relative: child.clone(),
+                depth,
             });
-            return;
         }
-        let child = relative.join(&name);
-        rows.push(FolderRow {
-            relative: child.clone(),
-            depth,
-        });
-        if depth + 1 >= MAX_TREE_DEPTH {
-            note.get_or_insert_with(|| {
-                format!("folders deeper than {MAX_TREE_DEPTH} levels are not listed")
-            });
-            continue;
-        }
-        walk_level(root, &child, depth + 1, rows, note);
+        pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
+        events.progress(
+            JobPhase::Scanning,
+            JobProgress {
+                completed: rows.len() as u64,
+                current: Some(dir),
+                ..JobProgress::default()
+            },
+        );
     }
+    rows.sort_by(|a, b| a.relative.cmp(&b.relative));
+    Ok((rows, note))
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,6 +1500,7 @@ enum DialogAction {
 
 struct NewProjectDialog {
     parent: String,
+    picked_parent: Option<(PathBuf, String)>,
     number: String,
     suggested_number: String,
     client: String,
@@ -1446,8 +1516,7 @@ struct NewProjectDialog {
 
 impl NewProjectDialog {
     fn new(library: &LibrarySnapshot, parent: Option<PathBuf>, template: &str) -> Self {
-        let date = crate::storage::utc_timestamp_now();
-        let date = date.get(..10).unwrap_or_default().to_string();
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let template = if library.template(template).is_some() {
             template.to_string()
         } else {
@@ -1458,6 +1527,9 @@ impl NewProjectDialog {
                 .unwrap_or_default()
         };
         Self {
+            picked_parent: parent
+                .as_ref()
+                .map(|path| (path.clone(), path.display().to_string())),
             parent: parent
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
@@ -1476,6 +1548,11 @@ impl NewProjectDialog {
     }
 
     fn parent_path(&self) -> Option<PathBuf> {
+        if let Some((path, spelling)) = &self.picked_parent {
+            if &self.parent == spelling {
+                return Some(path.clone());
+            }
+        }
         let text = self.parent.trim();
         (!text.is_empty()).then(|| PathBuf::from(text))
     }
@@ -1747,6 +1824,7 @@ impl StructureWorkspace {
                 self.last_pick = Some(folder.clone());
                 if let Some(dialog) = self.new_project.as_mut() {
                     dialog.parent = folder.display().to_string();
+                    dialog.picked_parent = Some((folder, dialog.parent.clone()));
                 }
                 self.suggest_number();
             }
@@ -1819,11 +1897,12 @@ impl StructureWorkspace {
         }
         let (tx, rx) = channel();
         let started = jobs.start(&self.ctx, "Reading project folders", move |context| {
-            let result = walk_project(&root);
-            let outcome = if result.is_ok() {
-                JobOutcome::Succeeded
-            } else {
-                JobOutcome::Failed
+            let result = walk_project(&root, &context.control, &context.events);
+            let outcome = match &result {
+                _ if context.control.is_cancelled() => JobOutcome::Cancelled,
+                Ok((_, Some(_))) => JobOutcome::Partial,
+                Ok(_) => JobOutcome::Succeeded,
+                Err(_) => JobOutcome::Failed,
             };
             let _ = tx.send(result);
             context.events.finish(outcome, JobProgress::default());
@@ -1988,7 +2067,7 @@ impl StructureWorkspace {
         None
     }
 
-    fn build_preview(&mut self) -> Result<(), String> {
+    fn build_preview(&mut self, jobs: &mut Jobs) -> Result<(), String> {
         if let Some(reason) = self.plan_reason() {
             return Err(reason);
         }
@@ -2005,13 +2084,10 @@ impl StructureWorkspace {
             }
         };
         let draft = self.add_draft();
-        let revision = self.session.next_revision();
-        let plan = plan_add(&draft, &template, revision)?;
-        self.session.preview = Some(Preview::build(draft, plan));
-        self.session.review = None;
-        self.session.report = None;
-        self.session.message = None;
-        Ok(())
+        self.session
+            .begin_preview(&self.ctx, jobs, draft, move |draft, revision| {
+                plan_add(draft, &template, revision)
+            })
     }
 
     fn validate_blocked(&self) -> Option<String> {
@@ -2187,7 +2263,7 @@ impl StructureWorkspace {
             .default_size(240.0)
             .min_size(150.0)
             .max_size(460.0)
-            .show(ui, |ui| self.preview_dock(ui));
+            .show(ui, |ui| self.preview_dock(ui, jobs));
         egui::Panel::left("structure_destination_tree")
             .resizable(true)
             .default_size(300.0)
@@ -2326,7 +2402,7 @@ impl StructureWorkspace {
         }
     }
 
-    fn preview_dock(&mut self, ui: &mut egui::Ui) {
+    fn preview_dock(&mut self, ui: &mut egui::Ui, jobs: &mut Jobs) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Destination preview").small().weak());
             if let Some(preview) = &self.session.preview {
@@ -2342,7 +2418,7 @@ impl StructureWorkspace {
                 let blocked = self.plan_reason();
                 let button = accent_button(ui, "Regenerate preview", blocked.is_none());
                 if button.clicked() {
-                    if let Err(message) = self.build_preview() {
+                    if let Err(message) = self.build_preview(jobs) {
                         self.session.message = Some(message);
                     }
                 }
@@ -2547,6 +2623,9 @@ impl StructureWorkspace {
                                     if edit.changed() {
                                         // No folder read per keystroke: the next free
                                         // number is looked up when the field is committed.
+                                        if dialog.number == dialog.suggested_number {
+                                            dialog.number.clear();
+                                        }
                                         dialog.suggested_number.clear();
                                     }
                                     if edit.lost_focus() {
@@ -2777,19 +2856,20 @@ impl StructureWorkspace {
                     if preview.clicked() {
                         dialog.session.clear();
                         if let Some(summary) = self.snapshot.template(&dialog.template).cloned() {
-                            match self.library.snapshot(&summary) {
-                                Ok(template) => {
-                                    let draft = dialog.draft();
-                                    let revision = dialog.session.next_revision();
-                                    match plan_new_project(&draft, &template, revision) {
-                                        Ok(plan) => {
-                                            dialog.session.preview =
-                                                Some(Preview::build(draft, plan));
-                                        }
-                                        Err(message) => dialog.session.message = Some(message),
-                                    }
-                                }
-                                Err(error) => dialog.session.message = Some(describe(&error)),
+                            let library = self.library.clone();
+                            let draft = dialog.draft();
+                            if let Err(message) = dialog.session.begin_preview(
+                                ctx,
+                                jobs,
+                                draft,
+                                move |draft, revision| {
+                                    let template = library
+                                        .snapshot(&summary)
+                                        .map_err(|error| describe(&error))?;
+                                    plan_new_project(draft, &template, revision)
+                                },
+                            ) {
+                                dialog.session.message = Some(message);
                             }
                         } else {
                             dialog.session.message = Some(NO_TEMPLATE.to_string());
@@ -2888,6 +2968,9 @@ impl StructureWorkspace {
 
     pub fn templates_dialog(&mut self, ctx: &egui::Context, jobs: &mut Jobs) {
         if !self.dialog.open {
+            return;
+        }
+        if self.busy() {
             return;
         }
         let mut open = self.dialog.open;
@@ -3234,6 +3317,14 @@ impl StructureWorkspace {
     }
 
     fn apply_dialog_action(&mut self, action: DialogAction, jobs: &mut Jobs) {
+        if self.busy() {
+            return;
+        }
+        // Template contents are part of both plans, even when their ID is unchanged.
+        self.session.clear();
+        if let Some(dialog) = self.new_project.as_mut() {
+            dialog.session.clear();
+        }
         match action {
             DialogAction::Close => self.dialog.open = false,
             DialogAction::CreateTemplate => {
