@@ -49,6 +49,7 @@ pub struct ImportWorkspace {
     data_root: PathBuf,
     database: PathField,
     ini: PathField,
+    ini_encoding: String,
     favorites: Vec<PathBuf>,
     worker: Option<(JobId, bool, Receiver<Reply>)>,
     prepared: Option<PreparedImport>,
@@ -63,6 +64,7 @@ impl ImportWorkspace {
             data_root,
             database: PathField::default(),
             ini: PathField::default(),
+            ini_encoding: "utf-8".to_string(),
             favorites: Vec::new(),
             worker: None,
             prepared: None,
@@ -190,18 +192,20 @@ impl ImportWorkspace {
             return;
         }
         let root = self.data_root.clone();
+        let encoding = self.ini_encoding.clone();
         let (tx, rx) = channel();
         match jobs.start(ui.ctx(), "Import previous Launcher data", move |context| {
-            let result = crate::legacy_import::prepare_import(
+            let result = crate::legacy_import::prepare_import_encoding(
                 &sources,
                 &root,
+                &encoding,
                 &context.control,
                 &context.events,
             );
-            let outcome = if context.control.is_cancelled() {
-                JobOutcome::Cancelled
-            } else if result.is_ok() {
+            let outcome = if result.is_ok() {
                 JobOutcome::Succeeded
+            } else if context.control.is_cancelled() {
+                JobOutcome::Cancelled
             } else {
                 JobOutcome::Failed
             };
@@ -226,7 +230,17 @@ impl ImportWorkspace {
         let root = self.data_root.clone();
         let (tx, rx) = channel();
         match jobs.start(ui.ctx(), "Select imported workspace", move |context| {
-            let result = crate::config::adopt_workspace(&root, &directory).map_err(|error| format!("The workspace selection could not be confirmed: {error}. Keep the prepared folder; a restart will read the saved selection."));
+            let result = if context.control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                Err("Selecting the imported workspace was cancelled.".to_string())
+            } else {
+                crate::config::adopt_workspace(&root, &directory).map_err(|error| {
+                    match crate::config::resolve_workspace(&root) {
+                        Ok(selected) if selected == directory => format!("The new workspace selection was saved, but its durability could not be confirmed: {error}. Keep the prepared folder; the next launch currently selects it."),
+                        Ok(_) => format!("The previous workspace selection is unchanged: {error}. Keep the prepared folder and retry after resolving the error."),
+                        Err(read_error) => format!("The workspace selection cannot be read after the write error: {error}. Read error: {read_error}. Keep both workspaces; resolve the selection error before restarting."),
+                    }
+                })
+            };
             let outcome = if result.is_ok() { JobOutcome::Succeeded } else { JobOutcome::Failed };
             let _ = tx.send(Reply::Adopted(result));
             context.events.finish(outcome, JobProgress::default());
@@ -263,6 +277,29 @@ impl ImportWorkspace {
                         ui.end_row();
                     }
                 });
+            ui.horizontal(|ui| {
+                ui.label("Original INI encoding");
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.ini_encoding).desired_width(160.0))
+                    .changed();
+                egui::ComboBox::from_id_salt("legacy_ini_encoding_presets")
+                    .selected_text("Presets")
+                    .show_ui(ui, |ui| {
+                        for label in [
+                            "utf-8",
+                            "windows-1252",
+                            "windows-1253",
+                            "windows-1251",
+                            "utf-16le",
+                            "utf-16be",
+                            "shift_jis",
+                        ] {
+                            changed |= ui
+                                .selectable_value(&mut self.ini_encoding, label.to_string(), label)
+                                .changed();
+                        }
+                    });
+            });
             ui.horizontal(|ui| {
                 if ui.button("Add favorites files…").clicked() {
                     pick = Some(Pick::Favorites);

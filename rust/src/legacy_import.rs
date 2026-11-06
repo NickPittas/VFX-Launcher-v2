@@ -421,20 +421,22 @@ fn convert_row(
             let raw = required(row, "path")?;
             let path = imported_path(&raw)?;
             let existing = connection.query_row("SELECT id FROM projects WHERE root_platform=?1 AND ((?2 IS NOT NULL AND root_storage=?2) OR (?2 IS NULL AND root_storage IS NULL AND root_display=?3)) ORDER BY id LIMIT 1", params![path.platform,path.storage,path.display], |row| row.get::<_,i64>(0)).optional().map_err(sql)?;
+            let author_name = text(row, "added_by");
+            let author = author_name
+                .as_ref()
+                .map(|name| {
+                    connection
+                        .query_row("SELECT id FROM users WHERE username=?1", [name], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .optional()
+                })
+                .transpose()
+                .map_err(sql)?
+                .flatten();
             let local = if let Some(existing) = existing {
                 existing
             } else {
-                let author = text(row, "added_by")
-                    .map(|name| {
-                        connection
-                            .query_row("SELECT id FROM users WHERE username=?1", [name], |row| {
-                                row.get::<_, i64>(0)
-                            })
-                            .optional()
-                    })
-                    .transpose()
-                    .map_err(sql)?
-                    .flatten();
                 connection.execute("INSERT INTO projects(id,name,root_storage,root_platform,root_spelling,root_display,added_by,added_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![id,name,path.storage,path.platform,path.spelling,path.display,author,text(row,"added_at").unwrap_or_default()]).map_err(sql)?;
                 id
             };
@@ -447,7 +449,7 @@ fn convert_row(
                 let folder = imported_path(folder)?;
                 connection.execute("INSERT INTO project_scan_folders(project_id,storage,platform,spelling,display,added_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE NOT EXISTS(SELECT 1 FROM project_scan_folders WHERE project_id=?1 AND platform=?3 AND spelling=?4)", params![local,folder.storage,folder.platform,folder.spelling,folder.display,at]).map_err(sql)?;
             }
-            let converted = converted(
+            let mut converted = converted(
                 "projects",
                 local,
                 if existing.is_some() {
@@ -456,6 +458,10 @@ fn convert_row(
                     "Imported with original ID; unavailable folders remain registered without scanning."
                 },
             );
+            if let Some(name) = author_name.filter(|_| author.is_none()) {
+                converted.status = RowStatus::ImportedWithUnresolvedReferences;
+                converted.message.push_str(&format!(" The original added-by username {name:?} could not be matched to an imported user; the original attribution remains in capture.json."));
+            }
             Ok(if existing.is_some() {
                 converted.combined()
             } else {
@@ -626,13 +632,13 @@ fn resolve_favorite(
                     if trimmed.is_empty() {
                         return Err("the value is an empty string".into());
                     }
-                    let imported = crate::paths::retain_imported(std::ffi::OsStr::new(trimmed));
+                    let imported = crate::paths::retain_imported(std::ffi::OsStr::new(spelling));
                     if imported.tag == crate::paths::PlatformTag::Unknown {
                         return Err(format!(
                             "{spelling:?} is neither a project ID nor an absolute path, and a basename is never guessed"
                         ));
                     }
-                    let path = imported_path(trimmed)?;
+                    let path = imported_path(spelling)?;
                     return connection
                         .query_row(
                             "SELECT id FROM projects WHERE root_platform=?1 AND ((?2 IS NOT NULL AND root_storage=?2) OR (?2 IS NULL AND root_storage IS NULL AND root_display=?3)) ORDER BY id LIMIT 1",
@@ -698,9 +704,9 @@ fn import_favorite_values(
         let spelled = value.to_string();
         // An unversioned JSON array has no row IDs, so the entry's provenance is
         // its raw value in the message, not a fabricated legacy_id.
-        let (project, message) = match resolve_favorite(connection, mappings, value) {
+        let (project, message, status) = match resolve_favorite(connection, mappings, value) {
             Ok(project) => {
-                connection.execute(
+                let inserted = connection.execute(
                     "INSERT INTO favorites(user_id,project_id,created_at) VALUES(?1,?2,?3) ON CONFLICT(user_id,project_id) DO NOTHING",
                     params![user, project, at],
                 )?;
@@ -709,6 +715,11 @@ fn import_favorite_values(
                     format!(
                         "Imported the sidecar favorite {spelled} for user {user} as project {project}; the SQL favorite for the same pair is kept. The sidecar carries no timestamp, so {at} is the import time."
                     ),
+                    if inserted == 0 {
+                        RowStatus::Combined
+                    } else {
+                        RowStatus::Imported
+                    },
                 )
             }
             Err(reason) => (
@@ -716,17 +727,14 @@ fn import_favorite_values(
                 format!(
                     "The sidecar favorite {spelled} for user {user} stays unresolved: {reason}. The original value remains in capture.json."
                 ),
+                RowStatus::Unresolved,
             ),
         };
         if project.is_none() {
             issues.push(format!("{label}: {message}"));
         }
         dispositions.push(RowDisposition {
-            status: if project.is_some() {
-                RowStatus::Imported
-            } else {
-                RowStatus::Unresolved
-            },
+            status,
             table: label.to_string(),
             legacy_id: None,
             local_table: project.map(|_| "favorites".to_string()),
@@ -741,6 +749,16 @@ fn import_favorite_values(
 pub fn prepare_import(
     sources: &LegacySources,
     data_root: &Path,
+    control: &JobControl,
+    events: &JobEvents,
+) -> Result<PreparedImport, String> {
+    prepare_import_encoding(sources, data_root, "utf-8", control, events)
+}
+
+pub fn prepare_import_encoding(
+    sources: &LegacySources,
+    data_root: &Path,
+    ini_encoding: &str,
     control: &JobControl,
     events: &JobEvents,
 ) -> Result<PreparedImport, String> {
@@ -770,7 +788,7 @@ pub fn prepare_import(
     let mut ini_issues = Vec::new();
     if let Some(sidecar) = &capture.ini {
         let label = sidecar_label(sidecar);
-        match crate::legacy_ini::import_settings(&sidecar.bytes, &settings) {
+        match crate::legacy_ini::import_settings_encoding(&sidecar.bytes, &settings, ini_encoding) {
             Ok((imported, issues)) => {
                 settings = imported;
                 ini_issues.extend(issues.into_iter().map(|issue| format!("{label}: {issue}")));
@@ -809,12 +827,9 @@ pub fn prepare_import(
             .map_err(|error| error.to_string())?
             .wait()
             .map_err(|error| error.to_string())?;
-        let source = imported_path(
-            sources
-                .database
-                .to_str()
-                .ok_or("The source database path cannot be represented in import metadata.")?,
-        )?;
+        let source_key = crate::paths::path_key(&sources.database, &sources.database)
+            .map_err(|error| error.to_string())?;
+        let source = PathColumns::native(&sources.database, &source_key);
         let at = capture.captured_at.clone();
         let origin=catalog.transaction(move |connection| {
             connection.execute("INSERT INTO import_origins(source_kind,source_spelling,source_display,imported_at,notes) VALUES('legacy_sqlite',?1,?2,?3,?4)",params![source.spelling,source.display,at,"Raw consistent snapshot: capture.json; dispositions: report.json"]).map_err(database_error)?;
@@ -901,7 +916,7 @@ pub fn prepare_import(
                 local_table: Some("settings".to_string()),
                 local_id: None,
                 message: format!(
-                    "The legacy settings this build consumes were applied from {label} over fresh defaults; values it has no consumer for are reported under issues, with their raw text retained in capture.json."
+                    "The legacy settings were decoded from {label} using the requested {ini_encoding} encoding and applied over fresh defaults; additional values are reported under issues, with their raw text retained in capture.json."
                 ),
             });
         }

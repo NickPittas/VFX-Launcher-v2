@@ -33,6 +33,7 @@ egui_extras = { version = "=0.37.0", default-features = false }
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
+encoding_rs = "=0.8.35"
 # P2 tokenizer for the legacy Linux Nuke launch command. Used only for
 # `shlex::split`, the POSIX-shell word splitting the legacy `shlex.split` did —
 # not a hand-written quote parser, and never a shell.

@@ -102,13 +102,29 @@ pub fn import_settings(
     bytes: &[u8],
     base: &config::Settings,
 ) -> Result<(config::Settings, Vec<String>), String> {
-    let text = std::str::from_utf8(bytes).map_err(|error| {
-        format!(
-            "the INI is not valid UTF-8 (first invalid byte at offset {}); it was not imported",
-            error.valid_up_to()
-        )
-    })?;
-    let ini = Ini::parse(text)?;
+    import_settings_encoding(bytes, base, "utf-8")
+}
+
+/// Encoding is chosen explicitly at import; raw bytes remain in the capture.
+pub fn import_settings_encoding(
+    bytes: &[u8],
+    base: &config::Settings,
+    label: &str,
+) -> Result<(config::Settings, Vec<String>), String> {
+    let encoding =
+        encoding_rs::Encoding::for_label_no_replacement(label.as_bytes()).ok_or_else(|| {
+            format!(
+                "The INI encoding {label:?} is not supported; choose the original file's encoding."
+            )
+        })?;
+    let (text, invalid) = encoding.decode_with_bom_removal(bytes);
+    if invalid {
+        return Err(format!(
+            "The INI contains invalid {} data; choose its original encoding. Nothing was imported.",
+            encoding.name()
+        ));
+    }
+    let ini = Ini::parse(&text)?;
     let mut settings = base.clone();
     let mut issues = Vec::new();
 
@@ -168,6 +184,28 @@ pub fn import_settings(
         issues.push(format!(
             "The legacy value {value:?} from [{section}] {option} is not applied by this build: {reason}. It stays with the import metadata."
         ));
+    }
+
+    const MAPPED: &[(&str, &str)] = &[
+        (PATHS, "nuke_path"),
+        (PATHS, "after_effects_path"),
+        (PATHS, "nuke_launch_cmd_linux"),
+        (PROJECTS, "project_directories"),
+        (LOGGING, "log_level"),
+    ];
+    for (section, values) in &ini.sections {
+        for option in values.keys() {
+            let known = MAPPED.iter().any(|(s, k)| *s == section && *k == option)
+                || INACTIVE_VALUES
+                    .iter()
+                    .any(|(s, k, _)| *s == section && k.to_lowercase() == *option);
+            if !known {
+                issues.push(format!("The additional original setting [{section}] {option} is retained in capture.json; it has no active setting in this application."));
+            }
+        }
+    }
+    for option in ini.defaults.keys() {
+        issues.push(format!("The original shared [DEFAULT] setting {option} is retained in capture.json. Recognized values are inherited only by sections present in the INI."));
     }
 
     Ok((settings, issues))
@@ -309,6 +347,9 @@ impl Ini {
     /// Raw (uninterpolated) value, section first, then `[DEFAULT]`, exactly the
     /// `ChainMap` a `ConfigParser.get` interpolates against.
     fn option(&self, section: &str, option: &str) -> Option<&str> {
+        if section != DEFAULT_SECTION && !self.sections.contains_key(section) {
+            return None;
+        }
         if let Some(values) = self.sections.get(section) {
             if let Some(value) = values.get(option) {
                 return Some(value);
