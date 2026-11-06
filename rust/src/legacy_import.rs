@@ -1,4 +1,13 @@
 //! Read-only legacy capture and staged catalog conversion. Sources are never initialized.
+//!
+//! Three legacy inputs are imported into one staged area: the SQLite catalog
+//! (read inside a consistent snapshot), `app_settings.ini` through
+//! [`crate::legacy_ini::import_settings`], and the per-user
+//! `favorites_<username>.json` sidecars. Sidecar favorites are unioned with the
+//! SQL `favorite_projects` rows: a numeric entry tries the legacy project ID
+//! first, an absolute path is matched against the imported roots on its own
+//! platform, and every other or unmatched value is reported instead of guessed.
+//! Malformed INI and favorites envelopes refuse preparation before staging.
 use crate::jobs::{Checkpoint, JobControl, JobEvents, JobPhase, JobProgress};
 use crate::storage::{Catalog, PathColumns, StorageCategory, StorageError};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::ValueRef};
@@ -112,6 +121,23 @@ pub fn capture(
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let required: &[&str] = match *name {
+            "users" => &["id", "username"],
+            "projects" => &["id", "name", "path"],
+            "project_files" => &["id", "project_id", "filename", "filepath"],
+            "recent_projects" | "favorite_projects" => &["id", "user_id", "project_id"],
+            "file_access_log" => &["id", "file_id", "user_id", "accessed_at"],
+            "user_activity_log" => &["id", "username", "action_type", "description", "timestamp"],
+            _ => &[],
+        };
+        if let Some(missing) = required
+            .iter()
+            .find(|required| !columns.iter().any(|column| column == **required))
+        {
+            return Err(format!(
+                "The legacy {name} table is missing its {missing} column; nothing was imported."
+            ));
+        }
         let mut cursor = statement.query([]).map_err(|error| error.to_string())?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next().map_err(|error| error.to_string())? {
@@ -223,7 +249,17 @@ fn capture_sidecar(path: &Path) -> Result<CapturedSidecar, String> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowStatus {
+    Imported,
+    Combined,
+    Unresolved,
+    ImportedWithUnresolvedReferences,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RowDisposition {
+    pub status: RowStatus,
     pub table: String,
     pub legacy_id: Option<i64>,
     pub local_table: Option<String>,
@@ -246,7 +282,7 @@ pub struct PreparedImport {
     pub report: ImportReport,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Mappings {
     ids: HashMap<(String, i64), i64>,
 }
@@ -307,15 +343,24 @@ fn imported_path(raw: &str) -> Result<PathColumns, String> {
 }
 
 struct Converted {
+    status: RowStatus,
     table: Option<&'static str>,
     id: Option<i64>,
     message: String,
 }
 fn converted(table: &'static str, id: i64, message: &str) -> Converted {
     Converted {
+        status: RowStatus::Imported,
         table: Some(table),
         id: Some(id),
         message: message.into(),
+    }
+}
+
+impl Converted {
+    fn combined(mut self) -> Self {
+        self.status = RowStatus::Combined;
+        self
     }
 }
 
@@ -356,7 +401,7 @@ fn convert_row(
                     "users",
                     existing,
                     "Combined with the same exact username; the original row remains in capture.json.",
-                ));
+                ).combined());
             }
             connection
                 .execute(
@@ -402,7 +447,7 @@ fn convert_row(
                 let folder = imported_path(folder)?;
                 connection.execute("INSERT INTO project_scan_folders(project_id,storage,platform,spelling,display,added_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE NOT EXISTS(SELECT 1 FROM project_scan_folders WHERE project_id=?1 AND platform=?3 AND spelling=?4)", params![local,folder.storage,folder.platform,folder.spelling,folder.display,at]).map_err(sql)?;
             }
-            Ok(converted(
+            let converted = converted(
                 "projects",
                 local,
                 if existing.is_some() {
@@ -410,7 +455,12 @@ fn convert_row(
                 } else {
                     "Imported with original ID; unavailable folders remain registered without scanning."
                 },
-            ))
+            );
+            Ok(if existing.is_some() {
+                converted.combined()
+            } else {
+                converted
+            })
         }
         "project_files" => {
             let project = mapped(mappings, "projects", integer(row, "project_id"))?;
@@ -446,7 +496,7 @@ fn convert_row(
                 id
             };
             connection.execute("INSERT INTO project_files(project_id,file_id,added_at) VALUES(?1,?2,?3) ON CONFLICT(project_id,file_id) DO NOTHING",params![project,local,at]).map_err(sql)?;
-            Ok(converted(
+            let converted = converted(
                 "files",
                 local,
                 if existing.is_some() {
@@ -454,17 +504,33 @@ fn convert_row(
                 } else {
                     "Imported with original file ID; raw modification time retained."
                 },
-            ))
+            );
+            Ok(if existing.is_some() {
+                converted.combined()
+            } else {
+                converted
+            })
         }
         "favorite_projects" | "recent_projects" => {
             let user = mapped(mappings, "users", integer(row, "user_id"))?;
             let project = mapped(mappings, "projects", integer(row, "project_id"))?;
+            let destination_table = if table == "favorite_projects" {
+                "favorites"
+            } else {
+                "recents"
+            };
+            let existing: bool = connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {destination_table} WHERE user_id=?1 AND project_id=?2)"), params![user,project], |row| row.get(0)).map_err(sql)?;
             if table == "favorite_projects" {
                 connection.execute("INSERT INTO favorites(user_id,project_id,created_at) VALUES(?1,?2,?3) ON CONFLICT(user_id,project_id) DO NOTHING",params![user,project,at]).map_err(sql)?;
             } else {
                 connection.execute("INSERT INTO recents(user_id,project_id,accessed_at) VALUES(?1,?2,?3) ON CONFLICT(user_id,project_id) DO UPDATE SET accessed_at=MAX(recents.accessed_at,excluded.accessed_at)",params![user,project,text(row,"accessed_at").unwrap_or_default()]).map_err(sql)?;
             }
             Ok(Converted {
+                status: if existing {
+                    RowStatus::Combined
+                } else {
+                    RowStatus::Imported
+                },
                 table: None,
                 id: None,
                 message: format!(
@@ -477,7 +543,7 @@ fn convert_row(
             let user = mapped(mappings, "users", integer(row, "user_id"));
             let unresolved = file.is_err() || user.is_err();
             connection.execute("INSERT INTO file_access_log(id,file_id,user_id,accessed_at) VALUES(?1,?2,?3,?4)",params![id,file.ok(),user.ok(),text(row,"accessed_at").unwrap_or_default()]).map_err(sql)?;
-            Ok(converted(
+            let mut converted = converted(
                 "file_access_log",
                 id,
                 if unresolved {
@@ -485,7 +551,11 @@ fn convert_row(
                 } else {
                     "Imported log with original ID and mapped references."
                 },
-            ))
+            );
+            if unresolved {
+                converted.status = RowStatus::ImportedWithUnresolvedReferences;
+            }
+            Ok(converted)
         }
         "user_activity_log" => {
             let username = text(row, "username").unwrap_or_default();
@@ -508,6 +578,165 @@ fn convert_row(
     }
 }
 
+/// Sidecar favorites: the legacy UI wrote `favorites_<username>.json`, an
+/// unversioned JSON array of project IDs and/or path spellings, next to the INI
+/// (`ui_slick/favorites_manager.py`), so the SQL `favorite_projects` rows are
+/// not the whole picture. Values resolve against the selected legacy database
+/// first and then against imported project roots; unresolved values are
+/// reported, never guessed.
+fn sidecar_username(sidecar: &CapturedSidecar) -> Option<&str> {
+    sidecar
+        .path
+        .path()
+        .file_name()?
+        .to_str()?
+        .strip_prefix("favorites_")?
+        .strip_suffix(".json")
+        .filter(|name| !name.is_empty())
+}
+
+fn sidecar_label(sidecar: &CapturedSidecar) -> String {
+    sidecar
+        .path
+        .path()
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| sidecar.path.path().display().to_string())
+}
+
+/// Resolves one sidecar entry. A JSON number or a numeric string is a legacy
+/// project ID and is looked up in the conversion map; an absolute path spelling
+/// is matched against the imported roots on its own platform and normalized
+/// root key. Anything else (relative names, `None`, basenames) is unresolved.
+fn resolve_favorite(
+    connection: &Connection,
+    mappings: &Mappings,
+    value: &serde_json::Value,
+) -> Result<i64, String> {
+    let id = match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .ok_or_else(|| format!("{number} is not an integer project ID"))?,
+        serde_json::Value::String(spelling) => {
+            let trimmed = spelling.trim();
+            match trimmed.parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    if trimmed.is_empty() {
+                        return Err("the value is an empty string".into());
+                    }
+                    let imported = crate::paths::retain_imported(std::ffi::OsStr::new(trimmed));
+                    if imported.tag == crate::paths::PlatformTag::Unknown {
+                        return Err(format!(
+                            "{spelling:?} is neither a project ID nor an absolute path, and a basename is never guessed"
+                        ));
+                    }
+                    let path = imported_path(trimmed)?;
+                    return connection
+                        .query_row(
+                            "SELECT id FROM projects WHERE root_platform=?1 AND ((?2 IS NOT NULL AND root_storage=?2) OR (?2 IS NULL AND root_storage IS NULL AND root_display=?3)) ORDER BY id LIMIT 1",
+                            params![path.platform, path.storage, path.display],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            format!(
+                                "{spelling:?} does not match any imported project root on its platform"
+                            )
+                        });
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "{other} is neither a project ID nor a path spelling; the legacy UI only stored those"
+            ));
+        }
+    };
+    mappings
+        .ids
+        .get(&("projects".to_string(), id))
+        .copied()
+        .ok_or_else(|| format!("no imported project carries legacy ID {id}"))
+}
+
+/// Imports one `favorites_<username>.json` into `favorites`, keeping the SQL
+/// favorites already imported for that user. Per-value outcomes are returned as
+/// dispositions; only catalog I/O errors abort.
+fn import_favorite_values(
+    connection: &Connection,
+    mappings: &Mappings,
+    user: i64,
+    label: &str,
+    bytes: &[u8],
+    at: &str,
+) -> Result<(Vec<RowDisposition>, Vec<String>), rusqlite::Error> {
+    let values: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(values) => values,
+        Err(error) => {
+            return Ok((
+                Vec::new(),
+                vec![format!(
+                    "{label} is not readable JSON ({error}); its entries were not imported and the SQL favorites are unchanged. The raw bytes remain in capture.json."
+                )],
+            ));
+        }
+    };
+    let Some(values) = values.as_array() else {
+        return Ok((
+            Vec::new(),
+            vec![format!(
+                "{label} is not the unversioned JSON array the legacy UI wrote; its entries were not imported. The raw bytes remain in capture.json."
+            )],
+        ));
+    };
+    let mut dispositions = Vec::new();
+    let mut issues = Vec::new();
+    for value in values {
+        let spelled = value.to_string();
+        // An unversioned JSON array has no row IDs, so the entry's provenance is
+        // its raw value in the message, not a fabricated legacy_id.
+        let (project, message) = match resolve_favorite(connection, mappings, value) {
+            Ok(project) => {
+                connection.execute(
+                    "INSERT INTO favorites(user_id,project_id,created_at) VALUES(?1,?2,?3) ON CONFLICT(user_id,project_id) DO NOTHING",
+                    params![user, project, at],
+                )?;
+                (
+                    Some(project),
+                    format!(
+                        "Imported the sidecar favorite {spelled} for user {user} as project {project}; the SQL favorite for the same pair is kept. The sidecar carries no timestamp, so {at} is the import time."
+                    ),
+                )
+            }
+            Err(reason) => (
+                None,
+                format!(
+                    "The sidecar favorite {spelled} for user {user} stays unresolved: {reason}. The original value remains in capture.json."
+                ),
+            ),
+        };
+        if project.is_none() {
+            issues.push(format!("{label}: {message}"));
+        }
+        dispositions.push(RowDisposition {
+            status: if project.is_some() {
+                RowStatus::Imported
+            } else {
+                RowStatus::Unresolved
+            },
+            table: label.to_string(),
+            legacy_id: None,
+            local_table: project.map(|_| "favorites".to_string()),
+            local_id: project,
+            message,
+        });
+    }
+    Ok((dispositions, issues))
+}
+
 /// Always creates a separate catalog/config area. No selection is changed here.
 pub fn prepare_import(
     sources: &LegacySources,
@@ -519,6 +748,40 @@ pub fn prepare_import(
         return Err("The application data root must be absolute.".into());
     }
     let capture = capture(sources, control, events)?;
+    for sidecar in &capture.favorites {
+        let values: serde_json::Value =
+            serde_json::from_slice(&sidecar.bytes).map_err(|error| {
+                format!(
+                    "{} cannot be read as favorites JSON: {error}. Nothing was staged.",
+                    sidecar_label(sidecar)
+                )
+            })?;
+        if !values.is_array() {
+            return Err(format!(
+                "{} must contain the original favorites array. Nothing was staged.",
+                sidecar_label(sidecar)
+            ));
+        }
+    }
+    // The INI is applied before anything is staged: the INI adapter never
+    // returns a partial result, so a malformed file aborts here and no staged
+    // area is left behind from a source this build could not read.
+    let mut settings = crate::config::Settings::default();
+    let mut ini_issues = Vec::new();
+    if let Some(sidecar) = &capture.ini {
+        let label = sidecar_label(sidecar);
+        match crate::legacy_ini::import_settings(&sidecar.bytes, &settings) {
+            Ok((imported, issues)) => {
+                settings = imported;
+                ini_issues.extend(issues.into_iter().map(|issue| format!("{label}: {issue}")));
+            }
+            Err(reason) => {
+                return Err(format!(
+                    "The legacy settings file {label} could not be imported: {reason}. Nothing was staged and the current workspace is unchanged."
+                ));
+            }
+        }
+    }
     let name = format!(
         "import-{}-{}",
         std::process::id(),
@@ -527,7 +790,8 @@ pub fn prepare_import(
             .map_err(|error| error.to_string())?
             .as_nanos()
     );
-    let parent = data_root.join("imports");
+    let parent = crate::paths::validate_destination(data_root, Path::new("imports"))
+        .map_err(|error| format!("The import staging folder cannot be used: {error}"))?;
     fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
     let directory = parent.join(name);
     fs::create_dir(&directory).map_err(|error| error.to_string())?;
@@ -596,9 +860,9 @@ pub fn prepare_import(
                                 }
                                 savepoint.commit().map_err(database_error)?;
                                 if let (Some(local_id),Some(legacy_id))=(converted.id,legacy_id) { mappings.ids.insert((table.into(),legacy_id),local_id); }
-                                dispositions.push(RowDisposition { table:table.into(),legacy_id,local_table:converted.table.map(str::to_owned),local_id:converted.id,message:converted.message });
+                                dispositions.push(RowDisposition { status:converted.status,table:table.into(),legacy_id,local_table:converted.table.map(str::to_owned),local_id:converted.id,message:converted.message });
                             }
-                            Err(message) => { savepoint.rollback().map_err(database_error)?; savepoint.commit().map_err(database_error)?; dispositions.push(RowDisposition { table:table.into(),legacy_id,local_table:None,local_id:None,message }); }
+                            Err(message) => { savepoint.rollback().map_err(database_error)?; savepoint.commit().map_err(database_error)?; dispositions.push(RowDisposition { status:RowStatus::Unresolved,table:table.into(),legacy_id,local_table:None,local_id:None,message }); }
                         }
                     }
                     Ok((mappings,dispositions))
@@ -617,7 +881,6 @@ pub fn prepare_import(
                 );
             }
         }
-        let mut settings = crate::config::Settings::default();
         let users = catalog
             .list_users()
             .map_err(|error| error.to_string())?
@@ -628,11 +891,81 @@ pub fn prepare_import(
             .find(|user| user.username == "admin")
             .or(users.first())
             .map(|user| user.username.clone());
-        if capture.ini.is_some() {
-            return Err("The legacy INI settings adapter is not connected yet; the current workspace was left unchanged.".into());
+        report.issues.extend(ini_issues);
+        if let Some(sidecar) = &capture.ini {
+            let label = sidecar_label(sidecar);
+            report.rows.push(RowDisposition {
+                status: RowStatus::Imported,
+                table: label.clone(),
+                legacy_id: None,
+                local_table: Some("settings".to_string()),
+                local_id: None,
+                message: format!(
+                    "The legacy settings this build consumes were applied from {label} over fresh defaults; values it has no consumer for are reported under issues, with their raw text retained in capture.json."
+                ),
+            });
         }
-        if !capture.favorites.is_empty() {
-            return Err("The sidecar favorites adapter is not connected yet; the current workspace was left unchanged.".into());
+        let sidecar_total = capture.favorites.len();
+        for (index, sidecar) in capture.favorites.iter().enumerate() {
+            if control.checkpoint() == Checkpoint::Cancelled {
+                return Err(format!(
+                    "Import cancelled. The current workspace is unchanged; staged data remains at {}.",
+                    directory.display()
+                ));
+            }
+            let label = sidecar_label(sidecar);
+            let Some(username) = sidecar_username(sidecar).map(str::to_owned) else {
+                report.issues.push(format!(
+                    "{label} is not named favorites_<username>.json; its entries were not imported."
+                ));
+                continue;
+            };
+            let bytes = sidecar.bytes.clone();
+            let captured_at = capture.captured_at.clone();
+            let sidecar_mappings = mappings.clone();
+            let sidecar_name = label.clone();
+            let (rows, issues) = catalog
+                .transaction(move |connection| {
+                    let user = connection
+                        .query_row(
+                            "SELECT id FROM users WHERE username=?1",
+                            [&username],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(database_error)?;
+                    let Some(user) = user else {
+                        return Ok((
+                            Vec::new(),
+                            vec![format!(
+                                "{sidecar_name} belongs to the legacy user {username:?}, who was not imported; its entries were not imported and are never attached to another user."
+                            )],
+                        ));
+                    };
+                    import_favorite_values(
+                        connection,
+                        &sidecar_mappings,
+                        user,
+                        &sidecar_name,
+                        &bytes,
+                        &captured_at,
+                    )
+                    .map_err(database_error)
+                })
+                .map_err(|error| error.to_string())?
+                .wait()
+                .map_err(|error| error.to_string())?;
+            report.rows.extend(rows);
+            report.issues.extend(issues);
+            events.progress(
+                JobPhase::Validating,
+                JobProgress {
+                    completed: (total + index + 1) as u64,
+                    total: Some((total + sidecar_total) as u64),
+                    current: Some(sidecar.path.path().to_path_buf()),
+                    ..Default::default()
+                },
+            );
         }
         crate::config::SettingsStore::new(directory.join("settings.json"))
             .save(&settings)
