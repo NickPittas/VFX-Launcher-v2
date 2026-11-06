@@ -27,6 +27,7 @@ pub mod incoming_workspace;
 pub mod jobs;
 pub mod launch;
 pub mod legacy_import;
+pub mod legacy_ini;
 pub mod nuke;
 pub mod paths;
 pub mod patterns;

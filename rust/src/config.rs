@@ -386,6 +386,224 @@ pub fn default_catalog_path() -> ConfigResult<PathBuf> {
     Ok(default_data_dir()?.join("catalog.sqlite3"))
 }
 
+/// Envelope version of `active-workspace.json`, the pointer to the workspace
+/// layout an import adopted.
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 1;
+
+/// File name of the adopted-workspace pointer, beside `settings.json` and
+/// `catalog.sqlite3` in the data root.
+pub const WORKSPACE_MANIFEST_FILE: &str = "active-workspace.json";
+
+/// Which directory under the data root this installation owns after an import.
+///
+/// The pointer is a separate file so that an installation which never imported
+/// anything keeps the original flat layout and needs no migration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceManifest {
+    pub schema_version: u32,
+    /// Workspace directory relative to the data root. Absolute spellings and
+    /// `..` components are refused, never normalized away.
+    pub workspace_relative: JsonPath,
+}
+
+/// Path of the adopted-workspace pointer for `data_root`.
+pub fn workspace_manifest_path(data_root: &Path) -> PathBuf {
+    data_root.join(WORKSPACE_MANIFEST_FILE)
+}
+
+/// Resolves the directory this installation reads its catalog, settings and
+/// reports from.
+///
+/// - no manifest: `data_root` itself, the original layout. A first run and an
+///   installation that never imported anything are unchanged, and nothing is
+///   created here.
+/// - a manifest naming a workspace: `data_root/<workspace_relative>` after
+///   [`paths::validate_destination`](crate::paths::validate_destination), so an
+///   absolute spelling, a `..` component, a NUL, an invalid native name or a
+///   symlink/reparse ancestor is refused rather than resolved. The directory
+///   must exist.
+/// - a malformed manifest, a version this build does not support, an unusable
+///   spelling or a workspace that is gone is an error. It never resolves to a
+///   fresh empty layout, because a lost workspace would then look like a lost
+///   catalog instead of being reported.
+///
+/// Callers open the catalog, the settings and the reports only from the
+/// returned directory, and only after this returns `Ok`.
+pub fn resolve_workspace(data_root: &Path) -> ConfigResult<PathBuf> {
+    require_absolute(data_root, "data root")?;
+    let manifest_path = workspace_manifest_path(data_root);
+    let manifest = read_versioned::<WorkspaceManifest>(
+        &manifest_path,
+        "workspace manifest",
+        WORKSPACE_SCHEMA_VERSION,
+    )?;
+    let Some(manifest) = manifest else {
+        return Ok(data_root.to_path_buf());
+    };
+    let workspace =
+        crate::paths::validate_destination(data_root, manifest.workspace_relative.as_path())
+            .map_err(|error| {
+                ConfigError::new(
+                    ConfigCategory::InvalidValue,
+                    Some(&manifest_path),
+                    format!("the workspace manifest does not name a usable directory: {error}"),
+                )
+            })?;
+    require_prepared_workspace(
+        manifest.workspace_relative.as_path(),
+        &workspace,
+        &manifest_path,
+    )?;
+    Ok(workspace)
+}
+
+/// Records `prepared_directory` as the adopted workspace, atomically.
+///
+/// Validation runs before the pointer is written: both paths must be absolute,
+/// the prepared directory must exist, and its spelling relative to `data_root`
+/// must survive [`paths::validate_destination`](crate::paths::validate_destination)
+/// — no absolute or `..` component, no NUL, valid native names, and no
+/// symlink/reparse point among its existing ancestors.
+///
+/// Nothing is copied, moved, rolled back or deleted here. Validation failures
+/// leave the selection unchanged. A write error can follow atomic replacement
+/// when the directory flush fails; the caller must reread the selector and report
+/// uncertain durability, never claim rollback or delete the prepared workspace. The caller opens the catalog, the
+/// settings and the reports only after this returns `Ok`, so a prepared
+/// workspace that cannot be opened is reported instead of being replaced by an
+/// empty layout.
+///
+/// The two arguments must be spelled from the same root: the relative name is
+/// computed lexically, so a differently spelled data root is refused.
+pub fn adopt_workspace(data_root: &Path, prepared_directory: &Path) -> ConfigResult<()> {
+    require_absolute(data_root, "data root")?;
+    require_absolute(prepared_directory, "prepared workspace")?;
+    let relative = prepared_directory.strip_prefix(data_root)
+        .map_err(|_| {
+            ConfigError::new(
+                ConfigCategory::InvalidValue,
+                Some(prepared_directory),
+                format!(
+                    "the prepared workspace is not inside the data root {}; refusing to adopt a directory this application does not own",
+                    data_root.display()
+                ),
+            )
+        })?;
+    if relative.as_os_str().is_empty() {
+        return Err(ConfigError::new(
+            ConfigCategory::InvalidValue,
+            Some(prepared_directory),
+            "the prepared workspace is the data root itself; there is nothing to adopt and the original layout already applies",
+        ));
+    }
+    let workspace = crate::paths::validate_destination(data_root, relative).map_err(|error| {
+        ConfigError::new(
+            ConfigCategory::InvalidValue,
+            Some(prepared_directory),
+            format!("the prepared workspace cannot be adopted: {error}"),
+        )
+    })?;
+    require_prepared_workspace(relative, &workspace, prepared_directory)?;
+    let manifest = WorkspaceManifest {
+        schema_version: WORKSPACE_SCHEMA_VERSION,
+        workspace_relative: JsonPath::from(relative.to_path_buf()),
+    };
+    write_versioned(
+        &workspace_manifest_path(data_root),
+        "workspace manifest",
+        &manifest,
+    )
+}
+
+fn require_absolute(path: &Path, what: &str) -> ConfigResult<()> {
+    if !path.is_absolute() {
+        return Err(ConfigError::new(
+            ConfigCategory::InvalidValue,
+            Some(path),
+            format!(
+                "the {what} must be an absolute path; a relative path would be resolved against the process working directory"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_prepared_workspace(
+    relative: &Path,
+    directory: &Path,
+    reported: &Path,
+) -> ConfigResult<()> {
+    let mut components = relative.components();
+    if components.next()
+        != Some(std::path::Component::Normal(std::ffi::OsStr::new(
+            "imports",
+        )))
+        || components.next().is_none()
+    {
+        return Err(ConfigError::new(
+            ConfigCategory::InvalidValue,
+            Some(reported),
+            "The selected workspace must be a prepared import below the application's imports folder.",
+        ));
+    }
+    require_existing_directory(directory, reported)?;
+    for name in [
+        "catalog.sqlite3",
+        "settings.json",
+        "report.json",
+        "capture.json",
+    ] {
+        let path =
+            crate::paths::validate_destination(directory, Path::new(name)).map_err(|error| {
+                ConfigError::new(
+                    ConfigCategory::InvalidValue,
+                    Some(reported),
+                    format!("The prepared workspace contains an unsafe {name} path: {error}"),
+                )
+            })?;
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            ConfigError::new(
+                ConfigCategory::Io,
+                Some(&path),
+                format!("The prepared workspace is incomplete: {error}"),
+            )
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ConfigError::new(
+                ConfigCategory::InvalidValue,
+                Some(&path),
+                "A prepared workspace file is missing or is not a regular file. The current workspace remains selected.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_existing_directory(directory: &Path, reported: &Path) -> ConfigResult<()> {
+    match fs::metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(ConfigError::new(
+            ConfigCategory::InvalidValue,
+            Some(reported),
+            format!(
+                "the adopted workspace {} is not a directory; it is reported instead of falling back to an empty layout",
+                directory.display()
+            ),
+        )),
+        Err(err) if err.kind() == ErrorKind::NotFound => Err(ConfigError::new(
+            ConfigCategory::Io,
+            Some(directory),
+            "the adopted workspace is missing; it is reported instead of falling back to an empty layout",
+        )),
+        Err(err) => Err(ConfigError::new(
+            ConfigCategory::Io,
+            Some(directory),
+            format!("the adopted workspace cannot be inspected: {err}"),
+        )),
+    }
+}
+
 fn absolute_dir(path: PathBuf) -> ConfigResult<PathBuf> {
     if !path.is_absolute() {
         return Err(ConfigError::new(
