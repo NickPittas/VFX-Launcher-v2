@@ -642,7 +642,7 @@ pub struct StructureTemplate {
 }
 
 impl StructureTemplate {
-    fn validate(&self) -> Result<(), TransferError> {
+    pub(crate) fn validate(&self) -> Result<(), TransferError> {
         let mut seen = HashSet::new();
         for entry in &self.entries {
             validate_relative_components(&entry.relative)?;
@@ -781,7 +781,7 @@ pub fn read_template_directory(
             format!("template folder cannot be inspected: {error}"),
         )
     })?;
-    if !meta.is_dir() {
+    if !meta.is_dir() || crate::paths::metadata_is_link(&meta) {
         return Err(TransferError::new(
             TransferCategory::InvalidInput,
             Some(dir),
@@ -877,20 +877,12 @@ fn sorted_template_children(dir: &Path) -> Result<Vec<TemplateChild>, TransferEr
                 format!("template entry cannot be inspected: {error}"),
             )
         })?;
-        let child = if link.is_symlink() {
-            // Broken or pointing anywhere: refuse instead of guessing. A link
-            // to a regular file keeps copy semantics (the source's copy2
-            // followed file links); directory links are refused.
-            match fs::metadata(&path) {
-                Ok(meta) if !meta.is_dir() => TemplateChild::File(path),
-                _ => {
-                    return Err(TransferError::new(
-                        TransferCategory::Unsupported,
-                        Some(&path),
-                        "template entry is a symbolic link; the source skipped or followed it unpredictably",
-                    ));
-                }
-            }
+        let child = if crate::paths::metadata_is_link(&link) {
+            return Err(TransferError::new(
+                TransferCategory::Unsupported,
+                Some(&path),
+                "The template contains a linked entry. Use an ordinary folder or file inside the template instead.",
+            ));
         } else if link.is_dir() {
             TemplateChild::Directory(path)
         } else if link.is_file() {

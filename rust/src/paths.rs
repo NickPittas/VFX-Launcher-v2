@@ -68,6 +68,21 @@ use std::os::windows::fs::MetadataExt;
 /// Result alias for module-owned path errors.
 pub type PathResult<T> = Result<T, PathError>;
 
+/// No-follow classification, including Windows junctions and mount reparse points.
+pub(crate) fn metadata_is_link(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        meta.file_attributes() & 0x0000_0400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Stable path-error/issue categories (module-owned; a later integration may
 /// map these into the shared app error without renaming them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

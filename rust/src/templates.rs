@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use crate::builtin_templates;
 use crate::config::{self, ConfigCategory};
 use crate::paths;
+use crate::paths::metadata_is_link as is_link;
 use crate::structure::{self, ClientsFile, StructureTemplate, TemplateEntryKind, TemplateMarkers};
 use crate::transfers::{TransferCategory, TransferError};
 
@@ -68,6 +69,13 @@ pub const LIBRARY_SCHEMA_VERSION: u32 = 1;
 /// Prefix of the working folders this module stages under `templates/`. They are
 /// never adopted as templates and never dropped by a load.
 const STAGING_PREFIX: &str = ".staging-";
+const SEEDING_FILE: &str = "seeding.json";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeedProgress {
+    schema_version: u32,
+}
 
 fn invalid(message: impl Into<String>) -> TransferError {
     TransferError::new(TransferCategory::InvalidInput, None, message)
@@ -451,13 +459,44 @@ impl TemplateLibrary {
             changed = true;
         }
 
-        if registry_absent && entries.is_empty() {
-            entries = self.seed_builtin_templates(warnings)?;
-            // `install` commits each seeded template, so nothing is pending.
-            changed = false;
-        }
         if changed {
             self.commit_registry(&entries)?;
+        }
+        let seeding_path = self.read_below(Path::new(SEEDING_FILE), "built-in template setup")?;
+        let resuming = match seeding_path.as_ref().map(fs::read) {
+            Some(Ok(bytes)) => {
+                let progress: SeedProgress = serde_json::from_slice(&bytes).map_err(|error| {
+                    invalid(format!(
+                        "The built-in template setup record cannot be read: {error}"
+                    ))
+                })?;
+                if progress.schema_version != 1 {
+                    return Err(invalid(
+                        "The built-in template setup record is from an unsupported version.",
+                    ));
+                }
+                true
+            }
+            Some(Err(error)) if error.kind() != ErrorKind::NotFound => {
+                return Err(invalid(format!(
+                    "The built-in template setup record cannot be read: {error}"
+                )));
+            }
+            _ => false,
+        };
+        if resuming || (registry_absent && entries.is_empty()) {
+            let path = self.write_below(Path::new(SEEDING_FILE), "built-in template setup")?;
+            if !resuming {
+                config::write_versioned(
+                    &path,
+                    "built-in template setup",
+                    &SeedProgress { schema_version: 1 },
+                )
+                .map_err(config_error)?;
+            }
+            entries = self.seed_builtin_templates(warnings)?;
+            fs::remove_file(&path).map_err(|error| unavailable(&path, format!("The built-in templates were installed, but their setup record could not be removed: {error}")))?;
+            sync_directory(&self.root())?;
         }
         Ok(entries)
     }
@@ -467,8 +506,11 @@ impl TemplateLibrary {
         &self,
         warnings: &mut Vec<String>,
     ) -> Result<Vec<TemplateSummary>, TransferError> {
-        let mut entries = Vec::new();
+        let mut entries = self.read_registry()?;
         for template in builtin_templates::builtin_templates()? {
+            if entries.iter().any(|entry| entry.name == template.name) {
+                continue;
+            }
             entries = self.install(&template.name, &template)?;
             warnings.push(format!(
                 "built-in template {:?} was created in the launcher library",
@@ -494,13 +536,18 @@ impl TemplateLibrary {
 
     /// Persists the whole client list (validated, deduplicated, sorted).
     pub fn save_clients(&self, clients: &[String]) -> Result<Vec<String>, TransferError> {
+        self.load_clients()?;
         let normalized = structure::normalize_clients(clients)?;
         let file = ClientsFile {
             schema_version: structure::CLIENTS_SCHEMA_VERSION,
             clients: normalized.clone(),
         };
         let path = self.write_below(Path::new(CLIENTS_FILE), "the client list")?;
-        config::write_versioned(&path, "client list", &file).map_err(config_error)?;
+        if let Err(error) = config::write_versioned(&path, "client list", &file) {
+            if self.load_clients().as_ref().ok() != Some(&normalized) {
+                return Err(config_error(error));
+            }
+        }
         Ok(normalized)
     }
 
@@ -696,6 +743,7 @@ impl TemplateLibrary {
         name: &str,
         snapshot: &StructureTemplate,
     ) -> Result<Vec<TemplateSummary>, TransferError> {
+        snapshot.validate()?;
         let name = display_name(name)?;
         let mut entries = self.read_registry()?;
         let id = self.unique_id(&name, &entries);
@@ -707,30 +755,52 @@ impl TemplateLibrary {
                 format!("the template staging folder cannot be created: {error}"),
             )
         })?;
-        let staged = self
-            .write_snapshot(&staging, snapshot)
-            .and_then(|()| self.publish(&staging, &templates, &id));
-        if let Err(error) = staged {
+        if let Err(error) = self.write_snapshot(&staging, snapshot) {
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
+        let sync_warning = match self.publish(&staging, &templates, &id) {
+            Ok(warning) => warning,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
         let dir = templates.join(&id);
         entries.push(TemplateSummary {
             id: id.clone(),
             name: name.clone(),
         });
         if let Err(error) = self.commit_registry(&entries) {
-            // Only contents copied from `snapshot` live here; the source of truth
-            // (the imported folder or the compiled-in manifest) is untouched.
-            let _ = fs::remove_dir_all(&dir);
-            return Err(error);
+            return Err(unavailable(
+                &dir,
+                format!(
+                    "The template is installed at {}, but its registry entry could not be confirmed: {}. The installed copy was retained; reload the library before retrying.",
+                    dir.display(),
+                    error.message()
+                ),
+            ));
+        }
+        if let Some(message) = sync_warning {
+            return Err(unavailable(
+                &dir,
+                format!(
+                    "The template is installed and registered at {}, but folder durability could not be confirmed: {message}. Keep this folder and reload the library.",
+                    dir.display()
+                ),
+            ));
         }
         Ok(entries)
     }
 
     /// Renames the finished staging folder into its final place, refusing to
     /// replace an existing folder.
-    fn publish(&self, staging: &Path, templates: &Path, id: &str) -> Result<(), TransferError> {
+    fn publish(
+        &self,
+        staging: &Path,
+        templates: &Path,
+        id: &str,
+    ) -> Result<Option<String>, TransferError> {
         let dir = templates.join(id);
         match fs::symlink_metadata(&dir) {
             Ok(_) => {
@@ -753,16 +823,9 @@ impl TemplateLibrary {
                 format!("the staged template folder cannot be published: {error}"),
             )
         })?;
-        sync_directory(templates).map_err(|error| {
-            TransferError::new(
-                error.category(),
-                Some(&dir),
-                format!(
-                    "the template folder was published but the template folder entry could not be synced, so it is not registered yet: {}",
-                    error.message()
-                ),
-            )
-        })
+        Ok(sync_directory(templates)
+            .err()
+            .map(|error| error.message().to_string()))
     }
 
     fn write_snapshot(
@@ -1154,25 +1217,6 @@ fn plain_relative(relative: &Path) -> bool {
         || relative
             .components()
             .all(|part| matches!(part, Component::Normal(_)))
-}
-
-/// True for a symlink on POSIX and for a symlink, junction or mount point on
-/// Windows. Never resolves what the entry points at.
-fn is_link(meta: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
 }
 
 /// The data area itself must be a real directory: a linked data area is refused
