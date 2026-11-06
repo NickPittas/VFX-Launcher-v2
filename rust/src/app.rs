@@ -261,6 +261,7 @@ impl eframe::App for VfxLauncherApp {
             // of killing queued catalog work with the process.
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = true;
+            self.backup.prepare_close(&mut self.jobs);
             self.jobs.begin_shutdown();
             self.workspace.set_workers_busy(self.jobs.is_busy());
             self.workspace.begin_shutdown();

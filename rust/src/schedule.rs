@@ -18,9 +18,17 @@ impl Schedule {
             return Ok(());
         }
         job.validate()?;
+        let timing_changed = self.config.as_ref().is_none_or(|previous| {
+            previous.schedule_enabled != job.schedule_enabled
+                || previous.schedule_mode != job.schedule_mode
+                || previous.schedule_interval_minutes != job.schedule_interval_minutes
+                || previous.schedule_time != job.schedule_time
+        });
         self.config = Some(job.clone());
-        self.pending = false;
-        self.arm()
+        if !job.schedule_enabled {
+            self.pending = false;
+        }
+        if timing_changed { self.arm() } else { Ok(()) }
     }
 
     pub fn due(&mut self, busy: bool) -> bool {
@@ -50,7 +58,9 @@ impl Schedule {
     }
 
     pub fn terminal(&mut self) -> Result<(), String> {
-        self.pending = false;
+        self.arm()
+    }
+    pub fn retry(&mut self) -> Result<(), String> {
         self.arm()
     }
 

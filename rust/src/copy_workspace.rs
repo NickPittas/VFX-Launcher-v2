@@ -311,8 +311,8 @@ impl CopyByFileTypeState {
     pub fn automatic_active(&self) -> bool {
         self.automatic_phase.is_some()
     }
-    pub fn begin_automatic(&mut self, jobs: &mut Jobs) {
-        if self.busy() || self.backup.is_none() {
+    pub fn begin_automatic(&mut self, saved: &crate::backup::BackupJob, jobs: &mut Jobs) {
+        if self.busy() || self.backup_job().as_ref() != Some(saved) {
             return;
         }
         self.begin_scan(jobs);
@@ -389,6 +389,9 @@ impl CopyByFileTypeState {
             self.message = Some("This folder name cannot be shown in the path field. Choose a folder with a Unicode name.".to_string());
             return;
         };
+        if let Some(job) = &mut self.backup {
+            job.last_browse_dir = text.clone();
+        }
         match field {
             Field::Source => self.source = text,
             Field::Destination => self.destination = text,
@@ -811,7 +814,14 @@ impl CopyByFileTypeState {
             Field::Source => self.source.trim(),
             Field::Destination => self.destination.trim(),
         };
-        let start = if current.is_empty() {
+        let start = if let Some(last) = self
+            .backup
+            .as_ref()
+            .map(|job| job.last_browse_dir.trim())
+            .filter(|last| !last.is_empty())
+        {
+            Some(PathBuf::from(last))
+        } else if current.is_empty() {
             self.last_pick.clone()
         } else {
             Some(PathBuf::from(current))

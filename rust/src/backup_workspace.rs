@@ -138,18 +138,47 @@ impl BackupWorkspace {
             jobs.is_busy()
                 || running
                 || self.request.is_some()
+                || self.saved.as_ref() != self.copy.backup_job().as_ref()
                 || !self.loaded
                 || catalog.is_none()
                 || user.is_none(),
         ) && !jobs.is_shutting_down()
         {
-            self.copy.begin_automatic(jobs);
+            if let Some(saved) = &self.saved {
+                self.copy.begin_automatic(saved, jobs);
+            }
             self.was_running = self.copy.automatic_active();
             if !self.was_running {
                 self.error = self.schedule.terminal().err();
             }
         }
         self.ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    pub fn prepare_close(&mut self, jobs: &mut Jobs) {
+        if !self.loaded || self.request.is_some() {
+            return;
+        }
+        let Some(job) = self.copy.backup_job() else {
+            return;
+        };
+        if self.saved.as_ref() == Some(&job) {
+            return;
+        }
+        if let Err(error) = job.validate() {
+            self.error = Some(error);
+            return;
+        }
+        let path = self.path.clone();
+        self.start(
+            jobs,
+            "Saving backup settings before quitting",
+            false,
+            move || {
+                let result = backup::save_job(&path, &job);
+                Reply::Saved(job, result)
+            },
+        );
     }
 
     fn start(
@@ -278,7 +307,7 @@ impl BackupWorkspace {
                 ui.horizontal(|ui| {
                     ui.colored_label(egui::Color32::from_rgb(230, 155, 100), error);
                     if ui.button("Retry").clicked() {
-                        self.error = None;
+                        self.error = self.schedule.retry().err();
                         if !self.loaded {
                             self.attempted_load = false;
                         }

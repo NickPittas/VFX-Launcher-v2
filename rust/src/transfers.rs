@@ -741,13 +741,12 @@ fn plan_relative_copy(
         }
     };
 
-    let normalized_root = paths::normalize_lexical(&snapshot.root, &snapshot.root)?;
     let mut seen = HashSet::new();
     let mut directories = HashSet::new();
     let mut missing_mtime = 0usize;
     let mut actions = Vec::with_capacity(snapshot.entries.len());
     for entry in &snapshot.entries {
-        let relative = entry.path.strip_prefix(&normalized_root).map_err(|_| {
+        let relative = entry.path.strip_prefix(&snapshot.root).map_err(|_| {
             TransferError::new(
                 TransferCategory::InvalidInput,
                 Some(&entry.path),

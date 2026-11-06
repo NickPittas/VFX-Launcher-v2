@@ -3,8 +3,26 @@
 ## Full-application completion work in progress
 
 User requires the complete original feature set, not disabled workspace shells.
-Shots/templates/new-project, Incoming patterns/routing/UI and Backup/schedule/CLI
-are being implemented in isolated packets. They are not yet integrated here.
+Shots/templates/new-project and Incoming patterns/routing/UI are being implemented
+in isolated packets. They are not yet integrated here. Backup/schedule/CLI is now
+wired, with the specific verification and remaining limits recorded below.
+
+Backup now implements the original collect/mtime-compare/preserve-existing flow,
+native scan/review/copy/results, legacy job JSON import/export, atomic saved jobs,
+GUI-only interval/daily schedules and headless backup/dry-run commands. Disposable
+CLI and native backup operations passed; see NATIVE-BACKUP-EVIDENCE.md. Initial
+source-review findings are corrected: automatic execution binds the saved job and
+waits for dirty settings, pending schedules survive ordinary edits/manual work,
+path spellings stay consistent, last-browsed paths persist, Retry can re-arm, and
+quitting admits the latest valid settings save before job shutdown. Scheduling,
+dialogs and failure cases still need localized live verification. Copy execution
+remains sequential; the worker value currently controls comparison concurrency.
+
+File-operation admission now refuses intersecting destination scopes and writes
+into another active run's source inside this process, while allowing shared
+read-only sources. It uses resolved native keys and a short-lived admission mutex;
+the guard is released on all normal/error/unwind exits. This is source/compile
+evidence only, not a hostile-namespace or cross-process locking guarantee.
 
 Coordinator restored counted scan passes, native configured project-folder
 matching, AE autosave filtering and dismissible registration/scan summaries.
