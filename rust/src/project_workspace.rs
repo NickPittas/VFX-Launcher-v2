@@ -1673,7 +1673,16 @@ impl ProjectWorkspace {
                 // already summarized in this pane's scan details.
                 jobs.clear_finished();
                 let label = folder_label(&scope);
-                match start_walk(jobs, &self.ctx, format!("Scanning {label}"), scope) {
+                match start_walk(
+                    jobs,
+                    &self.ctx,
+                    format!("Scanning {label}"),
+                    scope,
+                    self.settings
+                        .project_discovery
+                        .project_directory_names
+                        .clone(),
+                ) {
                     Ok((job, files)) => {
                         self.scan.step = Some(ScanStep::Walking {
                             project,
@@ -2218,6 +2227,7 @@ fn start_walk(
     ctx: &egui::Context,
     title: String,
     scope: PathBuf,
+    target_names: Vec<String>,
 ) -> Result<
     (
         JobId,
@@ -2238,7 +2248,8 @@ fn start_walk(
             recursive: true,
             filters,
         };
-        let result = discovery::walk(&request, &control, &events);
+        let result =
+            crate::project_discovery::walk_project(&request, &target_names, &control, &events);
         let progress = JobProgress {
             completed: result
                 .as_ref()

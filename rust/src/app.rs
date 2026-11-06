@@ -174,6 +174,7 @@ pub struct VfxLauncherApp {
     backup_destination: String,
     backup_exclusions: String,
     about_open: bool,
+    history: crate::history::HistoryWindow,
     info_dialog: Option<(String, Vec<String>)>,
     user_edit: Option<crate::storage::UserId>,
     user_name: String,
@@ -206,6 +207,7 @@ impl VfxLauncherApp {
             backup_destination: String::new(),
             backup_exclusions: String::new(),
             about_open: false,
+            history: crate::history::HistoryWindow::default(),
             info_dialog: None,
             user_edit: None,
             user_name: String::new(),
@@ -223,6 +225,7 @@ impl eframe::App for VfxLauncherApp {
     /// close coordination never depend on a painted frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.workspace.poll(&mut self.jobs);
+        self.history.poll();
         self.copy_by_type.poll(
             self.workspace.catalog_client().as_ref(),
             self.workspace.user().map(|user| user.id),
@@ -284,6 +287,8 @@ impl eframe::App for VfxLauncherApp {
         self.new_project_dialog(&ctx);
         self.info_dialog(&ctx);
         self.about_dialog(&ctx);
+        self.history
+            .show(&ctx, self.workspace.catalog_client().as_ref());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -307,6 +312,10 @@ impl VfxLauncherApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
+                    if ui.button("Logs and file-operation history…").clicked() {
+                        self.history.open = true;
+                        ui.close();
+                    }
                     for view in View::WORKSPACE {
                         if ui.button(view.label()).clicked() {
                             self.view = view;

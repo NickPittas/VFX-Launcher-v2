@@ -947,10 +947,10 @@ impl CopyByFileTypeState {
             self.message = Some(NO_CATALOG.to_string());
             return;
         };
-        if self.user.is_none() {
+        let Some(user) = self.user else {
             self.message = Some(NO_USER.to_string());
             return;
-        }
+        };
         let Some(mut review) = self.review.take() else {
             return;
         };
@@ -958,6 +958,7 @@ impl CopyByFileTypeState {
             self.review = Some(review);
             return;
         };
+        let validated = validated.attribute_to(user);
         let labels = review
             .items
             .iter()

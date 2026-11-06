@@ -260,7 +260,7 @@ pub fn walk(
         request.purpose,
         ScanPurpose::Projects | ScanPurpose::ExtensionCopy
     ) {
-        let counted = walk_pass(request, control, events, None)?;
+        let counted = walk_pass(request, control, events, None, 0)?;
         if counted.coverage != Coverage::Complete {
             return Ok(counted);
         }
@@ -274,16 +274,17 @@ pub fn walk(
                 ..JobProgress::default()
             },
         );
-        return walk_pass(request, control, events, Some(total));
+        return walk_pass(request, control, events, Some(total), 0);
     }
-    walk_pass(request, control, events, None)
+    walk_pass(request, control, events, None, 0)
 }
 
-fn walk_pass(
+pub(crate) fn walk_pass(
     request: &ScanRequest,
     control: &JobControl,
     events: &JobEvents,
     total: Option<u64>,
+    offset: u64,
 ) -> PathResult<ScanSnapshot> {
     let phase = if total.is_none()
         && matches!(
@@ -369,7 +370,7 @@ fn walk_pass(
         events.progress(
             phase,
             JobProgress {
-                completed: entries.len() as u64,
+                completed: offset + entries.len() as u64,
                 total,
                 bytes_done: 0,
                 bytes_total: None,
@@ -411,7 +412,7 @@ fn walk_pass(
                     events.progress(
                         phase,
                         JobProgress {
-                            completed: entries.len() as u64,
+                            completed: offset + entries.len() as u64,
                             total,
                             current: Some(entry.path()),
                             ..JobProgress::default()
@@ -432,7 +433,7 @@ fn walk_pass(
                 events.progress(
                     phase,
                     JobProgress {
-                        completed: entries.len() as u64,
+                        completed: offset + entries.len() as u64,
                         total,
                         current: Some(entry.path()),
                         ..JobProgress::default()

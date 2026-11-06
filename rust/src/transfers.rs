@@ -929,6 +929,7 @@ pub struct ValidationReport {
 /// Validation-bound plan. Only [`validate_plan`] constructs it, and its fields
 /// are private so a caller cannot inject unvalidated destinations.
 pub struct ValidatedPlan {
+    actor: Option<crate::storage::UserId>,
     plan: OperationPlan,
     items: Vec<ItemValidation>,
     warnings: Vec<String>,
@@ -936,6 +937,11 @@ pub struct ValidatedPlan {
 }
 
 impl ValidatedPlan {
+    /// Attach the identity accepting this run without changing reviewed actions.
+    pub fn attribute_to(mut self, user: crate::storage::UserId) -> Self {
+        self.actor = Some(user);
+        self
+    }
     pub fn plan(&self) -> &OperationPlan {
         &self.plan
     }
@@ -1248,6 +1254,7 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
     }
     let ready = if counts.blocked == 0 {
         Some(ValidatedPlan {
+            actor: None,
             plan: plan.clone(),
             items: items.clone(),
             warnings: warnings.clone(),
@@ -2494,12 +2501,20 @@ struct RunEnvelope {
     intent: OperationPlan,
     items: Vec<ItemValidation>,
     warnings: Vec<String>,
+    #[serde(default)]
+    actor: Option<RunActor>,
     /// Review-time destination evidence. Absent in envelopes written before this
     /// field existed; that absence is reported as unknown and never as agreement.
     #[serde(default)]
     destination_evidence: Option<DestinationEvidence>,
     #[serde(default)]
     result: Option<RunResultSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunActor {
+    pub user_id: crate::storage::UserId,
+    pub username: String,
 }
 
 /// Summary returned after finalizing a run.
@@ -2536,6 +2551,7 @@ pub struct ItemInspection {
 /// and every recovery path reported so far. Nothing here deletes or replays.
 #[derive(Clone, Debug)]
 pub struct RunInspection {
+    pub actor: Option<RunActor>,
     pub run_id: i64,
     pub kind: String,
     pub state: RunState,
@@ -2598,7 +2614,25 @@ pub fn persist_validated_intent(
 }
 
 fn insert_intent(tx: &mut Transaction<'_>, validated: &ValidatedPlan) -> StorageResult<i64> {
+    let actor = validated
+        .actor
+        .map(|user_id| {
+            let username: Option<String> = tx
+                .query_row(
+                    "SELECT username FROM users WHERE id=?1 AND deleted_at IS NULL",
+                    [user_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| db_error("could not verify the operation user", error))?;
+            let username = username.ok_or_else(|| {
+                invalid("The user accepting this operation is no longer available.")
+            })?;
+            Ok::<_, StorageError>(RunActor { user_id, username })
+        })
+        .transpose()?;
     let envelope = RunEnvelope {
+        actor,
         schema_version: RUN_ENVELOPE_VERSION,
         intent: validated.plan.clone(),
         items: validated.items.clone(),
@@ -2630,6 +2664,12 @@ fn insert_intent(tx: &mut Transaction<'_>, validated: &ValidatedPlan) -> Storage
         ));
     }
     let run_id = tx.last_insert_rowid();
+    if let Some(actor) = &envelope.actor {
+        tx.execute(
+            "INSERT INTO user_activity_log(user_id,username,action_type,description,at) VALUES(?1,?2,'operation_started',?3,?4)",
+            params![actor.user_id, actor.username, format!("Started {} run {run_id}", kind.replace('_', " ")), utc_timestamp_now()],
+        ).map_err(|error| db_error("could not record the operation user", error))?;
+    }
     for (ordinal, item) in validated.items.iter().enumerate() {
         let source = item.source.as_ref();
         let destination = item.destination.as_ref();
@@ -3214,6 +3254,12 @@ pub fn finalize_run(
                 format!("run {run_id} was not in a finalizable state"),
             ));
         }
+        if let Some(actor) = &envelope.actor {
+            tx.execute(
+                "INSERT INTO user_activity_log(user_id,username,action_type,description,at) VALUES(?1,?2,'operation_finished',?3,?4)",
+                params![actor.user_id, actor.username, format!("Run {run_id}: {} — {} copied, {} skipped, {} failed", terminal.state().as_str(), counts.copied, counts.skipped, counts.failed), finished_at],
+            ).map_err(|error| db_error("could not record the operation result user", error))?;
+        }
         Ok(RunSummary {
             run_id,
             state: terminal.state(),
@@ -3388,6 +3434,7 @@ fn load_run(
         ))
     })?;
     let mut intent = None;
+    let mut actor = None;
     let mut reviewed_items = Vec::new();
     let mut warnings = Vec::new();
     let mut destination_evidence = None;
@@ -3402,6 +3449,7 @@ fn load_run(
         Some(text) => match serde_json::from_str::<RunEnvelope>(&text) {
             Ok(envelope) if envelope.schema_version == RUN_ENVELOPE_VERSION => {
                 intent = Some(envelope.intent);
+                actor = envelope.actor;
                 reviewed_items = envelope.items;
                 warnings = envelope.warnings;
                 destination_evidence = envelope.destination_evidence;
@@ -3426,6 +3474,7 @@ fn load_run(
         intent.as_ref().map(|_| reviewed_items.as_slice()),
     )?;
     let mut inspection = RunInspection {
+        actor,
         run_id,
         kind,
         state,

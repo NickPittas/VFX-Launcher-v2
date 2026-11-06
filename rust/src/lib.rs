@@ -12,15 +12,18 @@
 //! Feature packets attach to these seams
 //! (`transfers`, `backup`) instead of adding a second coordination layer.
 
+pub mod ai;
 pub mod app;
 pub mod config;
 pub mod copy_workspace;
 pub mod discovery;
+pub mod history;
 pub mod incoming;
 pub mod jobs;
 pub mod launch;
 pub mod nuke;
 pub mod paths;
+pub mod project_discovery;
 pub mod project_workspace;
 pub mod projects;
 pub mod storage;

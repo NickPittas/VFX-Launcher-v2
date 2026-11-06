@@ -1,5 +1,30 @@
 # Implementation status
 
+## Full-application completion work in progress
+
+User requires the complete original feature set, not disabled workspace shells.
+Shots/templates/new-project, Incoming patterns/routing/UI and Backup/schedule/CLI
+are being implemented in isolated packets. They are not yet integrated here.
+
+Coordinator restored counted scan passes, native configured project-folder
+matching, AE autosave filtering and dismissible registration/scan summaries.
+Native evidence confirms AE filtering and summary dismissal, and captures a
+12,000-file counting/processing workflow. See NATIVE-REGRESSION-EVIDENCE.md for
+the exact limits; intermediate determinate movement was not captured.
+
+User management and project unregister now call the existing asynchronous APIs;
+file opened-by/time columns read real history. A View-menu history window reads
+activity and operation/item/recovery records without replay or deletion. New copy
+runs attach the accepting user to their journal and activity; older journals
+remain unattributed rather than fabricated. These additions compile but need
+localized runtime verification and source review.
+
+The new proposal-only Pi adapter disables all harness tools/extensions/MCP/skills/
+context loading, bounds context/output/time, kills its owned process on exit and
+validates returned item IDs/relative paths. Pi retains provider authentication.
+It is not yet wired to Incoming and has no model-runtime pass. No application-wide
+completion claim or test-suite run is made.
+
 ## Copy follow-up review corrections
 
 The fresh review confirmed the original four corrections and found three smaller
