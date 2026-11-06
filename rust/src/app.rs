@@ -5,9 +5,8 @@
 //! bar, workspace strip, docked resizable panes with internal scrolling, and a
 //! persistent bottom status/execution strip.
 //!
-//! Projects and Settings are wired to the real backend through
-//! [`crate::project_workspace`]. The remaining views keep their explicit
-//! placeholders until their packets land; nothing here invents data.
+//! Feature workspaces own their background work; the shell coordinates their
+//! catalog admission, close lifecycle and shared execution strip.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,7 +27,7 @@ const PANEL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x24, 0x25, 0x28);
 const EDITOR_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x1a, 0x1b, 0x1d);
 const CONTROL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x2d, 0x2f, 0x33);
 const UNAVAILABLE: &str = "Not available in this build.";
-/// Honest placeholder for columns whose backend is not built yet.
+/// Missing metadata is displayed without fabricating a value.
 const UNKNOWN: &str = "—";
 
 /// Starts the native desktop application against one local data area.
@@ -36,6 +35,7 @@ pub fn run_gui(data_dir: PathBuf) -> eframe::Result {
     let workspace_dir = crate::config::resolve_workspace(&data_dir)
         .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
     let options = eframe::NativeOptions {
+        persistence_path: Some(data_dir.join("window.ron")),
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 880.0])
             .with_min_inner_size([1080.0, 680.0]),
@@ -179,7 +179,16 @@ impl VfxLauncherApp {
         apply_desktop_style(&cc.egui_ctx);
         Self {
             ctx: cc.egui_ctx.clone(),
-            view: View::Projects,
+            view: cc
+                .storage
+                .and_then(|storage| storage.get_string("workspace_view"))
+                .and_then(|label| {
+                    View::WORKSPACE
+                        .into_iter()
+                        .chain([View::Settings])
+                        .find(|view| view.label() == label)
+                })
+                .unwrap_or(View::Projects),
             jobs: Jobs::new(),
             workspace: ProjectWorkspace::new(&cc.egui_ctx, workspace_dir),
             project_filter: String::new(),
@@ -205,6 +214,9 @@ impl VfxLauncherApp {
 }
 
 impl eframe::App for VfxLauncherApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("workspace_view", self.view.label().to_string());
+    }
     /// Runs before `ui` and also while the window is hidden, so job polling and
     /// close coordination never depend on a painted frame.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1598,14 +1610,17 @@ fn bucket_label(bucket: &(Option<String>, Option<String>)) -> String {
 
 fn modified_text(file: &ProjectFile) -> String {
     match file.modified_unix_ns {
-        Some(nanos) => {
-            // `YYYY-MM-DDTHH:MM:SSZ` -> `YYYY-MM-DD HH:MM`, still UTC.
-            let stamp = crate::storage::utc_timestamp_signed(nanos.div_euclid(1_000_000_000));
+        Some(nanos) => chrono::DateTime::from_timestamp(
+            nanos.div_euclid(1_000_000_000),
+            nanos.rem_euclid(1_000_000_000) as u32,
+        )
+        .map(|stamp| {
             stamp
-                .get(0..16)
-                .map(|text| text.replace('T', " "))
-                .unwrap_or(stamp)
-        }
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| UNKNOWN.to_string()),
         None => UNKNOWN.to_string(),
     }
 }
