@@ -79,6 +79,28 @@ fn notice(ui: &mut egui::Ui, message: &str, error: bool) {
     }
 }
 
+/// Every line of a list the user must be able to read in full: load warnings and
+/// run reports scroll inside their own box instead of being truncated.
+fn notices(ui: &mut egui::Ui, title: &str, id: &str, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(format!("{title} ({})", lines.len()))
+        .id_salt(id)
+        .default_open(lines.len() <= 6)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt((id, "lines"))
+                .max_height(160.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for line in lines {
+                        ui.label(egui::RichText::new(line).small().weak());
+                    }
+                });
+        });
+}
+
 fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(10.0);
@@ -599,6 +621,10 @@ struct StructureDraft {
     groups: Vec<ShotGroup>,
     nuke: Option<NukeSettings>,
     parent_as_sequence: bool,
+    /// Template-library content revision this draft was built from. Any library
+    /// mutation bumps it, which invalidates this draft's preview and review the
+    /// same way an edited field does.
+    library: u64,
 }
 
 impl StructureDraft {
@@ -1433,17 +1459,236 @@ fn walk_project(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickTarget {
     NewProjectParent,
-    TemplateImport,
-}
-
-enum PickReply {
-    Folder(Option<PathBuf>),
-    Imported(Result<Vec<TemplateSummary>, String>),
+    TemplateFolder,
+    ClientsFile,
 }
 
 struct PickRun {
     job: JobId,
-    replies: Receiver<PickReply>,
+    target: PickTarget,
+    replies: Receiver<Option<PathBuf>>,
+}
+
+// ---------------------------------------------------------------------------
+// Template library workers
+// ---------------------------------------------------------------------------
+
+/// One unit of work against the template data area. The workspace itself never
+/// reads or writes that area from a UI frame: every request runs as a tracked
+/// job and answers once with exactly the data the frame needs.
+#[derive(Clone, Debug)]
+enum LibraryRequest {
+    Load,
+    Snapshot {
+        id: String,
+        name: String,
+    },
+    Create {
+        name: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    Delete {
+        id: String,
+    },
+    Reorder {
+        id: String,
+        delta: i8,
+    },
+    AddFolder {
+        id: String,
+        parent: PathBuf,
+        name: String,
+    },
+    RenameFolder {
+        id: String,
+        relative: PathBuf,
+        name: String,
+    },
+    RemoveFolder {
+        id: String,
+        relative: PathBuf,
+    },
+    SetMarkers {
+        id: String,
+        relative: PathBuf,
+        markers: TemplateMarkers,
+    },
+    SaveClients {
+        clients: Vec<String>,
+    },
+    ImportClients {
+        path: PathBuf,
+    },
+    ImportFolder {
+        path: PathBuf,
+    },
+}
+
+impl LibraryRequest {
+    fn title(&self) -> &'static str {
+        match self {
+            Self::Load => "Reading templates",
+            Self::Snapshot { .. } => "Reading the template",
+            Self::Create { .. } => "Creating the template",
+            Self::Rename { .. } => "Renaming the template",
+            Self::Delete { .. } => "Deleting the template",
+            Self::Reorder { .. } => "Reordering templates",
+            Self::AddFolder { .. } => "Adding a template folder",
+            Self::RenameFolder { .. } => "Renaming a template folder",
+            Self::RemoveFolder { .. } => "Removing a template folder",
+            Self::SetMarkers { .. } => "Updating marker files",
+            Self::SaveClients { .. } => "Saving the client list",
+            Self::ImportClients { .. } => "Importing clients",
+            Self::ImportFolder { .. } => "Importing a template folder",
+        }
+    }
+
+    /// Requests whose success changes template content, so every open plan goes
+    /// stale. Client-only and plain reads leave the plans alone.
+    fn mutates_templates(&self) -> bool {
+        !matches!(
+            self,
+            Self::Snapshot { .. } | Self::SaveClients { .. } | Self::ImportClients { .. }
+        )
+    }
+}
+
+/// Everything one request hands back. Only the fields the frame needs are set.
+#[derive(Default)]
+struct LibraryOutcome {
+    snapshot: Option<LibrarySnapshot>,
+    clients: Option<Vec<String>>,
+    template: Option<StructureTemplate>,
+    /// Template created or imported by this request, for the dialog's selection.
+    selected: Option<String>,
+    feedback: Option<String>,
+}
+
+struct LibraryJob {
+    request: LibraryRequest,
+    replies: Receiver<Result<LibraryOutcome, String>>,
+}
+
+/// The next free project number, keyed by the parent and preset it was read for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NumberKey {
+    parent: PathBuf,
+    naming: NamingPreset,
+}
+
+struct NumberJob {
+    job: JobId,
+    key: NumberKey,
+    replies: Receiver<Result<String, String>>,
+}
+
+fn run_library(
+    library: &TemplateLibrary,
+    request: LibraryRequest,
+) -> Result<LibraryOutcome, String> {
+    let fail = |error| describe(&error);
+    let mut outcome = LibraryOutcome::default();
+    match request {
+        LibraryRequest::Load => {
+            outcome.snapshot = Some(library.load().map_err(fail)?);
+        }
+        LibraryRequest::Snapshot { id, name } => {
+            let summary = TemplateSummary { id, name };
+            outcome.template = Some(library.snapshot(&summary).map_err(fail)?);
+        }
+        LibraryRequest::Create { name } => {
+            library.create(&name).map_err(fail)?;
+            let snapshot = library.load().map_err(fail)?;
+            outcome.selected = snapshot.templates.last().map(|entry| entry.id.clone());
+            outcome.feedback = Some(format!("Created template {name}."));
+            outcome.snapshot = Some(snapshot);
+        }
+        LibraryRequest::Rename { id, name } => {
+            library.rename(&id, &name).map_err(fail)?;
+            let snapshot = library.load().map_err(fail)?;
+            outcome.selected = Some(id);
+            outcome.feedback = Some("Template renamed.".to_string());
+            outcome.snapshot = Some(snapshot);
+        }
+        LibraryRequest::Delete { id } => {
+            library.delete(&id).map_err(fail)?;
+            outcome.feedback = Some("Template deleted.".to_string());
+            outcome.snapshot = Some(library.load().map_err(fail)?);
+        }
+        LibraryRequest::Reorder { id, delta } => {
+            library.reorder(&id, delta).map_err(fail)?;
+            outcome.selected = Some(id);
+            outcome.snapshot = Some(library.load().map_err(fail)?);
+        }
+        LibraryRequest::AddFolder { id, parent, name } => {
+            library.add_folder(&id, &parent, &name).map_err(fail)?;
+            outcome.feedback = Some(format!("Added folder {name}."));
+        }
+        LibraryRequest::RenameFolder { id, relative, name } => {
+            library.rename_folder(&id, &relative, &name).map_err(fail)?;
+            outcome.feedback = Some("Folder renamed.".to_string());
+        }
+        LibraryRequest::RemoveFolder { id, relative } => {
+            library.remove_folder(&id, &relative).map_err(fail)?;
+            outcome.feedback = Some(format!("Removed {}.", relative.display()));
+        }
+        LibraryRequest::SetMarkers {
+            id,
+            relative,
+            markers,
+        } => {
+            library.set_markers(&id, &relative, markers).map_err(fail)?;
+            outcome.feedback = Some("Marker files updated.".to_string());
+        }
+        LibraryRequest::SaveClients { clients } => {
+            outcome.clients = Some(library.save_clients(&clients).map_err(fail)?);
+            outcome.feedback = Some("Client list saved.".to_string());
+        }
+        LibraryRequest::ImportClients { path } => {
+            outcome.clients = Some(library.import_clients(&path).map_err(fail)?);
+            outcome.feedback = Some("Clients imported.".to_string());
+        }
+        LibraryRequest::ImportFolder { path } => {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Template".to_string());
+            library.import(&path, &name).map_err(fail)?;
+            let snapshot = library.load().map_err(fail)?;
+            outcome.selected = snapshot.templates.last().map(|entry| entry.id.clone());
+            outcome.feedback = Some("Template imported.".to_string());
+            outcome.snapshot = Some(snapshot);
+        }
+    }
+    Ok(outcome)
+}
+
+/// Case-insensitive substring first, then every typed character in order
+/// (`UI/assets/app.js` `filterClients`).
+fn client_matches(query: &str, client: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let client = client.to_lowercase();
+    if client.contains(&query) {
+        return true;
+    }
+    let mut typed = query.chars();
+    let mut wanted = typed.next();
+    for found in client.chars() {
+        match wanted {
+            Some(character) if character == found => wanted = typed.next(),
+            _ => {}
+        }
+        if wanted.is_none() {
+            return true;
+        }
+    }
+    wanted.is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,6 +1723,7 @@ enum DialogAction {
     Close,
     CreateTemplate,
     ImportTemplate,
+    ImportClients,
     RenameTemplate,
     MoveUp,
     MoveDown,
@@ -1511,6 +1757,8 @@ struct NewProjectDialog {
     tree: ShotTreeEditor,
     nuke: NukeEditor,
     session: PlanSession,
+    /// The partly or fully created root was handed to the catalog already.
+    registered: bool,
     feedback: Option<String>,
 }
 
@@ -1543,6 +1791,7 @@ impl NewProjectDialog {
             tree: ShotTreeEditor::new(),
             nuke: NukeEditor::default(),
             session: PlanSession::default(),
+            registered: false,
             feedback: None,
         }
     }
@@ -1557,7 +1806,7 @@ impl NewProjectDialog {
         (!text.is_empty()).then(|| PathBuf::from(text))
     }
 
-    fn draft(&self) -> StructureDraft {
+    fn draft(&self, library: u64) -> StructureDraft {
         StructureDraft {
             mode: PlanMode::NewProject,
             root: None,
@@ -1573,6 +1822,7 @@ impl NewProjectDialog {
             groups: self.tree.groups(),
             nuke: self.nuke.settings(),
             parent_as_sequence: false,
+            library,
         }
     }
 
@@ -1651,13 +1901,26 @@ pub struct StructureWorkspace {
         Receiver<Result<(Vec<FolderRow>, Option<String>), String>>,
     )>,
     template: String,
-    loaded_template: Option<String>,
+    /// Template id and library revision the destination snapshot was read for.
+    loaded_template: Option<(String, u64)>,
     template_snapshot: Option<StructureTemplate>,
     template_error: Option<String>,
     /// The template the administration dialog is showing, loaded independently of
     /// the destination template the plan uses.
     dialog_template: Option<StructureTemplate>,
-    dialog_loaded: Option<String>,
+    dialog_loaded: Option<(String, u64)>,
+    /// Bumped by every successful library request that changes template content.
+    library_revision: u64,
+    /// First snapshot read: the constructor never touches the data area.
+    reload_requested: bool,
+    /// Mutations and the full snapshot read; one at a time.
+    library_job: Option<LibraryJob>,
+    /// One template folder read, separate so a mutation never waits on it.
+    template_job: Option<LibraryJob>,
+    number_job: Option<NumberJob>,
+    /// Parent and preset the user committed, so typing a path never reads a
+    /// directory per keystroke.
+    number_request: Option<NumberKey>,
     destinations: Destinations,
     tree_editor: ShotTreeEditor,
     nuke: NukeEditor,
@@ -1670,17 +1933,16 @@ pub struct StructureWorkspace {
 }
 
 impl StructureWorkspace {
+    /// Cheap by construction: nothing here touches the data area. The first
+    /// snapshot read is a tracked job started by the first `poll`. A missing
+    /// registry is seeded with the built-in templates by that read itself
+    /// (`TemplateLibrary::load`).
     pub fn new(ctx: &egui::Context, data_dir: &Path) -> Self {
-        let library = TemplateLibrary::new(data_dir);
-        let (snapshot, library_error) = match library.load() {
-            Ok(snapshot) => (snapshot, None),
-            Err(error) => (LibrarySnapshot::default(), Some(describe(&error))),
-        };
-        let mut workspace = Self {
+        Self {
             ctx: ctx.clone(),
-            library,
-            snapshot,
-            library_error,
+            library: TemplateLibrary::new(data_dir),
+            snapshot: LibrarySnapshot::default(),
+            library_error: None,
             catalog: None,
             user: None,
             scope: None,
@@ -1692,6 +1954,12 @@ impl StructureWorkspace {
             template_error: None,
             dialog_template: None,
             dialog_loaded: None,
+            library_revision: 0,
+            reload_requested: true,
+            library_job: None,
+            template_job: None,
+            number_job: None,
+            number_request: None,
             destinations: Destinations::default(),
             tree_editor: ShotTreeEditor::new(),
             nuke: NukeEditor::default(),
@@ -1701,42 +1969,35 @@ impl StructureWorkspace {
             last_pick: None,
             dialog: TemplateDialog::default(),
             new_project: None,
-        };
-        workspace.seed_default_template();
-        workspace.refresh_library();
-        workspace
-    }
-
-    /// First run: the built-in Launcher manifest becomes a real template, so a new
-    /// project can be created without hand-authoring one first.
-    fn seed_default_template(&mut self) {
-        if self.library_error.is_some() || !self.snapshot.templates.is_empty() {
-            return;
-        }
-        let template = structure::launcher_default_template();
-        if let Err(error) = self.library.install("Launcher", &template) {
-            self.library_error = Some(describe(&error));
         }
     }
 
-    fn refresh_library(&mut self) {
-        match self.library.load() {
-            Ok(snapshot) => {
-                self.snapshot = snapshot;
-                if self.snapshot.template(&self.template).is_none() {
-                    self.template = self
-                        .snapshot
-                        .templates
-                        .first()
-                        .map(|entry| entry.id.clone())
-                        .unwrap_or_default();
-                    self.loaded_template = None;
-                }
-                if self.snapshot.template(&self.dialog.selected).is_none() {
-                    self.dialog.selected = self.template.clone();
-                }
+    /// Keeps both template selections inside a snapshot the library just returned.
+    fn settle_template_selection(&mut self) {
+        if self.snapshot.template(&self.template).is_none() {
+            self.template = self
+                .snapshot
+                .templates
+                .first()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default();
+            self.loaded_template = None;
+        }
+        if self.snapshot.template(&self.dialog.selected).is_none() {
+            self.dialog.selected = self.template.clone();
+            self.dialog.folder = PathBuf::new();
+            self.dialog_loaded = None;
+        }
+        if let Some(dialog) = self.new_project.as_mut() {
+            if self.snapshot.template(&dialog.template).is_none() && !dialog.busy() {
+                dialog.template = self
+                    .snapshot
+                    .templates
+                    .first()
+                    .map(|entry| entry.id.clone())
+                    .unwrap_or_default();
+                dialog.session.clear();
             }
-            Err(error) => self.library_error = Some(describe(&error)),
         }
     }
 
@@ -1746,6 +2007,17 @@ impl StructureWorkspace {
     pub fn poll(&mut self, workspace: &mut ProjectWorkspace, jobs: &mut Jobs) {
         self.catalog = workspace.catalog_client();
         self.user = workspace.user().map(|user| user.id);
+        if self.reload_requested && self.library_job.is_none() && !jobs.is_shutting_down() {
+            self.reload_requested = false;
+            match self.start_library_job(jobs, LibraryRequest::Load) {
+                Ok(job) => self.library_job = Some(job),
+                Err(error) => {
+                    self.library_error = Some(error);
+                    self.reload_requested = true;
+                }
+            }
+        }
+        self.poll_library();
 
         let scope = workspace.selected_project().map(|project| Scope {
             id: project.id,
@@ -1764,10 +2036,12 @@ impl StructureWorkspace {
             }
             self.begin_walk(jobs);
         }
-        self.poll_pick();
+        self.poll_pick(jobs);
         self.poll_walk();
-        self.ensure_template();
-        self.ensure_dialog_template();
+        self.ensure_template(jobs);
+        self.ensure_dialog_template(jobs);
+        self.ensure_number(jobs);
+        self.poll_number();
         self.session.poll();
         if let Some(dialog) = self.new_project.as_mut() {
             dialog.session.poll();
@@ -1777,30 +2051,350 @@ impl StructureWorkspace {
                 self.begin_walk(jobs);
             }
         }
-        if let Some(completion) = self
+        let completion = self
             .new_project
             .as_mut()
-            .and_then(|dialog| dialog.session.take_completion())
-        {
-            if completion.succeeded && completion.created > 0 {
-                workspace.register_created_project(completion.root.clone());
+            .and_then(|dialog| dialog.session.take_completion());
+        if let Some(completion) = completion {
+            let finished = completion.succeeded && completion.failed == 0 && completion.created > 0;
+            if let Some(dialog) = self.new_project.as_mut() {
+                // A partial run still created the root, so the catalog gets it and
+                // the dialog keeps the report instead of claiming success.
+                if completion.created > 0 && !dialog.registered {
+                    dialog.registered = true;
+                    workspace.register_created_project(completion.root.clone());
+                }
+                if !finished {
+                    dialog.feedback = Some(if completion.created > 0 {
+                        "Only part of the project was created. The report lists every failure, \
+                         and the folder is registered so it can be repaired from Projects."
+                            .to_string()
+                    } else {
+                        "The project was not created; inspect the report before retrying."
+                            .to_string()
+                    });
+                }
+            }
+            if finished {
                 self.new_project = None;
-            } else if let Some(dialog) = self.new_project.as_mut() {
-                dialog.feedback = Some(
-                    "The project was not fully created; inspect the report before retrying."
-                        .to_string(),
-                );
             }
         }
 
         let draft = self.add_draft();
         self.session.invalidate(&draft);
+        let revision = self.library_revision;
         if let Some(dialog) = self.new_project.as_mut() {
-            dialog.session.invalidate(&dialog.draft());
+            dialog.session.invalidate(&dialog.draft(revision));
         }
     }
 
-    fn poll_pick(&mut self) {
+    // ------------------------------------------------------- template library
+
+    fn library_busy(&self) -> bool {
+        self.library_job.is_some() || self.template_job.is_some()
+    }
+
+    /// Why the library controls are inert, if they are.
+    fn library_reason(&self) -> &'static str {
+        if self.library_busy() {
+            "Wait for the template library to finish working."
+        } else if self.pick.is_some() {
+            "Close the folder chooser first."
+        } else if self.session.busy()
+            || self
+                .new_project
+                .as_ref()
+                .is_some_and(NewProjectDialog::busy)
+        {
+            "Wait for the current plan to finish."
+        } else {
+            ""
+        }
+    }
+
+    /// Starts one library request as a tracked job. The worker owns every read and
+    /// write; the reply carries exactly what the frame needs.
+    fn start_library_job(
+        &mut self,
+        jobs: &mut Jobs,
+        request: LibraryRequest,
+    ) -> Result<LibraryJob, String> {
+        if jobs.is_shutting_down() {
+            return Err("The application is closing.".to_string());
+        }
+        let library = self.library.clone();
+        let title = request.title();
+        let work = request.clone();
+        let (tx, rx) = channel();
+        jobs.start(&self.ctx, title, move |context| {
+            let JobContext {
+                control, events, ..
+            } = context;
+            let result = if control.checkpoint() == crate::jobs::Checkpoint::Cancelled {
+                Err("The template library request was cancelled.".to_string())
+            } else {
+                run_library(&library, work)
+            };
+            let outcome = if control.is_cancelled() {
+                JobOutcome::Cancelled
+            } else if result.is_ok() {
+                JobOutcome::Succeeded
+            } else {
+                JobOutcome::Failed
+            };
+            if let Err(message) = &result {
+                events.diagnostic(JobPhase::Scanning, message.clone());
+            }
+            let _ = tx.send(result);
+            events.finish(outcome, JobProgress::default());
+        })
+        .map_err(|error| format!("The template request could not be started: {error}"))?;
+        Ok(LibraryJob {
+            request,
+            replies: rx,
+        })
+    }
+
+    fn request_library(&mut self, jobs: &mut Jobs, request: LibraryRequest) {
+        if self.library_busy() {
+            self.dialog.error = Some(BUSY.to_string());
+            return;
+        }
+        match self.start_library_job(jobs, request) {
+            Ok(job) => self.library_job = Some(job),
+            Err(error) => self.dialog.error = Some(error),
+        }
+    }
+
+    fn poll_library(&mut self) {
+        if let Some(job) = self.library_job.take() {
+            match job.replies.try_recv() {
+                Ok(result) => {
+                    let request = job.request.clone();
+                    self.apply_library(request, result);
+                }
+                Err(TryRecvError::Empty) => self.library_job = Some(job),
+                Err(TryRecvError::Disconnected) => {
+                    self.dialog.error =
+                        Some("The template library stopped without a result.".to_string());
+                    self.loaded_template = None;
+                    self.dialog_loaded = None;
+                }
+            }
+        }
+        if let Some(job) = self.template_job.take() {
+            match job.replies.try_recv() {
+                Ok(result) => self.apply_template_read(&job.request, result),
+                Err(TryRecvError::Empty) => self.template_job = Some(job),
+                Err(TryRecvError::Disconnected) => {
+                    self.template_error =
+                        Some("Reading the template stopped without a result.".to_string());
+                }
+            }
+        }
+    }
+
+    fn apply_library(&mut self, request: LibraryRequest, result: Result<LibraryOutcome, String>) {
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(message) => {
+                match &request {
+                    LibraryRequest::Load => self.library_error = Some(message),
+                    _ => self.dialog.error = Some(message),
+                }
+                return;
+            }
+        };
+        self.library_error = None;
+        self.dialog.error = None;
+        if let Some(snapshot) = outcome.snapshot {
+            self.snapshot = snapshot;
+            self.settle_template_selection();
+        }
+        if let Some(clients) = outcome.clients {
+            self.snapshot.clients = clients;
+        }
+        if let Some(selected) = outcome.selected {
+            self.dialog.selected = selected;
+            self.dialog.confirm = None;
+            self.dialog_loaded = None;
+        }
+        if let Some(feedback) = outcome.feedback {
+            self.dialog.feedback = Some(feedback);
+        }
+        match &request {
+            LibraryRequest::Create { .. } => self.dialog.new_name.clear(),
+            LibraryRequest::Rename { .. } => self.dialog.rename.clear(),
+            LibraryRequest::AddFolder { .. } => self.dialog.folder_name.clear(),
+            LibraryRequest::SaveClients { .. } => {
+                self.dialog.client_entry.clear();
+                self.dialog.client_rename = None;
+            }
+            LibraryRequest::Delete { .. } => {
+                self.dialog.folder = PathBuf::new();
+                self.dialog.confirm = None;
+                self.settle_template_selection();
+            }
+            LibraryRequest::RenameFolder { relative, name, .. } => {
+                self.dialog.folder = match relative.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+                    _ => PathBuf::from(name),
+                };
+                self.dialog.folder_rename.clear();
+            }
+            LibraryRequest::RemoveFolder { .. } => {
+                self.dialog.folder = PathBuf::new();
+                self.dialog.confirm = None;
+            }
+            _ => {}
+        }
+        // Any content change makes every template snapshot and open plan stale.
+        if request.mutates_templates() {
+            self.library_revision += 1;
+            self.loaded_template = None;
+            self.dialog_loaded = None;
+        }
+    }
+
+    fn apply_template_read(
+        &mut self,
+        request: &LibraryRequest,
+        result: Result<LibraryOutcome, String>,
+    ) {
+        let LibraryRequest::Snapshot { id, .. } = request else {
+            return;
+        };
+        match result {
+            Ok(outcome) => {
+                let Some(template) = outcome.template else {
+                    return;
+                };
+                if self.template == *id {
+                    self.template_snapshot = Some(template.clone());
+                    self.template_error = None;
+                }
+                if self.dialog.open && self.dialog.selected == *id {
+                    self.dialog_template = Some(template);
+                }
+            }
+            Err(message) => {
+                if self.template == *id {
+                    self.template_snapshot = None;
+                    self.template_error = Some(message.clone());
+                }
+                if self.dialog.open && self.dialog.selected == *id {
+                    self.dialog_template = None;
+                    self.dialog.error = Some(message);
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------- next project number
+
+    fn number_key(&self) -> Option<NumberKey> {
+        let dialog = self.new_project.as_ref()?;
+        Some(NumberKey {
+            parent: dialog.parent_path()?,
+            naming: dialog.naming,
+        })
+    }
+
+    /// Reads the next free number on a worker for the parent and preset the user
+    /// committed. A reply is only acknowledged for that same pair.
+    fn ensure_number(&mut self, jobs: &mut Jobs) {
+        let Some(requested) = self.number_request.clone() else {
+            return;
+        };
+        if self.number_key().as_ref() != Some(&requested) {
+            if let Some(job) = self.number_job.take() {
+                jobs.cancel(job.job);
+            }
+            self.number_request = None;
+            return;
+        }
+        if self
+            .number_job
+            .as_ref()
+            .is_some_and(|job| job.key == requested)
+        {
+            return;
+        }
+        if let Some(job) = self.number_job.take() {
+            jobs.cancel(job.job);
+        }
+        if jobs.is_shutting_down() {
+            return;
+        }
+        let start = requested.parent.clone();
+        let naming = requested.naming;
+        let (tx, rx) = channel();
+        let started = jobs.start(
+            &self.ctx,
+            "Reading the next project number",
+            move |context| {
+                let result = match naming {
+                    NamingPreset::LauncherDated => structure::next_launcher_code(&start),
+                    NamingPreset::FolderStructurer => {
+                        structure::next_folder_structurer_number(&start)
+                    }
+                }
+                .map_err(|error| describe(&error));
+                let _ = tx.send(result);
+                context
+                    .events
+                    .finish(JobOutcome::Succeeded, JobProgress::default());
+            },
+        );
+        if let Ok(job) = started {
+            self.number_job = Some(NumberJob {
+                job,
+                key: requested,
+                replies: rx,
+            });
+        }
+    }
+
+    fn poll_number(&mut self) {
+        let Some(job) = self.number_job.take() else {
+            return;
+        };
+        match job.replies.try_recv() {
+            Ok(result) => {
+                if self.number_key().as_ref() != Some(&job.key) {
+                    return;
+                }
+                if self.number_request.as_ref() == Some(&job.key) {
+                    self.number_request = None;
+                }
+                let Some(dialog) = self.new_project.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(number) => {
+                        if dialog.number.trim().is_empty()
+                            || dialog.number == dialog.suggested_number
+                        {
+                            dialog.number = number.clone();
+                        }
+                        dialog.suggested_number = number;
+                    }
+                    Err(message) => {
+                        dialog.suggested_number.clear();
+                        dialog.feedback = Some(message);
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => self.number_job = Some(job),
+            Err(TryRecvError::Disconnected) => {
+                if self.number_request.as_ref() == Some(&job.key) {
+                    self.number_request = None;
+                }
+            }
+        }
+    }
+
+    fn poll_pick(&mut self, jobs: &mut Jobs) {
         let Some(run) = self.pick.take() else {
             return;
         };
@@ -1816,74 +2410,72 @@ impl StructureWorkspace {
                 return;
             }
         };
-        match reply {
-            PickReply::Folder(folder) => {
-                let Some(folder) = folder else {
-                    return;
-                };
-                self.last_pick = Some(folder.clone());
+        let Some(path) = reply else {
+            return;
+        };
+        // Remember a starting folder, never a chosen file.
+        self.last_pick = match (run.target, &path) {
+            (PickTarget::ClientsFile, path) => path.parent().map(Path::to_path_buf),
+            (_, path) => Some(path.clone()),
+        };
+        match run.target {
+            PickTarget::NewProjectParent => {
                 if let Some(dialog) = self.new_project.as_mut() {
-                    dialog.parent = folder.display().to_string();
-                    dialog.picked_parent = Some((folder, dialog.parent.clone()));
+                    dialog.parent = path.display().to_string();
+                    dialog.picked_parent = Some((path, dialog.parent.clone()));
                 }
-                self.suggest_number();
+                self.number_request = self.number_key();
             }
-            PickReply::Imported(result) => match result {
-                Ok(entries) => {
-                    self.snapshot.templates = entries;
-                    let imported = self.snapshot.templates.last().map(|entry| entry.id.clone());
-                    self.dialog.selected = imported.unwrap_or_default();
-                    self.dialog.feedback = Some("Template imported.".to_string());
-                    self.dialog.error = None;
-                    self.loaded_template = None;
-                    self.refresh_library();
-                }
-                Err(message) => self.dialog.error = Some(message),
-            },
+            // The library does the filesystem work, not the chooser worker.
+            PickTarget::TemplateFolder => {
+                self.request_library(jobs, LibraryRequest::ImportFolder { path })
+            }
+            PickTarget::ClientsFile => {
+                self.request_library(jobs, LibraryRequest::ImportClients { path })
+            }
         }
     }
 
-    fn begin_pick(&mut self, jobs: &mut Jobs, target: PickTarget, start: Option<PathBuf>) {
+    /// Opens the native chooser on a tracked job. The picker only returns the
+    /// chosen path; the workspace decides what to do with it.
+    fn begin_pick(&mut self, jobs: &mut Jobs, target: PickTarget) {
         if self.pick.is_some() || jobs.is_shutting_down() {
             return;
         }
         let title = match target {
             PickTarget::NewProjectParent => "Choose where the project goes",
-            PickTarget::TemplateImport => "Choose the folder to import",
+            PickTarget::TemplateFolder => "Choose the folder to import",
+            PickTarget::ClientsFile => "Choose a clients file",
         };
-        let start = start.or_else(|| self.last_pick.clone());
+        let start = self.last_pick.clone();
         let (tx, rx) = channel();
-        let library = self.library.clone();
-        let title = title.to_string();
-        let started = jobs.start(&self.ctx, title.clone(), move |context| {
-            let mut dialog = rfd::FileDialog::new().set_title(title);
-            if let Some(start) = start {
-                dialog = dialog.set_directory(start);
-            }
-            let reply = match dialog.pick_folder() {
-                Some(folder) if target == PickTarget::TemplateImport => {
-                    let name = folder
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Template".to_string());
-                    PickReply::Imported(
-                        library
-                            .import(&folder, &name)
-                            .map_err(|error| describe(&error)),
-                    )
+        let started = jobs
+            .start(&self.ctx, title, move |context| {
+                let mut dialog = rfd::FileDialog::new().set_title(title);
+                if let Some(start) = start {
+                    dialog = dialog.set_directory(start);
                 }
-                picked => PickReply::Folder(picked),
-            };
-            let _ = tx.send(reply);
-            context
-                .events
-                .finish(JobOutcome::Succeeded, JobProgress::default());
-        });
+                let picked = match target {
+                    PickTarget::ClientsFile => {
+                        dialog.add_filter("Clients file", &["json"]).pick_file()
+                    }
+                    _ => dialog.pick_folder(),
+                };
+                let _ = tx.send(picked);
+                context
+                    .events
+                    .finish(JobOutcome::Succeeded, JobProgress::default());
+            })
+            .map_err(|error| format!("The chooser could not be opened: {error}"));
         match started {
-            Ok(job) => self.pick = Some(PickRun { job, replies: rx }),
-            Err(error) => {
-                self.dialog.error = Some(format!("The folder chooser could not be opened: {error}"))
+            Ok(job) => {
+                self.pick = Some(PickRun {
+                    job,
+                    target,
+                    replies: rx,
+                })
             }
+            Err(error) => self.dialog.error = Some(error),
         }
     }
 
@@ -1938,46 +2530,68 @@ impl StructureWorkspace {
         }
     }
 
-    /// Loads the selected template's snapshot once per selection change.
-    fn ensure_template(&mut self) {
-        if self.loaded_template.as_deref() == Some(self.template.as_str())
-            && (self.template_snapshot.is_some() || self.template_error.is_some())
-        {
+    /// Loads the selected template's snapshot once per selection and revision.
+    fn ensure_template(&mut self, jobs: &mut Jobs) {
+        let key = (self.template.clone(), self.library_revision);
+        if self.loaded_template.as_ref() == Some(&key) || self.template_job.is_some() {
             return;
         }
         let Some(summary) = self.snapshot.template(&self.template).cloned() else {
-            self.loaded_template = Some(self.template.clone());
+            self.loaded_template = Some(key);
             self.template_snapshot = None;
             self.template_error = None;
             return;
         };
-        match self.library.snapshot(&summary) {
-            Ok(template) => {
-                self.template_snapshot = Some(template);
-                self.template_error = None;
-            }
-            Err(error) => {
-                self.template_snapshot = None;
-                self.template_error = Some(describe(&error));
-            }
+        if self.loaded_template.as_ref().map(|(id, _)| id) != Some(&summary.id) {
+            self.template_snapshot = None;
+            self.template_error = None;
         }
-        self.loaded_template = Some(self.template.clone());
+        self.loaded_template = Some(key);
+        let request = LibraryRequest::Snapshot {
+            id: summary.id,
+            name: summary.name,
+        };
+        match self.start_library_job(jobs, request) {
+            Ok(job) => self.template_job = Some(job),
+            Err(error) => self.template_error = Some(error),
+        }
     }
 
-    /// Loads the template the administration dialog is editing, once per selection.
-    fn ensure_dialog_template(&mut self) {
-        if !self.dialog.open {
+    /// Loads the template the administration dialog is editing, once per selection
+    /// and revision. Reuses the destination read when both point at one template.
+    fn ensure_dialog_template(&mut self, jobs: &mut Jobs) {
+        if !self.dialog.open || self.template_job.is_some() {
             return;
         }
-        if self.dialog_loaded.as_deref() == Some(self.dialog.selected.as_str()) {
+        let key = (self.dialog.selected.clone(), self.library_revision);
+        if self.dialog_loaded.as_ref() == Some(&key) {
             return;
         }
-        self.dialog_loaded = Some(self.dialog.selected.clone());
-        self.dialog_template = self
-            .snapshot
-            .template(&self.dialog.selected)
-            .cloned()
-            .and_then(|summary| self.library.snapshot(&summary).ok());
+        if self.template == self.dialog.selected
+            && self.loaded_template.as_ref() == Some(&key)
+            && self.template_snapshot.is_some()
+        {
+            self.dialog_template = self.template_snapshot.clone();
+            self.dialog_loaded = Some(key);
+            return;
+        }
+        let Some(summary) = self.snapshot.template(&self.dialog.selected).cloned() else {
+            self.dialog_loaded = Some(key);
+            self.dialog_template = None;
+            return;
+        };
+        if self.dialog_loaded.as_ref().map(|(id, _)| id) != Some(&summary.id) {
+            self.dialog_template = None;
+        }
+        self.dialog_loaded = Some(key);
+        let request = LibraryRequest::Snapshot {
+            id: summary.id,
+            name: summary.name,
+        };
+        match self.start_library_job(jobs, request) {
+            Ok(job) => self.template_job = Some(job),
+            Err(error) => self.dialog.error = Some(error),
+        }
     }
 
     // ----------------------------------------------------------------- drafts
@@ -2007,11 +2621,13 @@ impl StructureWorkspace {
             groups: self.tree_editor.groups(),
             nuke: self.nuke.settings(),
             parent_as_sequence: self.parent_as_sequence,
+            library: self.library_revision,
         }
     }
 
     fn busy(&self) -> bool {
         self.pick.is_some()
+            || self.library_busy()
             || self.session.busy()
             || self
                 .new_project
@@ -2167,39 +2783,15 @@ impl StructureWorkspace {
         }
     }
 
-    fn suggest_number(&mut self) {
-        if let Some(dialog) = self.new_project.as_mut() {
-            Self::suggest_number_for(dialog);
-        }
-    }
-
-    /// Suggests the next project number for a dialog's parent folder. Takes the
-    /// dialog by value-reference because the modal frame owns it while it is open.
-    fn suggest_number_for(dialog: &mut NewProjectDialog) {
-        let Some(parent) = dialog.parent_path() else {
-            return;
-        };
-        let suggestion = match dialog.naming {
-            NamingPreset::LauncherDated => structure::next_launcher_code(&parent),
-            NamingPreset::FolderStructurer => structure::next_folder_structurer_number(&parent),
-        };
-        match suggestion {
-            Ok(number) => {
-                if dialog.number.trim().is_empty() || dialog.number == dialog.suggested_number {
-                    dialog.number = number.clone();
-                }
-                dialog.suggested_number = number;
-            }
-            Err(error) => {
-                dialog.suggested_number.clear();
-                dialog.feedback = Some(describe(&error));
-            }
-        }
-    }
-
     pub fn status_line(&self) -> String {
         if let Some(reason) = self.live_reason() {
             return reason;
+        }
+        if let Some(job) = &self.library_job {
+            return format!("{}…", job.request.title());
+        }
+        if self.template_job.is_some() {
+            return "Reading the template…".to_string();
         }
         if self.walk.is_some() {
             return "Reading project folders…".to_string();
@@ -2233,6 +2825,7 @@ impl StructureWorkspace {
 
     /// Draws the whole Shots & Sequences page.
     pub fn view(&mut self, ui: &mut egui::Ui, jobs: &mut Jobs) {
+        let enabled = !self.busy() && self.scope.is_some();
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Project").small().weak());
             let name = self
@@ -2247,7 +2840,7 @@ impl StructureWorkspace {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button("Templates & clients…")
+                    .add_enabled(!self.busy(), egui::Button::new("Templates & clients…"))
                     .on_hover_text("Folder templates and client names for both flows.")
                     .clicked()
                 {
@@ -2255,9 +2848,16 @@ impl StructureWorkspace {
                 }
             });
         });
+        if !self.snapshot.warnings.is_empty() {
+            notices(
+                ui,
+                "Library notices",
+                "structure_library",
+                &self.snapshot.warnings,
+            );
+        }
         ui.separator();
 
-        let enabled = !self.busy() && self.scope.is_some();
         egui::Panel::bottom("structure_preview_dock")
             .resizable(true)
             .default_size(240.0)
@@ -2496,9 +3096,7 @@ impl StructureWorkspace {
                     if let Some(error) = &report.error {
                         notice(ui, error, true);
                     }
-                    for line in report.lines.iter().take(40) {
-                        ui.label(egui::RichText::new(line).small().weak());
-                    }
+                    notices(ui, "Files and failures", "structure_run", &report.lines);
                     if !report.inspection.is_empty() {
                         ui.collapsing("Journal record", |ui| {
                             for line in &report.inspection {
@@ -2561,7 +3159,8 @@ impl StructureWorkspace {
 
     pub fn begin_new_project(&mut self, workspace: &ProjectWorkspace) {
         if self.library_error.is_some() {
-            self.refresh_library();
+            // Retried by the next poll; nothing here touches the data area.
+            self.reload_requested = true;
         }
         let parent = workspace
             .selected_project()
@@ -2569,7 +3168,7 @@ impl StructureWorkspace {
             .and_then(|root| root.parent().map(Path::to_path_buf));
         let dialog = NewProjectDialog::new(&self.snapshot, parent, &self.template);
         self.new_project = Some(dialog);
-        self.suggest_number();
+        self.number_request = self.number_key();
     }
 
     pub fn new_project_dialog(
@@ -2592,375 +3191,463 @@ impl StructureWorkspace {
         let templates = self.snapshot.templates.clone();
         let clients = self.snapshot.clients.clone();
         let library_error = self.library_error.clone();
+        let warnings = self.snapshot.warnings.clone();
+        // Any library worker, the folder chooser, or the page's own plan keeps the
+        // whole form inert: templates cannot change under a running plan.
+        let library_held = !self.library_reason().is_empty();
+        let number_pending = self.number_request.is_some();
+        let revision = self.library_revision;
         let mut cancel = false;
         let mut open = true;
+        let mut ask_number = false;
         egui::Window::new("New project")
             .collapsible(false)
             .resizable(true)
-            .default_width(760.0)
+            .default_size([860.0, 720.0])
+            .min_width(640.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 if let Some(error) = &library_error {
                     notice(ui, error, true);
                 }
-                let editing = !dialog.busy();
-                egui::ScrollArea::vertical()
-                    .max_height(430.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("new_project_fields")
-                            .num_columns(2)
-                            .spacing([12.0, 6.0])
-                            .show(ui, |ui| {
-                                ui.label("Create inside");
-                                ui.horizontal(|ui| {
-                                    let edit = ui.add_enabled(
-                                        editing,
-                                        egui::TextEdit::singleline(&mut dialog.parent)
-                                            .desired_width(400.0)
-                                            .hint_text("Absolute parent folder"),
-                                    );
-                                    if edit.changed() {
-                                        // No folder read per keystroke: the next free
-                                        // number is looked up when the field is committed.
-                                        if dialog.number == dialog.suggested_number {
-                                            dialog.number.clear();
-                                        }
-                                        dialog.suggested_number.clear();
-                                    }
-                                    if edit.lost_focus() {
-                                        StructureWorkspace::suggest_number_for(&mut dialog);
-                                    }
-                                    if ui
-                                        .add_enabled(editing, egui::Button::new("Browse…"))
-                                        .clicked()
-                                    {
-                                        self.begin_pick(
-                                            jobs,
-                                            PickTarget::NewProjectParent,
-                                            dialog.parent_path(),
-                                        );
-                                    }
-                                });
-                                ui.end_row();
+                notices(ui, "Library notices", "new_project_library", &warnings);
+                if library_held {
+                    notice(ui, self.library_reason(), false);
+                }
+                let editing = !dialog.busy() && !library_held;
+                let library_blocked = library_held.then(|| self.library_reason().to_string());
+                let number_blocked = number_pending
+                    .then(|| "Reading the next project number in that folder…".to_string());
 
-                                ui.label("Naming");
-                                let mut naming = dialog.naming;
-                                egui::ComboBox::from_id_salt("new_project_naming")
-                                    .selected_text(naming.label())
-                                    .width(220.0)
-                                    .show_ui(ui, |ui| {
-                                        for preset in [
-                                            NamingPreset::LauncherDated,
-                                            NamingPreset::FolderStructurer,
-                                        ] {
-                                            ui.selectable_value(
-                                                &mut naming,
-                                                preset,
-                                                preset.label(),
-                                            );
-                                        }
-                                    });
-                                if naming != dialog.naming {
-                                    let old = std::mem::replace(
-                                        &mut dialog.suggested_number,
-                                        String::new(),
-                                    );
-                                    if dialog.number == old {
-                                        dialog.number.clear();
-                                    }
-                                    dialog.naming = naming;
+                // Pinned actions first, then a resizable review dock, so the form
+                // above keeps a usable height and the buttons never scroll away.
+                egui::Panel::bottom("new_project_actions").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let plan_reason = dialog
+                            .plan_reason(&self.snapshot)
+                            .or_else(|| library_blocked.clone())
+                            .or_else(|| number_blocked.clone());
+                        let preview = ui.add_enabled(
+                            plan_reason.is_none(),
+                            egui::Button::new("Preview"),
+                        );
+                        if preview.clicked() {
+                            dialog.session.clear();
+                            if let Some(summary) = self.snapshot.template(&dialog.template).cloned()
+                            {
+                                let library = self.library.clone();
+                                let draft = dialog.draft(revision);
+                                if let Err(message) = dialog.session.begin_preview(
+                                    ctx,
+                                    jobs,
+                                    draft,
+                                    move |draft, revision| {
+                                        let template = library
+                                            .snapshot(&summary)
+                                            .map_err(|error| describe(&error))?;
+                                        plan_new_project(draft, &template, revision)
+                                    },
+                                ) {
+                                    dialog.session.message = Some(message);
                                 }
-                                ui.end_row();
+                            } else {
+                                dialog.session.message = Some(NO_TEMPLATE.to_string());
+                            }
+                        }
+                        if let Some(reason) = &plan_reason {
+                            explain(&preview, reason);
+                        }
 
-                                ui.label("Number");
-                                ui.horizontal(|ui| {
-                                    ui.add_enabled(
-                                        editing,
-                                        egui::TextEdit::singleline(&mut dialog.number)
-                                            .desired_width(90.0)
-                                            .hint_text("auto"),
-                                    );
-                                    if ui
-                                        .add_enabled(editing, egui::Button::new("Next"))
-                                        .on_hover_text("Use the next free number in that folder.")
-                                        .clicked()
-                                    {
-                                        dialog.number = dialog.suggested_number.clone();
+                        let check_reason = match &dialog.session.preview {
+                            None => Some("Preview the project first.".to_string()),
+                            Some(preview) if preview.draft != dialog.draft(revision) => {
+                                Some("The form changed; preview again.".to_string())
+                            }
+                            Some(_) => None,
+                        }
+                        .or_else(|| library_blocked.clone());
+                        let check = ui.add_enabled(
+                            !dialog.busy() && check_reason.is_none(),
+                            egui::Button::new("Check"),
+                        );
+                        if check.clicked() {
+                            if let Some(preview) = dialog.session.preview.clone() {
+                                if let Err(message) = dialog.session.begin_validate(
+                                    ctx,
+                                    jobs,
+                                    preview.draft.clone(),
+                                    preview.plan.clone(),
+                                    preview.revision,
+                                    preview.project_root.clone(),
+                                ) {
+                                    dialog.session.message = Some(message);
+                                }
+                            }
+                        }
+                        if let Some(reason) = &check_reason {
+                            explain(&check, reason);
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!dialog.busy(), egui::Button::new("Cancel"))
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                            let execute_reason = if dialog.busy() {
+                                Some(BUSY.to_string())
+                            } else if let Some(reason) = library_blocked.clone() {
+                                Some(reason)
+                            } else if dialog
+                                .session
+                                .review
+                                .as_ref()
+                                .is_some_and(|review| review.draft != dialog.draft(revision))
+                            {
+                                Some("The form changed; check again.".to_string())
+                            } else if dialog
+                                .session
+                                .review
+                                .as_ref()
+                                .and_then(|review| review.ready.as_ref())
+                                .is_none()
+                            {
+                                Some("Check the preview first.".to_string())
+                            } else {
+                                None
+                            };
+                            let add = accent_button(ui, "Add project", execute_reason.is_none());
+                            if add.clicked() {
+                                match (self.catalog.clone(), self.user) {
+                                    (Some(catalog), Some(user)) => {
+                                        if let Err(message) = dialog.session.begin_execute(
+                                            ctx,
+                                            jobs,
+                                            catalog,
+                                            user,
+                                            "Creating the project",
+                                        ) {
+                                            dialog.session.message = Some(message);
+                                        }
                                     }
-                                    ui.label(
-                                        egui::RichText::new(match dialog.naming {
-                                            NamingPreset::LauncherDated => {
-                                                "required by the dated preset"
-                                            }
-                                            NamingPreset::FolderStructurer => "optional",
-                                        })
-                                        .small()
-                                        .weak(),
-                                    );
-                                });
-                                ui.end_row();
+                                    _ => dialog.session.message = Some(NO_CATALOG.to_string()),
+                                }
+                            }
+                            if let Some(reason) = &execute_reason {
+                                explain(&add, reason);
+                            }
+                        });
+                    });
+                });
 
-                                ui.label("Client");
-                                ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_salt("new_project_client")
-                                        .selected_text(if dialog.client.trim().is_empty() {
-                                            "—".to_string()
-                                        } else {
-                                            dialog.client.clone()
-                                        })
-                                        .width(160.0)
-                                        .show_ui(ui, |ui| {
-                                            for client in &clients {
-                                                if ui
-                                                    .selectable_label(
-                                                        &dialog.client == client,
-                                                        client,
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    dialog.client = client.clone();
-                                                }
-                                            }
-                                        });
-                                    ui.add_enabled(
-                                        editing,
-                                        egui::TextEdit::singleline(&mut dialog.client)
-                                            .desired_width(160.0)
-                                            .hint_text("Client name"),
-                                    );
-                                });
-                                ui.end_row();
-
-                                ui.label("Project name");
-                                ui.add_enabled(
-                                    editing,
-                                    egui::TextEdit::singleline(&mut dialog.name)
-                                        .desired_width(260.0)
-                                        .hint_text("Working title"),
+                egui::Panel::bottom("new_project_review")
+                    .resizable(true)
+                    .default_size(300.0)
+                    .min_size(140.0)
+                    .max_size(560.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Review and report").small().weak());
+                            if let Some(preview) = &dialog.session.preview {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} folder(s) · {} script(s)",
+                                        preview.folders, preview.scripts
+                                    ))
+                                    .small()
+                                    .weak(),
                                 );
-                                ui.end_row();
-
-                                ui.label("Date");
-                                ui.horizontal(|ui| {
-                                    ui.add_enabled(
-                                        editing,
-                                        egui::TextEdit::singleline(&mut dialog.date)
-                                            .desired_width(110.0)
-                                            .hint_text("YYYY-MM-DD"),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "captured once for preview and creation",
-                                        )
-                                        .small()
-                                        .weak(),
-                                    );
-                                });
-                                ui.end_row();
-
-                                ui.label("Folder template");
-                                ui.horizontal(|ui| {
-                                    let mut template = dialog.template.clone();
-                                    egui::ComboBox::from_id_salt("new_project_template")
-                                        .selected_text(
-                                            self.snapshot
-                                                .name_of(&template)
-                                                .unwrap_or("No template"),
-                                        )
-                                        .width(200.0)
-                                        .show_ui(ui, |ui| {
-                                            for entry in &templates {
-                                                ui.selectable_value(
-                                                    &mut template,
-                                                    entry.id.clone(),
-                                                    &entry.name,
+                            }
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("new_project_review_lines")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(feedback) = &dialog.feedback {
+                                    notice(ui, feedback, false);
+                                }
+                                if let Some(message) = &dialog.session.message {
+                                    notice(ui, message, false);
+                                }
+                                if let Some(report) = &dialog.session.report {
+                                    ui.label(egui::RichText::new(&report.headline).small());
+                                    if let Some(error) = &report.error {
+                                        notice(ui, error, true);
+                                    }
+                                    notices(ui, "Created and failed items", "new_project_run", &report.lines);
+                                    if !report.inspection.is_empty() {
+                                        ui.collapsing("Journal record", |ui| {
+                                            for line in &report.inspection {
+                                                ui.label(
+                                                    egui::RichText::new(line).small().monospace(),
                                                 );
                                             }
                                         });
-                                    if template != dialog.template {
-                                        dialog.template = template;
-                                        dialog.session.clear();
-                                    }
-                                    if ui
-                                        .button("Manage…")
-                                        .on_hover_text("Templates & clients")
-                                        .clicked()
-                                    {
-                                        self.dialog.open = true;
-                                    }
-                                });
-                                ui.end_row();
-
-                                ui.label("Project folder");
-                                ui.label(egui::RichText::new(dialog.root_name()).monospace());
-                                ui.end_row();
-                            });
-
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.label(egui::RichText::new("Sequences and shots").small().weak());
-                        if dialog.tree.ui(ui, editing) {
-                            dialog.session.invalidate(&dialog.draft());
-                        }
-                        ui.add_space(4.0);
-                        ui.separator();
-                        dialog.nuke.ui(ui, editing, None);
-
-                        if let Some(feedback) = &dialog.feedback {
-                            notice(ui, feedback, false);
-                        }
-                        if let Some(message) = &dialog.session.message {
-                            notice(ui, message, false);
-                        }
-                        if let Some(report) = &dialog.session.report {
-                            ui.label(egui::RichText::new(&report.headline).small());
-                            if let Some(error) = &report.error {
-                                notice(ui, error, true);
-                            }
-                            for line in report.lines.iter().take(40) {
-                                ui.label(egui::RichText::new(line).small().weak());
-                            }
-                            if !report.inspection.is_empty() {
-                                ui.collapsing("Journal record", |ui| {
-                                    for line in &report.inspection {
-                                        ui.label(egui::RichText::new(line).small().monospace());
-                                    }
-                                });
-                            }
-                        }
-                        if let Some(review) = &dialog.session.review {
-                            ui.label(egui::RichText::new(review.summary()).small());
-                            if let Some(refusal) = &review.refusal {
-                                notice(ui, refusal, true);
-                            }
-                            for warning in &review.warnings {
-                                notice(ui, warning, false);
-                            }
-                            review_rows(ui, &review.rows);
-                        } else if let Some(preview) = &dialog.session.preview {
-                            for warning in &preview.warnings {
-                                notice(ui, warning, false);
-                            }
-                            preview_rows(ui, preview, None);
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let plan_reason = dialog.plan_reason(&self.snapshot);
-                    let preview = ui.add_enabled(
-                        !dialog.busy() && plan_reason.is_none(),
-                        egui::Button::new("Preview"),
-                    );
-                    if preview.clicked() {
-                        dialog.session.clear();
-                        if let Some(summary) = self.snapshot.template(&dialog.template).cloned() {
-                            let library = self.library.clone();
-                            let draft = dialog.draft();
-                            if let Err(message) = dialog.session.begin_preview(
-                                ctx,
-                                jobs,
-                                draft,
-                                move |draft, revision| {
-                                    let template = library
-                                        .snapshot(&summary)
-                                        .map_err(|error| describe(&error))?;
-                                    plan_new_project(draft, &template, revision)
-                                },
-                            ) {
-                                dialog.session.message = Some(message);
-                            }
-                        } else {
-                            dialog.session.message = Some(NO_TEMPLATE.to_string());
-                        }
-                    }
-                    if let Some(reason) = &plan_reason {
-                        explain(&preview, reason);
-                    }
-
-                    let check_reason = match &dialog.session.preview {
-                        None => Some("Preview the project first.".to_string()),
-                        Some(preview) if preview.draft != dialog.draft() => {
-                            Some("The form changed; preview again.".to_string())
-                        }
-                        Some(_) => None,
-                    };
-                    let check = ui.add_enabled(
-                        !dialog.busy() && check_reason.is_none(),
-                        egui::Button::new("Check"),
-                    );
-                    if check.clicked() {
-                        if let Some(preview) = dialog.session.preview.clone() {
-                            if let Err(message) = dialog.session.begin_validate(
-                                ctx,
-                                jobs,
-                                preview.draft.clone(),
-                                preview.plan.clone(),
-                                preview.revision,
-                                preview.project_root.clone(),
-                            ) {
-                                dialog.session.message = Some(message);
-                            }
-                        }
-                    }
-                    if let Some(reason) = &check_reason {
-                        explain(&check, reason);
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!dialog.busy(), egui::Button::new("Cancel"))
-                            .clicked()
-                        {
-                            cancel = true;
-                        }
-                        let execute_reason = if dialog.busy() {
-                            Some(BUSY.to_string())
-                        } else if dialog
-                            .session
-                            .review
-                            .as_ref()
-                            .is_some_and(|review| review.draft != dialog.draft())
-                        {
-                            Some("The form changed; check again.".to_string())
-                        } else if dialog
-                            .session
-                            .review
-                            .as_ref()
-                            .and_then(|review| review.ready.as_ref())
-                            .is_none()
-                        {
-                            Some("Check the preview first.".to_string())
-                        } else {
-                            None
-                        };
-                        let add = accent_button(ui, "Add project", execute_reason.is_none());
-                        if add.clicked() {
-                            match (self.catalog.clone(), self.user) {
-                                (Some(catalog), Some(user)) => {
-                                    if let Err(message) = dialog.session.begin_execute(
-                                        ctx,
-                                        jobs,
-                                        catalog,
-                                        user,
-                                        "Creating the project",
-                                    ) {
-                                        dialog.session.message = Some(message);
                                     }
                                 }
-                                _ => dialog.session.message = Some(NO_CATALOG.to_string()),
-                            }
-                        }
-                        if let Some(reason) = &execute_reason {
-                            explain(&add, reason);
-                        }
+                                if let Some(review) = &dialog.session.review {
+                                    ui.label(egui::RichText::new(review.summary()).small());
+                                    if let Some(refusal) = &review.refusal {
+                                        notice(ui, refusal, true);
+                                    }
+                                    for warning in &review.warnings {
+                                        notice(ui, warning, false);
+                                    }
+                                    review_rows(ui, &review.rows);
+                                } else if let Some(preview) = &dialog.session.preview {
+                                    for warning in &preview.warnings {
+                                        notice(ui, warning, false);
+                                    }
+                                    preview_rows(ui, preview, None);
+                                } else {
+                                    empty_state(
+                                        ui,
+                                        "No preview yet.",
+                                        "Fill in the form and preview the project to review it here.",
+                                    );
+                                }
+                            });
                     });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("new_project_form")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("new_project_fields")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Create inside");
+                                    ui.horizontal(|ui| {
+                                        let edit = ui.add_enabled(
+                                            editing,
+                                            egui::TextEdit::singleline(&mut dialog.parent)
+                                                .desired_width(400.0)
+                                                .hint_text("Absolute parent folder"),
+                                        );
+                                        if edit.changed() {
+                                            // No folder read per keystroke: the next free
+                                            // number is looked up when the field is committed.
+                                            if dialog.number == dialog.suggested_number {
+                                                dialog.number.clear();
+                                            }
+                                            dialog.suggested_number.clear();
+                                        }
+                                        if edit.lost_focus() {
+                                            ask_number = true;
+                                        }
+                                        if ui
+                                            .add_enabled(editing, egui::Button::new("Browse…"))
+                                            .clicked()
+                                        {
+                                            self.begin_pick(jobs, PickTarget::NewProjectParent);
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Naming");
+                                    let mut naming = dialog.naming;
+                                    ui.add_enabled_ui(editing, |ui| {
+                                        egui::ComboBox::from_id_salt("new_project_naming")
+                                            .selected_text(naming.label())
+                                            .width(220.0)
+                                            .show_ui(ui, |ui| {
+                                                for preset in [
+                                                    NamingPreset::LauncherDated,
+                                                    NamingPreset::FolderStructurer,
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut naming,
+                                                        preset,
+                                                        preset.label(),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    if naming != dialog.naming {
+                                        let old =
+                                            std::mem::replace(&mut dialog.suggested_number, String::new());
+                                        if dialog.number == old {
+                                            dialog.number.clear();
+                                        }
+                                        dialog.naming = naming;
+                                        ask_number = true;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Number");
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editing,
+                                            egui::TextEdit::singleline(&mut dialog.number)
+                                                .desired_width(90.0)
+                                                .hint_text("auto"),
+                                        );
+                                        if ui
+                                            .add_enabled(editing, egui::Button::new("Next"))
+                                            .on_hover_text("Use the next free number in that folder.")
+                                            .clicked()
+                                        {
+                                            dialog.number = dialog.suggested_number.clone();
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(match dialog.naming {
+                                                NamingPreset::LauncherDated => {
+                                                    "required by the dated preset"
+                                                }
+                                                NamingPreset::FolderStructurer => "optional",
+                                            })
+                                            .small()
+                                            .weak(),
+                                        );
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Client");
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.add_enabled(
+                                                editing,
+                                                egui::TextEdit::singleline(&mut dialog.client)
+                                                    .desired_width(200.0)
+                                                    .hint_text("Client name"),
+                                            );
+                                            if ui
+                                                .add_enabled(
+                                                    editing,
+                                                    egui::Button::new("Import clients…"),
+                                                )
+                                                .on_hover_text(
+                                                    "Merge an existing clients.json into the library.",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.begin_pick(jobs, PickTarget::ClientsFile);
+                                            }
+                                        });
+                                        let matches: Vec<String> = clients
+                                            .iter()
+                                            .filter(|client| client_matches(&dialog.client, client))
+                                            .cloned()
+                                            .collect();
+                                        if !matches.is_empty() {
+                                            ui.add_enabled_ui(editing, |ui| {
+                                                egui::ScrollArea::vertical()
+                                                    .id_salt("new_project_clients")
+                                                    .max_height(96.0)
+                                                    .auto_shrink([false, false])
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            for client in &matches {
+                                                                let selected =
+                                                                    &dialog.client == client;
+                                                                if ui
+                                                                    .add(
+                                                                        egui::Button::selectable(
+                                                                            selected, client,
+                                                                        ),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    dialog.client =
+                                                                        client.clone();
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                            });
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Project name");
+                                    ui.add_enabled(
+                                        editing,
+                                        egui::TextEdit::singleline(&mut dialog.name)
+                                            .desired_width(260.0)
+                                            .hint_text("Working title"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Date");
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editing,
+                                            egui::TextEdit::singleline(&mut dialog.date)
+                                                .desired_width(110.0)
+                                                .hint_text("YYYY-MM-DD"),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "captured once for preview and creation",
+                                            )
+                                            .small()
+                                            .weak(),
+                                        );
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Folder template");
+                                    ui.horizontal(|ui| {
+                                        let mut template = dialog.template.clone();
+                                        ui.add_enabled_ui(editing, |ui| {
+                                            egui::ComboBox::from_id_salt("new_project_template")
+                                                .selected_text(
+                                                    self.snapshot
+                                                        .name_of(&template)
+                                                        .unwrap_or("No template"),
+                                                )
+                                                .width(200.0)
+                                                .show_ui(ui, |ui| {
+                                                    for entry in &templates {
+                                                        ui.selectable_value(
+                                                            &mut template,
+                                                            entry.id.clone(),
+                                                            &entry.name,
+                                                        );
+                                                    }
+                                                });
+                                            if ui
+                                                .button("Manage…")
+                                                .on_hover_text("Templates & clients")
+                                                .clicked()
+                                            {
+                                                self.dialog.open = true;
+                                            }
+                                        });
+                                        if template != dialog.template {
+                                            dialog.template = template;
+                                            dialog.session.clear();
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Project folder");
+                                    ui.label(egui::RichText::new(dialog.root_name()).monospace());
+                                    ui.end_row();
+                                });
+
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.label(egui::RichText::new("Sequences and shots").small().weak());
+                            if dialog.tree.ui(ui, editing) {
+                                dialog.session.invalidate(&dialog.draft(revision));
+                            }
+                            ui.add_space(4.0);
+                            ui.separator();
+                            dialog.nuke.ui(ui, editing, None);
+                        });
                 });
             });
 
         if dialog.busy() || (!cancel && open) {
             self.new_project = Some(dialog);
+            if ask_number {
+                self.number_request = self.number_key();
+            }
         }
     }
 
@@ -2970,21 +3657,25 @@ impl StructureWorkspace {
         if !self.dialog.open {
             return;
         }
-        if self.busy() {
-            return;
-        }
-        let mut open = self.dialog.open;
         if ctx.input(|input| input.key_pressed(egui::Key::Escape))
             && ctx.memory(|memory| memory.focused().is_none())
         {
             self.dialog.open = false;
             return;
         }
+        // The window stays visible and honest while a worker runs; only its
+        // controls go inert, so nothing the user typed disappears.
+        let editable = !self.busy();
+        let blocked = self.library_reason();
+        let warnings = self.snapshot.warnings.clone();
         let mut actions: Vec<DialogAction> = Vec::new();
+        let mut open = self.dialog.open;
+        const PANES: f32 = 250.0;
         egui::Window::new("Templates & clients")
             .collapsible(false)
             .resizable(true)
-            .default_width(780.0)
+            .default_size([880.0, 660.0])
+            .min_width(720.0)
             .open(&mut open)
             .show(ctx, |ui| {
                 if let Some(error) = &self.library_error {
@@ -2993,300 +3684,443 @@ impl StructureWorkspace {
                 if let Some(error) = &self.dialog.error {
                     notice(ui, error, true);
                 }
-                ui.horizontal_top(|ui| {
-                    ui.set_max_height(360.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(250.0);
-                        ui.label(egui::RichText::new("Templates").small().weak());
-                        egui::ScrollArea::vertical()
-                            .id_salt("template_list")
-                            .max_height(200.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for entry in self.snapshot.templates.clone() {
-                                    let selected = self.dialog.selected == entry.id;
-                                    if ui.selectable_label(selected, &entry.name).clicked() {
-                                        self.dialog.selected = entry.id.clone();
-                                        self.dialog.folder = PathBuf::new();
-                                        self.dialog.confirm = None;
-                                    }
-                                }
-                                if self.snapshot.templates.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("No templates yet.").small().weak(),
-                                    );
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dialog.new_name)
-                                    .hint_text("New template name")
-                                    .desired_width(140.0),
-                            );
-                            if ui.button("Create").clicked() {
-                                actions.push(DialogAction::CreateTemplate);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("Import folder…").clicked() {
-                                actions.push(DialogAction::ImportTemplate);
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.selected.is_empty(),
-                                    egui::Button::new("Delete template"),
-                                )
-                                .on_hover_text("Delete the template and its folder.")
-                                .clicked()
-                            {
-                                actions.push(DialogAction::AskDeleteTemplate);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dialog.rename)
-                                    .hint_text("Rename to")
-                                    .desired_width(140.0),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.selected.is_empty(),
-                                    egui::Button::new("Rename"),
-                                )
-                                .clicked()
-                            {
-                                actions.push(DialogAction::RenameTemplate);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.selected.is_empty(),
-                                    egui::Button::new("Move up"),
-                                )
-                                .clicked()
-                            {
-                                actions.push(DialogAction::MoveUp);
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.selected.is_empty(),
-                                    egui::Button::new("Move down"),
-                                )
-                                .clicked()
-                            {
-                                actions.push(DialogAction::MoveDown);
+                if let Some(feedback) = &self.dialog.feedback {
+                    notice(ui, feedback, false);
+                }
+                notices(ui, "Library notices", "manager_library", &warnings);
+
+                egui::Panel::bottom("manager_footer").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Changes are written to disk immediately.")
+                                .small()
+                                .weak(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                actions.push(DialogAction::Close);
                             }
                         });
                     });
-                    ui.separator();
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("Folders").small().weak());
-                        let rows = self.selected_template_rows();
-                        egui::ScrollArea::vertical()
-                            .id_salt("template_folders")
-                            .max_height(200.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for (relative, depth, markers) in &rows {
-                                    ui.push_id(("template_folder", relative), |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(*depth as f32 * 12.0);
-                                            let label = format!("{}/", file_label(relative));
-                                            if ui
-                                                .selectable_label(
-                                                    self.dialog.folder == *relative,
-                                                    label,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.dialog.folder = relative.clone();
-                                                self.dialog.markers_sequences = markers.sequences;
-                                                self.dialog.markers_shots = markers.shots;
+                });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("manager_body")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.set_width(300.0);
+                                    ui.set_min_height(PANES);
+                                    ui.label(egui::RichText::new("Templates").small().weak());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("template_list")
+                                        .max_height(PANES)
+                                        .min_scrolled_height(PANES)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            for entry in self.snapshot.templates.clone() {
+                                                let selected = self.dialog.selected == entry.id;
+                                                if ui
+                                                    .add_enabled(
+                                                        editable,
+                                                        egui::Button::selectable(
+                                                            selected,
+                                                            &entry.name,
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.dialog.selected = entry.id.clone();
+                                                    self.dialog.folder = PathBuf::new();
+                                                    self.dialog.confirm = None;
+                                                }
                                             }
-                                            let mut flags = Vec::new();
-                                            if markers.sequences {
-                                                flags.push("sequences");
-                                            }
-                                            if markers.shots {
-                                                flags.push("shots");
-                                            }
-                                            if !flags.is_empty() {
+                                            if self.snapshot.templates.is_empty() {
                                                 ui.label(
-                                                    egui::RichText::new(flags.join(" + "))
+                                                    egui::RichText::new("No templates yet.")
                                                         .small()
                                                         .weak(),
                                                 );
                                             }
                                         });
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editable,
+                                            egui::TextEdit::singleline(&mut self.dialog.new_name)
+                                                .hint_text("New template name")
+                                                .desired_width(150.0),
+                                        );
+                                        if ui
+                                            .add_enabled(editable, egui::Button::new("Create"))
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::CreateTemplate);
+                                        }
                                     });
-                                }
-                                if rows.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("No folders in this template.")
-                                            .small()
-                                            .weak(),
-                                    );
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dialog.folder_name)
-                                    .hint_text("New folder name")
-                                    .desired_width(140.0),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.selected.is_empty(),
-                                    egui::Button::new("Add folder"),
-                                )
-                                .on_hover_text("Add inside the selected folder, or at the top.")
-                                .clicked()
-                            {
-                                actions.push(DialogAction::AddFolder);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.dialog.folder_rename)
-                                    .hint_text("Rename folder to")
-                                    .desired_width(140.0),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.folder.as_os_str().is_empty(),
-                                    egui::Button::new("Rename folder"),
-                                )
-                                .clicked()
-                            {
-                                actions.push(DialogAction::RenameFolder);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let mut markers_changed = false;
-                            markers_changed |= ui
-                                .add_enabled(
-                                    !self.dialog.folder.as_os_str().is_empty(),
-                                    egui::Checkbox::new(
-                                        &mut self.dialog.markers_sequences,
-                                        "Sequence folders",
-                                    ),
-                                )
-                                .on_hover_text("sequences.txt: one folder per named sequence")
-                                .changed();
-                            markers_changed |= ui
-                                .add_enabled(
-                                    !self.dialog.folder.as_os_str().is_empty(),
-                                    egui::Checkbox::new(
-                                        &mut self.dialog.markers_shots,
-                                        "Shot folders",
-                                    ),
-                                )
-                                .on_hover_text("shots.txt: shots inside this folder")
-                                .changed();
-                            if markers_changed {
-                                actions.push(DialogAction::SetMarkers);
-                            }
-                            if ui
-                                .add_enabled(
-                                    !self.dialog.folder.as_os_str().is_empty(),
-                                    egui::Button::new("Delete folder"),
-                                )
-                                .on_hover_text("Delete this folder and its contents.")
-                                .clicked()
-                            {
-                                actions.push(DialogAction::AskDeleteFolder);
-                            }
-                        });
-                        if let Some(confirm) = self.dialog.confirm.clone() {
-                            ui.horizontal(|ui| {
-                                let what = match &confirm {
-                                    Confirm::Template(_) => "this template and its folder",
-                                    Confirm::Folder(_) => "this template folder and its contents",
-                                };
-                                ui.label(
-                                    egui::RichText::new(format!("Delete {what}?"))
-                                        .small()
-                                        .color(WARNING),
-                                );
-                                if ui.small_button("Delete").clicked() {
-                                    actions.push(DialogAction::ConfirmDelete);
-                                }
-                                if ui.small_button("Keep").clicked() {
-                                    actions.push(DialogAction::CancelDelete);
-                                }
-                            });
-                        }
-                    });
-                });
-
-                ui.separator();
-                ui.label(egui::RichText::new("Client names").small().weak());
-                ui.horizontal_wrapped(|ui| {
-                    for client in self.snapshot.clients.clone() {
-                        ui.push_id(("client", &client), |ui| {
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(&client);
-                                    if ui.small_button("Rename").clicked() {
-                                        self.dialog.client_rename =
-                                            Some((client.clone(), client.clone()));
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                editable,
+                                                egui::Button::new("Import folder…"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::ImportTemplate);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                editable && !self.dialog.selected.is_empty(),
+                                                egui::Button::new("Delete template"),
+                                            )
+                                            .on_hover_text("Delete the template and its folder.")
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::AskDeleteTemplate);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editable,
+                                            egui::TextEdit::singleline(&mut self.dialog.rename)
+                                                .hint_text("Rename to")
+                                                .desired_width(150.0),
+                                        );
+                                        if ui
+                                            .add_enabled(
+                                                editable && !self.dialog.selected.is_empty(),
+                                                egui::Button::new("Rename"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::RenameTemplate);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                editable && !self.dialog.selected.is_empty(),
+                                                egui::Button::new("Move up"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::MoveUp);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                editable && !self.dialog.selected.is_empty(),
+                                                egui::Button::new("Move down"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::MoveDown);
+                                        }
+                                    });
+                                });
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    ui.set_min_height(PANES);
+                                    ui.label(egui::RichText::new("Folders").small().weak());
+                                    let rows = self.selected_template_rows();
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("template_folders")
+                                        .max_height(PANES)
+                                        .min_scrolled_height(PANES)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            for (relative, depth, markers) in &rows {
+                                                ui.push_id(("template_folder", relative), |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_space(*depth as f32 * 12.0);
+                                                        let label =
+                                                            format!("{}/", file_label(relative));
+                                                        if ui
+                                                            .add_enabled(
+                                                                editable,
+                                                                egui::Button::selectable(
+                                                                    self.dialog.folder == *relative,
+                                                                    label,
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.dialog.folder = relative.clone();
+                                                            self.dialog.markers_sequences =
+                                                                markers.sequences;
+                                                            self.dialog.markers_shots =
+                                                                markers.shots;
+                                                        }
+                                                        let mut flags = Vec::new();
+                                                        if markers.sequences {
+                                                            flags.push("sequences");
+                                                        }
+                                                        if markers.shots {
+                                                            flags.push("shots");
+                                                        }
+                                                        if !flags.is_empty() {
+                                                            ui.label(
+                                                                egui::RichText::new(
+                                                                    flags.join(" + "),
+                                                                )
+                                                                .small()
+                                                                .weak(),
+                                                            );
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                            if rows.is_empty() {
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "No folders in this template.",
+                                                    )
+                                                    .small()
+                                                    .weak(),
+                                                );
+                                            }
+                                        });
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editable,
+                                            egui::TextEdit::singleline(
+                                                &mut self.dialog.folder_name,
+                                            )
+                                            .hint_text("New folder name")
+                                            .desired_width(150.0),
+                                        );
+                                        if ui
+                                            .add_enabled(editable, egui::Button::new("Add folder"))
+                                            .on_hover_text(
+                                                "Add inside the selected folder, or at the top.",
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::AddFolder);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editable,
+                                            egui::TextEdit::singleline(
+                                                &mut self.dialog.folder_rename,
+                                            )
+                                            .hint_text("Rename folder to")
+                                            .desired_width(150.0),
+                                        );
+                                        if ui
+                                            .add_enabled(
+                                                editable
+                                                    && !self.dialog.folder.as_os_str().is_empty(),
+                                                egui::Button::new("Rename folder"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::RenameFolder);
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        let mut markers_changed = false;
+                                        markers_changed |= ui
+                                            .add_enabled(
+                                                editable
+                                                    && !self.dialog.folder.as_os_str().is_empty(),
+                                                egui::Checkbox::new(
+                                                    &mut self.dialog.markers_sequences,
+                                                    "Sequence folders",
+                                                ),
+                                            )
+                                            .on_hover_text(
+                                                "sequences.txt: one folder per named sequence",
+                                            )
+                                            .changed();
+                                        markers_changed |= ui
+                                            .add_enabled(
+                                                editable
+                                                    && !self.dialog.folder.as_os_str().is_empty(),
+                                                egui::Checkbox::new(
+                                                    &mut self.dialog.markers_shots,
+                                                    "Shot folders",
+                                                ),
+                                            )
+                                            .on_hover_text("shots.txt: shots inside this folder")
+                                            .changed();
+                                        if markers_changed {
+                                            actions.push(DialogAction::SetMarkers);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                editable
+                                                    && !self.dialog.folder.as_os_str().is_empty(),
+                                                egui::Button::new("Delete folder"),
+                                            )
+                                            .on_hover_text("Delete this folder and its contents.")
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::AskDeleteFolder);
+                                        }
+                                    });
+                                    if let Some(confirm) = self.dialog.confirm.clone() {
+                                        ui.horizontal(|ui| {
+                                            let what = match &confirm {
+                                                Confirm::Template(_) => {
+                                                    "this template and its folder"
+                                                }
+                                                Confirm::Folder(_) => {
+                                                    "this template folder and its contents"
+                                                }
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(format!("Delete {what}?"))
+                                                    .small()
+                                                    .color(WARNING),
+                                            );
+                                            if ui
+                                                .add_enabled(
+                                                    editable,
+                                                    egui::Button::new("Delete").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::ConfirmDelete);
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    editable,
+                                                    egui::Button::new("Keep").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::CancelDelete);
+                                            }
+                                        });
                                     }
-                                    if ui.small_button("Remove").clicked() {
-                                        actions.push(DialogAction::RemoveClient(client.clone()));
+                                    if !blocked.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(blocked).small().color(WARNING),
+                                        );
                                     }
                                 });
                             });
-                        });
-                    }
-                    if self.snapshot.clients.is_empty() {
-                        ui.label(egui::RichText::new("No clients yet.").small().weak());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.dialog.client_entry)
-                            .hint_text("New client name")
-                            .desired_width(180.0),
-                    );
-                    if ui.button("Add client").clicked() {
-                        actions.push(DialogAction::AddClient);
-                    }
-                });
-                if let Some((from, to)) = self.dialog.client_rename.clone() {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("Rename {from} to")).small());
-                        let mut value = to.clone();
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut value).desired_width(160.0))
-                            .changed()
-                        {
-                            self.dialog.client_rename = Some((from.clone(), value.clone()));
-                        }
-                        if ui.small_button("Apply").clicked() {
-                            actions.push(DialogAction::RenameClient(from.clone(), value));
-                        }
-                        if ui.small_button("Cancel").clicked() {
-                            actions.push(DialogAction::CancelClientRename);
-                        }
-                    });
-                }
-                if let Some(feedback) = &self.dialog.feedback {
-                    notice(ui, feedback, false);
-                }
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Changes are written to disk immediately.")
-                            .small()
-                            .weak(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            actions.push(DialogAction::Close);
-                        }
-                    });
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Client names").small().weak());
+                                if ui
+                                    .add_enabled(editable, egui::Button::new("Import clients…"))
+                                    .on_hover_text("Merge a clients.json file into the library.")
+                                    .clicked()
+                                {
+                                    actions.push(DialogAction::ImportClients);
+                                }
+                            });
+                            egui::ScrollArea::vertical()
+                                .id_salt("manager_clients")
+                                .max_height(150.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for client in self.snapshot.clients.clone() {
+                                            ui.push_id(("client", &client), |ui| {
+                                                ui.group(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(&client);
+                                                        if ui
+                                                            .add_enabled(
+                                                                editable,
+                                                                egui::Button::new("Rename").small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.dialog.client_rename = Some((
+                                                                client.clone(),
+                                                                client.clone(),
+                                                            ));
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                editable,
+                                                                egui::Button::new("Remove").small(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            actions.push(
+                                                                DialogAction::RemoveClient(
+                                                                    client.clone(),
+                                                                ),
+                                                            );
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                        }
+                                        if self.snapshot.clients.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("No clients yet.")
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled(
+                                            editable,
+                                            egui::TextEdit::singleline(
+                                                &mut self.dialog.client_entry,
+                                            )
+                                            .hint_text("New client name")
+                                            .desired_width(180.0),
+                                        );
+                                        if ui
+                                            .add_enabled(editable, egui::Button::new("Add client"))
+                                            .clicked()
+                                        {
+                                            actions.push(DialogAction::AddClient);
+                                        }
+                                    });
+                                    if let Some((from, to)) = self.dialog.client_rename.clone() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("Rename {from} to"))
+                                                    .small(),
+                                            );
+                                            let mut value = to.clone();
+                                            if ui
+                                                .add_enabled(
+                                                    editable,
+                                                    egui::TextEdit::singleline(&mut value)
+                                                        .desired_width(160.0),
+                                                )
+                                                .changed()
+                                            {
+                                                self.dialog.client_rename =
+                                                    Some((from.clone(), value.clone()));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    editable,
+                                                    egui::Button::new("Apply").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::RenameClient(
+                                                    from.clone(),
+                                                    value,
+                                                ));
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    editable,
+                                                    egui::Button::new("Cancel").small(),
+                                                )
+                                                .clicked()
+                                            {
+                                                actions.push(DialogAction::CancelClientRename);
+                                            }
+                                        });
+                                    }
+                                });
+                        });
                 });
             });
 
@@ -3317,7 +4151,8 @@ impl StructureWorkspace {
     }
 
     fn apply_dialog_action(&mut self, action: DialogAction, jobs: &mut Jobs) {
-        if self.busy() {
+        if self.library_busy() {
+            self.dialog.error = Some(BUSY.to_string());
             return;
         }
         // Template contents are part of both plans, even when their ID is unchanged.
@@ -3325,32 +4160,15 @@ impl StructureWorkspace {
         if let Some(dialog) = self.new_project.as_mut() {
             dialog.session.clear();
         }
+        self.dialog.error = None;
         match action {
             DialogAction::Close => self.dialog.open = false,
             DialogAction::CreateTemplate => {
                 let name = self.dialog.new_name.clone();
-                match self.library.create(&name) {
-                    Ok(entries) => {
-                        self.snapshot.templates = entries;
-                        self.dialog.feedback = Some(format!("Created template {name}."));
-                        self.dialog.error = None;
-                        self.dialog.new_name.clear();
-                        self.dialog.selected = self
-                            .snapshot
-                            .templates
-                            .last()
-                            .map(|entry| entry.id.clone())
-                            .unwrap_or_default();
-                        self.loaded_template = None;
-                        self.dialog_loaded = None;
-                        self.refresh_library();
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(jobs, LibraryRequest::Create { name });
             }
-            DialogAction::ImportTemplate => {
-                self.begin_pick(jobs, PickTarget::TemplateImport, self.last_pick.clone())
-            }
+            DialogAction::ImportTemplate => self.begin_pick(jobs, PickTarget::TemplateFolder),
+            DialogAction::ImportClients => self.begin_pick(jobs, PickTarget::ClientsFile),
             DialogAction::AskDeleteTemplate => {
                 self.dialog.confirm = Some(Confirm::Template(self.dialog.selected.clone()));
             }
@@ -3359,102 +4177,42 @@ impl StructureWorkspace {
             }
             DialogAction::CancelDelete => self.dialog.confirm = None,
             DialogAction::ConfirmDelete => match self.dialog.confirm.take() {
-                Some(Confirm::Template(id)) => match self.library.delete(&id) {
-                    Ok(entries) => {
-                        self.snapshot.templates = entries;
-                        self.dialog.selected.clear();
-                        self.dialog.folder = PathBuf::new();
-                        self.dialog.feedback = Some("Template deleted.".to_string());
-                        self.dialog.error = None;
-                        self.loaded_template = None;
-                        self.dialog_template = None;
-                        self.dialog_loaded = Some(String::new());
-                        self.refresh_library();
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                },
+                Some(Confirm::Template(id)) => {
+                    self.dialog.selected.clear();
+                    self.dialog.folder = PathBuf::new();
+                    self.request_library(jobs, LibraryRequest::Delete { id });
+                }
                 Some(Confirm::Folder(relative)) => {
                     let id = self.dialog.selected.clone();
-                    match self.library.remove_folder(&id, &relative) {
-                        Ok(()) => {
-                            self.dialog.folder = PathBuf::new();
-                            self.dialog.feedback = Some(format!("Removed {}.", relative.display()));
-                            self.dialog.error = None;
-                            self.loaded_template = None;
-                            self.dialog_loaded = None;
-                            self.ensure_template();
-                        }
-                        Err(error) => self.dialog.error = Some(describe(&error)),
-                    }
+                    self.request_library(jobs, LibraryRequest::RemoveFolder { id, relative });
                 }
                 None => {}
             },
             DialogAction::RenameTemplate => {
                 let id = self.dialog.selected.clone();
                 let name = self.dialog.rename.clone();
-                match self.library.rename(&id, &name) {
-                    Ok(entries) => {
-                        self.snapshot.templates = entries;
-                        self.dialog.feedback = Some("Template renamed.".to_string());
-                        self.dialog.error = None;
-                        self.dialog.rename.clear();
-                        self.loaded_template = None;
-                        self.dialog_loaded = None;
-                        self.refresh_library();
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(jobs, LibraryRequest::Rename { id, name });
             }
             DialogAction::MoveUp | DialogAction::MoveDown => {
-                let id = self.dialog.selected.clone();
                 let delta = if matches!(action, DialogAction::MoveUp) {
                     -1
                 } else {
                     1
                 };
-                match self.library.reorder(&id, delta) {
-                    Ok(entries) => {
-                        self.snapshot.templates = entries;
-                        self.dialog.error = None;
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                let id = self.dialog.selected.clone();
+                self.request_library(jobs, LibraryRequest::Reorder { id, delta });
             }
             DialogAction::AddFolder => {
                 let id = self.dialog.selected.clone();
                 let parent = self.dialog.folder.clone();
                 let name = self.dialog.folder_name.clone();
-                match self.library.add_folder(&id, &parent, &name) {
-                    Ok(()) => {
-                        self.dialog.feedback = Some(format!("Added folder {name}."));
-                        self.dialog.error = None;
-                        self.dialog.folder_name.clear();
-                        self.loaded_template = None;
-                        self.dialog_loaded = None;
-                        self.ensure_template();
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(jobs, LibraryRequest::AddFolder { id, parent, name });
             }
             DialogAction::RenameFolder => {
                 let id = self.dialog.selected.clone();
                 let relative = self.dialog.folder.clone();
                 let name = self.dialog.folder_rename.clone();
-                match self.library.rename_folder(&id, &relative, &name) {
-                    Ok(()) => {
-                        self.dialog.feedback = Some("Folder renamed.".to_string());
-                        self.dialog.error = None;
-                        self.dialog.folder = match relative.parent() {
-                            Some(parent) if !parent.as_os_str().is_empty() => parent.join(&name),
-                            _ => PathBuf::from(&name),
-                        };
-                        self.dialog.folder_rename.clear();
-                        self.loaded_template = None;
-                        self.dialog_loaded = None;
-                        self.ensure_template();
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(jobs, LibraryRequest::RenameFolder { id, relative, name });
             }
             DialogAction::SetMarkers => {
                 let id = self.dialog.selected.clone();
@@ -3463,31 +4221,23 @@ impl StructureWorkspace {
                     sequences: self.dialog.markers_sequences,
                     shots: self.dialog.markers_shots,
                 };
-                match self.library.set_markers(&id, &relative, markers) {
-                    Ok(()) => {
-                        self.dialog.feedback = Some("Marker files updated.".to_string());
-                        self.dialog.error = None;
-                        self.loaded_template = None;
-                        self.dialog_loaded = None;
-                        self.ensure_template();
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(
+                    jobs,
+                    LibraryRequest::SetMarkers {
+                        id,
+                        relative,
+                        markers,
+                    },
+                );
             }
             DialogAction::AddClient => {
                 let mut clients = self.snapshot.clients.clone();
                 match structure::add_client(&mut clients, &self.dialog.client_entry) {
-                    Ok(true) => match self.library.save_clients(&clients) {
-                        Ok(clients) => {
-                            self.snapshot.clients = clients;
-                            self.dialog.feedback = Some("Client added.".to_string());
-                            self.dialog.error = None;
-                            self.dialog.client_entry.clear();
-                        }
-                        Err(error) => self.dialog.error = Some(describe(&error)),
-                    },
+                    Ok(true) => {
+                        self.request_library(jobs, LibraryRequest::SaveClients { clients });
+                    }
                     Ok(false) => {
-                        self.dialog.feedback = Some("That client is already listed.".to_string())
+                        self.dialog.feedback = Some("That client is already listed.".to_string());
                     }
                     Err(error) => self.dialog.error = Some(describe(&error)),
                 }
@@ -3500,14 +4250,7 @@ impl StructureWorkspace {
                     .filter(|client| **client != name)
                     .cloned()
                     .collect();
-                match self.library.save_clients(&clients) {
-                    Ok(clients) => {
-                        self.snapshot.clients = clients;
-                        self.dialog.feedback = Some("Client removed.".to_string());
-                        self.dialog.error = None;
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(jobs, LibraryRequest::SaveClients { clients });
             }
             DialogAction::RenameClient(from, to) => {
                 let renamed = match structure::normalize_client(&to) {
@@ -3529,15 +4272,7 @@ impl StructureWorkspace {
                         }
                     })
                     .collect();
-                match self.library.save_clients(&clients) {
-                    Ok(clients) => {
-                        self.snapshot.clients = clients;
-                        self.dialog.client_rename = None;
-                        self.dialog.feedback = Some("Client renamed.".to_string());
-                        self.dialog.error = None;
-                    }
-                    Err(error) => self.dialog.error = Some(describe(&error)),
-                }
+                self.request_library(jobs, LibraryRequest::SaveClients { clients });
             }
             DialogAction::CancelClientRename => self.dialog.client_rename = None,
         }
