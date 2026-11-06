@@ -260,12 +260,11 @@ pub fn walk(
         request.purpose,
         ScanPurpose::Projects | ScanPurpose::ExtensionCopy
     ) {
-        let counted = walk_pass(request, control, events, None, 0)?;
-        if counted.coverage != Coverage::Complete {
-            return Ok(counted);
+        let counted = count_files(request, control, events, 0)?;
+        if counted.snapshot.coverage != Coverage::Complete {
+            return Ok(counted.snapshot);
         }
-        let total = counted.entries.len() as u64;
-        drop(counted);
+        let total = counted.total;
         events.progress(
             JobPhase::Scanning,
             JobProgress {
@@ -274,9 +273,220 @@ pub fn walk(
                 ..JobProgress::default()
             },
         );
-        return walk_pass(request, control, events, Some(total), 0);
+        let mut processed = walk_pass(request, control, events, Some(total), 0)?;
+        if counted
+            .snapshot
+            .root_identity
+            .as_ref()
+            .zip(processed.root_identity.as_ref())
+            .and_then(|(before, after)| before.compare_identity(after))
+            != Some(true)
+        {
+            if processed.coverage == Coverage::Complete {
+                processed.coverage = Coverage::Partial;
+            }
+            report_issue(
+                &mut processed.errors,
+                events,
+                &request.root,
+                PathCategory::Unavailable,
+                "The scan root changed between counting and processing.".into(),
+            );
+        }
+        return Ok(processed);
     }
     walk_pass(request, control, events, None, 0)
+}
+
+pub(crate) struct FileCount {
+    pub total: u64,
+    /// Coverage/root evidence only; no fabricated file stamps during counting.
+    pub snapshot: ScanSnapshot,
+}
+
+pub(crate) fn count_files(
+    request: &ScanRequest,
+    control: &JobControl,
+    events: &JobEvents,
+    offset: u64,
+) -> PathResult<FileCount> {
+    if !request.root.is_absolute() {
+        return Err(PathError::new(
+            PathCategory::InvalidInput,
+            Some(&request.root),
+            "scan root must be an absolute path",
+        ));
+    }
+    let mut snapshot = ScanSnapshot {
+        root: request.root.clone(),
+        purpose: request.purpose,
+        entries: Vec::new(),
+        coverage: Coverage::Complete,
+        continuity: RootContinuity::Uncertain,
+        errors: Vec::new(),
+        root_identity: None,
+    };
+    match inspect_root(&request.root) {
+        Ok(identity) => snapshot.root_identity = Some(identity),
+        Err(error) => {
+            report_issue(
+                &mut snapshot.errors,
+                events,
+                &request.root,
+                error.category(),
+                error.message().into(),
+            );
+            snapshot.coverage = Coverage::RootUnavailable;
+            return Ok(FileCount { total: 0, snapshot });
+        }
+    }
+    let excludes = build_excludes(&request.filters, events)?;
+    let mut total = 0;
+    let mut stack = vec![PendingDir {
+        absolute: request.root.clone(),
+        relative: PathBuf::new(),
+    }];
+    let mut visited = HashSet::new();
+    'count: while let Some(pending) = stack.pop() {
+        if control.checkpoint() == Checkpoint::Cancelled {
+            snapshot.coverage = Coverage::Cancelled;
+            break;
+        }
+        let directory = &pending.absolute;
+        match inspect_root(directory) {
+            Ok(identity) if visited.insert(identity) => {}
+            result => {
+                let message = result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "Repeated directory identity was skipped.".into());
+                report_issue(
+                    &mut snapshot.errors,
+                    events,
+                    directory,
+                    PathCategory::Unavailable,
+                    message,
+                );
+                snapshot.coverage = Coverage::Partial;
+                continue;
+            }
+        }
+        events.progress(
+            JobPhase::Counting,
+            JobProgress {
+                completed: offset + total,
+                current: Some(directory.clone()),
+                ..JobProgress::default()
+            },
+        );
+        let entries = match read_sorted(directory, control) {
+            Listing::Entries(entries) => entries,
+            Listing::Cancelled => {
+                snapshot.coverage = Coverage::Cancelled;
+                break;
+            }
+            Listing::Failed(category, message) => {
+                report_issue(&mut snapshot.errors, events, directory, category, message);
+                snapshot.coverage = Coverage::Partial;
+                continue;
+            }
+        };
+        for (index, entry) in entries.into_iter().enumerate() {
+            if index % CHECKPOINT_EVERY == 0 && control.checkpoint() == Checkpoint::Cancelled {
+                snapshot.coverage = Coverage::Cancelled;
+                break 'count;
+            }
+            let relative = pending.relative.join(entry.file_name());
+            if is_excluded(&relative, &excludes)
+                || (request.purpose == ScanPurpose::Projects && is_project_autosave(&relative))
+            {
+                continue;
+            }
+            // POSIX dirent kinds avoid a metadata call for every ordinary file
+            // in the count pass. Windows uses the existing reparse-point checks.
+            let kind = entry.file_type();
+            let ordinary = !cfg!(windows);
+            let shape = match kind {
+                Ok(kind) if ordinary && kind.is_dir() => {
+                    if request.recursive {
+                        stack.push(PendingDir {
+                            absolute: entry.path(),
+                            relative,
+                        });
+                    }
+                    continue;
+                }
+                Ok(kind) if ordinary && kind.is_file() => None,
+                Ok(_) => Some(entry_shape(&entry)),
+                Err(error) => Some(EntryShape::Unreadable(error)),
+            };
+            match shape {
+                None | Some(EntryShape::File(_) | EntryShape::FileLink(_)) => {
+                    if request.filters.matches_name(&entry.file_name()) {
+                        total += 1;
+                        events.progress(
+                            JobPhase::Counting,
+                            JobProgress {
+                                completed: offset + total,
+                                current: Some(entry.path()),
+                                ..JobProgress::default()
+                            },
+                        );
+                    }
+                }
+                Some(EntryShape::Directory) => {
+                    if request.recursive {
+                        stack.push(PendingDir {
+                            absolute: entry.path(),
+                            relative,
+                        });
+                    }
+                }
+                Some(shape) => {
+                    let (category, message) = match shape {
+                        EntryShape::Unreadable(error) => (
+                            io_category(&error),
+                            format!("Could not inspect entry while counting: {error}"),
+                        ),
+                        EntryShape::DirectoryLink => (
+                            PathCategory::Unsupported,
+                            "Directory link was not followed while counting.".into(),
+                        ),
+                        _ => (
+                            PathCategory::Unsupported,
+                            "Special file is not a regular file; not included.".into(),
+                        ),
+                    };
+                    report_issue(
+                        &mut snapshot.errors,
+                        events,
+                        &entry.path(),
+                        category,
+                        message,
+                    );
+                    snapshot.coverage = Coverage::Partial;
+                }
+            }
+        }
+    }
+    if snapshot.coverage != Coverage::Cancelled
+        && inspect_root(&request.root).ok().and_then(|after| {
+            snapshot
+                .root_identity
+                .as_ref()
+                .and_then(|before| before.compare_identity(&after))
+        }) != Some(true)
+    {
+        snapshot.coverage = Coverage::Partial;
+        report_issue(
+            &mut snapshot.errors,
+            events,
+            &request.root,
+            PathCategory::Unavailable,
+            "The root changed or became unavailable while counting.".into(),
+        );
+    }
+    Ok(FileCount { total, snapshot })
 }
 
 pub(crate) fn walk_pass(

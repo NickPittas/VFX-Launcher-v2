@@ -169,17 +169,16 @@ pub fn walk_project(
     for target in &targets {
         let mut target_request = request.clone();
         target_request.root = target.clone();
-        let counted = discovery::walk_pass(&target_request, control, events, None, total_files)?;
-        total_files += counted.entries.len() as u64;
-        let coverage = counted.coverage;
-        result.errors.extend(counted.errors);
+        let counted = discovery::count_files(&target_request, control, events, total_files)?;
+        total_files += counted.total;
+        let coverage = counted.snapshot.coverage;
+        result.errors.extend(counted.snapshot.errors);
         if coverage != Coverage::Complete {
             result.coverage = if coverage == Coverage::Cancelled {
                 Coverage::Cancelled
             } else {
                 Coverage::Partial
             };
-            result.entries.extend(counted.entries);
             // Do not turn an incomplete counting pass into a complete processing pass.
             return Ok(result);
         }

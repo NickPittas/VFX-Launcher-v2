@@ -101,6 +101,7 @@ impl JobProgress {
     /// Completed fraction for a determinate total, `0.0` when the total is unknown.
     pub fn fraction(&self) -> f32 {
         match self.total {
+            Some(0) => 1.0,
             Some(total) if total > 0 => (self.completed as f32 / total as f32).clamp(0.0, 1.0),
             _ => 0.0,
         }
