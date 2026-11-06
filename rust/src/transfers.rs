@@ -1531,7 +1531,7 @@ impl<'a> Validator<'a> {
                             expectation: DestinationExpectation::Directory {
                                 identity: identity_of(&meta),
                             },
-                            effect: ItemEffect::CreateDirectory,
+                            effect: ItemEffect::Skip,
                             displaced: None,
                             existing_identity: identity_of(&meta),
                             displaced_identity: None,
