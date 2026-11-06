@@ -86,10 +86,8 @@ const CHECKPOINT_EVERY: usize = 128;
 /// Pause acknowledged every this many entries while listing child directories.
 const CHILD_CHECKPOINT_EVERY: usize = 64;
 
-// `DirEntryExt::file_attributes` on directory entries and `MetadataExt::file_attributes`
-// in the unknown-readdir-type fallback.
 #[cfg(windows)]
-use std::os::windows::fs::{DirEntryExt, MetadataExt};
+use std::os::windows::fs::MetadataExt;
 
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -832,8 +830,12 @@ fn entry_shape(entry: &std::fs::DirEntry) -> EntryShape {
     }
     if file_type.is_dir() {
         #[cfg(windows)]
-        if entry.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return EntryShape::DirectoryLink;
+        match entry.metadata() {
+            Ok(meta) if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+                return EntryShape::DirectoryLink;
+            }
+            Ok(_) => {}
+            Err(error) => return EntryShape::Unreadable(error),
         }
         return EntryShape::Directory;
     }
@@ -961,7 +963,7 @@ fn stamp_from(path: &Path, meta: &fs::Metadata) -> (FileStamp, Option<(PathCateg
         FileStamp {
             size: stamp_meta.len(),
             modified,
-            identity: FileIdentity::from_metadata(&stamp_meta),
+            identity: FileIdentity::from_path(path, &stamp_meta),
         },
         issue,
     )

@@ -3,6 +3,8 @@
 The merged Rust/egui application is now version **0.2.0**, packaged for Linux
 x86_64 as an AppImage. See [Linux installation and build instructions](docs/LINUX-APPIMAGE.md)
 and [0.2.0 release notes](docs/RELEASE-0.2.0.md).
+There is also a [Windows x64 portable preview](docs/WINDOWS-PREVIEW.md), with file
+operation execution still limited to Linux.
 
 The Python Windows application remains available. The sections below describe
 that legacy application.

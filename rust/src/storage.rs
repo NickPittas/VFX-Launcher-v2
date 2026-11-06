@@ -1776,6 +1776,7 @@ impl TargetLocation {
 /// best-effort refusal: a bind-mounted remote directory inside a local mount is
 /// not distinguishable from a local one, so a positive local result is not a
 /// certificate either.
+#[cfg(target_os = "linux")]
 const NETWORK_FILE_SYSTEMS: &[&str] = &[
     "9p",
     "afs",

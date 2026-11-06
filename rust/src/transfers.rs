@@ -303,29 +303,8 @@ impl NativeIdentity {
     }
 }
 
-#[cfg(unix)]
-fn identity_of(meta: &fs::Metadata) -> Option<NativeIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    Some(NativeIdentity {
-        unix: Some((meta.dev(), meta.ino())),
-        windows: None,
-    })
-}
-
-#[cfg(windows)]
-fn identity_of(meta: &fs::Metadata) -> Option<NativeIdentity> {
-    use std::os::windows::fs::MetadataExt;
-    meta.volume_serial_number()
-        .zip(meta.file_index())
-        .map(|(volume, index)| NativeIdentity {
-            unix: None,
-            windows: Some((u64::from(volume), index)),
-        })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn identity_of(_meta: &fs::Metadata) -> Option<NativeIdentity> {
-    None
+fn identity_of(meta: &fs::Metadata, path: &Path) -> Option<NativeIdentity> {
+    paths::FileIdentity::from_path(path, meta).map(native_identity)
 }
 
 /// Expected source metadata recorded at review time. `modified_ns` is `None`
@@ -809,7 +788,7 @@ fn plan_relative_copy(
             RootContinuity::Proven => EvidenceContinuity::Proven,
             RootContinuity::Uncertain => EvidenceContinuity::Uncertain,
         },
-        root_identity: identity_of(&root_metadata),
+        root_identity: identity_of(&root_metadata, &snapshot.root),
         root_modified_ns,
         issues: snapshot.errors.iter().map(issue_summary).collect(),
     };
@@ -908,7 +887,7 @@ fn stamp_from_metadata(meta: &fs::Metadata, path: &Path) -> Result<SourceStamp, 
     Ok(SourceStamp {
         size: meta.len(),
         modified_ns: Some(modified_ns),
-        identity: identity_of(meta),
+        identity: identity_of(meta, path),
     })
 }
 
@@ -1124,7 +1103,7 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
     // a later pass cannot tell the reviewed root from a different directory at the
     // same spelling, so the plan is refused here instead of being journaled blind.
     let root_identity = match fs::metadata(destination_root) {
-        Ok(meta) => identity_of(&meta),
+        Ok(meta) => identity_of(&meta, destination_root),
         Err(error) => {
             return refused_report(
                 plan,
@@ -1224,7 +1203,7 @@ pub fn validate_plan(plan: &OperationPlan) -> ValidationReport {
         if let (Some(recorded), Some(source_root)) = (evidence.root_identity, &plan.source_root) {
             let fresh = fs::metadata(source_root.path())
                 .ok()
-                .and_then(|meta| identity_of(&meta));
+                .and_then(|meta| identity_of(&meta, source_root.path()));
             match fresh {
                 Some(fresh) => match recorded.same(&fresh) {
                     Some(true) => {}
@@ -1513,11 +1492,10 @@ impl<'a> Validator<'a> {
             ),
             Some(meta) if meta.is_dir() => {
                 if self.plan.add_to_existing {
-                    if let Err(reason) = self.record_ancestor(
-                        destination_key.clone(),
-                        &destination,
-                        identity_of(&meta),
-                    ) {
+                    let identity = identity_of(&meta, &destination);
+                    if let Err(reason) =
+                        self.record_ancestor(destination_key.clone(), &destination, identity)
+                    {
                         return self.blocked(index, action, reason);
                     }
                     self.ready(
@@ -1528,12 +1506,10 @@ impl<'a> Validator<'a> {
                             key: destination_key,
                             // Identity only: creating children changes a directory's
                             // modification time, so that time is never the evidence.
-                            expectation: DestinationExpectation::Directory {
-                                identity: identity_of(&meta),
-                            },
+                            expectation: DestinationExpectation::Directory { identity },
                             effect: ItemEffect::Skip,
                             displaced: None,
-                            existing_identity: identity_of(&meta),
+                            existing_identity: identity,
                             displaced_identity: None,
                         },
                         None,
@@ -1816,7 +1792,7 @@ impl<'a> Validator<'a> {
         if !meta.is_file() {
             return Err("destination exists and is not a regular file".into());
         }
-        let existing_identity = identity_of(&meta);
+        let existing_identity = identity_of(&meta, &destination);
         let stamp = stamp_from_metadata(&meta, &destination)
             .map_err(|error| error.message().to_string())?;
         match self.plan.policy {
@@ -1866,7 +1842,7 @@ impl<'a> Validator<'a> {
                                 .into(),
                         );
                     }
-                    Ok(meta) => identity_of(&meta),
+                    Ok(meta) => identity_of(&meta, &displaced),
                     Err(error) if error.kind() == ErrorKind::NotFound => None,
                     Err(error) => {
                         return Err(format!(
@@ -1976,7 +1952,7 @@ impl<'a> Validator<'a> {
             }
             match fs::symlink_metadata(&parent) {
                 Ok(meta) if meta.is_dir() => {
-                    self.record_ancestor(key, &parent, identity_of(&meta))?;
+                    self.record_ancestor(key, &parent, identity_of(&meta, &parent))?;
                     continue;
                 }
                 Ok(meta) if meta.file_type().is_symlink() => {

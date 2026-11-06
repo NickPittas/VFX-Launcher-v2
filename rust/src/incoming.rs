@@ -1242,7 +1242,7 @@ pub fn plan_incoming(request: IncomingPlanRequest<'_>) -> Result<OperationPlan, 
         // The stat just taken for the root, through the same platform rules the
         // extension-copy plan uses: execution re-proves this identity before the
         // first item runs.
-        root_identity: root_identity(&root_metadata),
+        root_identity: root_identity(&root_metadata, &snapshot.root),
         root_modified_ns,
         issues: snapshot.errors.iter().map(issue_summary).collect(),
     };
@@ -1266,8 +1266,8 @@ pub fn plan_incoming(request: IncomingPlanRequest<'_>) -> Result<OperationPlan, 
 
 /// Observable identity of one stat snapshot, through the transfer module's
 /// platform rules.
-fn root_identity(metadata: &fs::Metadata) -> Option<NativeIdentity> {
-    paths::FileIdentity::from_metadata(metadata).map(transfers::native_identity_of)
+fn root_identity(metadata: &fs::Metadata, path: &Path) -> Option<NativeIdentity> {
+    paths::FileIdentity::from_path(path, metadata).map(transfers::native_identity_of)
 }
 
 fn expected_stamp(path: &Path, stamp: &FileStamp) -> Result<SourceStamp, TransferError> {

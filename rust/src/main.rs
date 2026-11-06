@@ -9,6 +9,8 @@
 //!
 //! Command packets (`backup --job ...`) attach here when they land.
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;

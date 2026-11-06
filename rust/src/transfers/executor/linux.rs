@@ -42,7 +42,7 @@ use super::super::{
     DestinationEvidence, DestinationExpectation, ItemCheckpoint, ItemEffect, ItemState,
     ItemValidation, JournaledPlan, NativeIdentity, PlannedAction, RunSummary, RunTerminal,
     SourceStamp, StoredPath, TransferCategory, TransferError, ValidatedPlan,
-    append_item_checkpoint, finalize_run, identity_of, mark_run_running, nanos_from_time,
+    append_item_checkpoint, finalize_run, mark_run_running, nanos_from_time,
     persist_validated_intent, update_item_outcome,
 };
 use crate::jobs::{Checkpoint, JobControl, JobEvents, JobPhase, JobProgress};
@@ -2037,7 +2037,10 @@ fn verify_stamp(meta: &fs::Metadata, reviewed: &SourceStamp, path: &Path) -> Res
             ));
         }
     }
-    match (reviewed.identity, identity_of(meta)) {
+    match (
+        reviewed.identity,
+        crate::paths::FileIdentity::from_metadata(meta).map(super::super::native_identity_of),
+    ) {
         (Some(before), Some(now)) => match before.same(&now) {
             Some(true) => Ok(()),
             Some(false) => Err(format!(

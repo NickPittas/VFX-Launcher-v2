@@ -185,8 +185,11 @@ pub fn capture(
     }
     transaction.commit().map_err(|error| error.to_string())?;
     let after = fs::metadata(&sources.database).map_err(|error| error.to_string())?;
-    if crate::paths::FileIdentity::from_metadata(&before)
-        .zip(crate::paths::FileIdentity::from_metadata(&after))
+    if crate::paths::FileIdentity::from_file(&held)
+        .zip(crate::paths::FileIdentity::from_path(
+            &sources.database,
+            &after,
+        ))
         .is_some_and(|(before, after)| !before.same_file(&after))
     {
         return Err(
@@ -233,8 +236,8 @@ fn capture_sidecar(path: &Path) -> Result<CapturedSidecar, String> {
     if bytes.len() > 16 * 1024 * 1024
         || before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
-        || crate::paths::FileIdentity::from_metadata(&before)
-            .zip(crate::paths::FileIdentity::from_metadata(&named))
+        || crate::paths::FileIdentity::from_file(&file)
+            .zip(crate::paths::FileIdentity::from_path(path, &named))
             .is_some_and(|(before, named)| !before.same_file(&named))
     {
         return Err(format!(

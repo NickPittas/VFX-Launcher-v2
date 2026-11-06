@@ -1,6 +1,7 @@
 # VFX Launcher 0.2.0
 
-Linux x86_64 AppImage of the Rust/egui merged workspace:
+Linux x86_64 AppImage of the Rust/egui merged workspace, plus a Windows x64
+portable preview:
 
 - Projects catalog, version selection, user settings and legacy import.
 - Project templates, clients, named shots/sequences and Nuke script generation.
@@ -14,6 +15,14 @@ runtime verification. See `docs/migration/IMPLEMENTATION-STATUS.md` and the nati
 evidence documents for remaining work. External Nuke/viewer integrations and
 advanced regex compatibility remain incomplete. The transfer executor is Linux
 only. Schedules run while the desktop application is open.
+
+The Windows preview provides project browsing/scanning, settings and configured
+application launching. File creation, copy/move and backup execution remain
+unavailable on Windows and refuse without performing a transfer. This limitation
+is shown in the application and in `README-Windows.md` inside the zip. It is not
+Windows feature parity. The Windows asset's exact source commit is recorded in
+its `BUILD-INFO.txt`; the existing Linux asset remains the verified AppImage from
+the `v0.2.0` tag.
 
 The AppImage bundles GTK3 and its supporting libraries. GPU drivers, the desktop
 session, Nuke and the optional Pi harness remain host applications. Existing

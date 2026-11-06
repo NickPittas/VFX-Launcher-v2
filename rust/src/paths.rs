@@ -59,9 +59,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-// Trait methods used on Windows metadata (`file_attributes`,
-// `volume_serial_number`, `file_index`). Unix metadata extension traits are
-// imported inside the functions that need them.
+// Windows file attributes are stable; identity comes from an open OS handle.
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 
@@ -323,8 +321,8 @@ pub fn relation(a: &PathKey, b: &PathKey) -> PathRelation {
 pub fn evidence_same_file(a: &Path, b: &Path) -> Option<bool> {
     let a_meta = fs::metadata(a).ok()?;
     let b_meta = fs::metadata(b).ok()?;
-    let a_identity = FileIdentity::from_metadata(&a_meta)?;
-    let b_identity = FileIdentity::from_metadata(&b_meta)?;
+    let a_identity = FileIdentity::from_path(a, &a_meta)?;
+    let b_identity = FileIdentity::from_path(b, &b_meta)?;
     a_identity.compare_file(&b_identity)
 }
 
@@ -383,7 +381,13 @@ pub fn inspect_root(path: &Path) -> PathResult<RootIdentity> {
             "root is not a directory",
         ));
     }
-    Ok(RootIdentity::from_metadata(&meta))
+    #[cfg(unix)]
+    return Ok(RootIdentity::from_metadata(&meta));
+    #[cfg(windows)]
+    Ok(RootIdentity {
+        unix: None,
+        windows: FileIdentity::from_path(path, &meta).and_then(|identity| identity.windows),
+    })
 }
 
 /// The UTF-8 spelling of a path for portable JSON export, or `None` when the
@@ -775,17 +779,6 @@ impl RootIdentity {
         }
     }
 
-    #[cfg(windows)]
-    fn from_metadata(meta: &fs::Metadata) -> Self {
-        Self {
-            unix: None,
-            windows: meta
-                .volume_serial_number()
-                .zip(meta.file_index())
-                .map(|(volume, index)| (u64::from(volume), index)),
-        }
-    }
-
     /// True only with positive matching evidence: at least one evidence kind
     /// must be present on both sides, and every shared kind must agree.
     pub fn same_identity(&self, other: &RootIdentity) -> bool {
@@ -810,18 +803,63 @@ impl FileIdentity {
         })
     }
 
-    /// Windows identity is only present when the metadata actually carries
-    /// `volume_serial_number` + `file_index`. `DirEntry::metadata` does not
-    /// populate those fields, so callers that need identity must stat the entry
-    /// path; an identity-free snapshot is `None`, never `Some` with no evidence.
+    /// Obtains identity without depending on Rust's nightly-only Windows metadata APIs.
+    /// A changed observation or an unavailable handle yields no identity evidence.
     #[cfg(windows)]
-    pub(crate) fn from_metadata(meta: &fs::Metadata) -> Option<Self> {
-        meta.volume_serial_number()
-            .zip(meta.file_index())
-            .map(|(volume, index)| Self {
-                unix: None,
-                windows: Some((u64::from(volume), index)),
-            })
+    pub(crate) fn from_path(path: &Path, meta: &fs::Metadata) -> Option<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        let file = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .ok()?;
+        let fresh = file.metadata().ok()?;
+        if meta.file_attributes() != fresh.file_attributes()
+            || meta.len() != fresh.len()
+            || meta.last_write_time() != fresh.last_write_time()
+            || meta.creation_time() != fresh.creation_time()
+        {
+            return None;
+        }
+        Self::from_file(&file)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn from_path(_path: &Path, meta: &fs::Metadata) -> Option<Self> {
+        Self::from_metadata(meta)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn from_file(file: &fs::File) -> Option<Self> {
+        Self::from_metadata(&file.metadata().ok()?)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_file(file: &fs::File) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // SAFETY: the borrowed file keeps the handle live; the output points to valid storage.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return None;
+        }
+        // SAFETY: a successful call initialized the complete output structure.
+        let info = unsafe { info.assume_init() };
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        if index == 0 {
+            return None;
+        }
+        Some(Self {
+            unix: None,
+            windows: Some((u64::from(info.dwVolumeSerialNumber), index)),
+        })
     }
 
     /// Same contract as [`RootIdentity::same_identity`]: definite agreement on
