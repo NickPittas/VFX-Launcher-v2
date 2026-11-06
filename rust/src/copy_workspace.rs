@@ -121,6 +121,7 @@ struct RowState {
 /// One matching file list produced by a completed scan, bound to the exact
 /// source and suffix set it was found with.
 struct ScanResult {
+    summary: Option<String>,
     backup: Option<crate::backup::BackupJob>,
     snapshot: ScanSnapshot,
     source: String,
@@ -136,7 +137,7 @@ struct PickRun {
 struct ScanRun {
     backup: Option<crate::backup::BackupJob>,
     job: JobId,
-    replies: Receiver<Result<ScanSnapshot, String>>,
+    replies: Receiver<Result<(ScanSnapshot, Option<String>), String>>,
     source: String,
     extensions: Vec<String>,
 }
@@ -414,7 +415,7 @@ impl CopyByFileTypeState {
         self.row_states.clear();
         self.report = None;
         match result {
-            Ok(snapshot) => {
+            Ok((snapshot, summary)) => {
                 self.scan_generation += 1;
                 self.rows = table_rows(&snapshot);
                 self.selected = snapshot
@@ -424,8 +425,9 @@ impl CopyByFileTypeState {
                     .collect();
                 self.selection_generation += 1;
                 self.scan_error = None;
-                self.message = None;
+                self.message = summary.clone();
                 self.scanned = Some(ScanResult {
+                    summary,
                     snapshot,
                     source: run.source,
                     extensions: run.extensions,
@@ -903,14 +905,21 @@ impl CopyByFileTypeState {
                             scan.up_to_date.len()
                         ),
                     );
-                    scan.snapshot
+                    let summary = format!(
+                        "{} project files compared · {} up to date · {} need copying",
+                        scan.compared,
+                        scan.up_to_date.len(),
+                        scan.snapshot.entries.len()
+                    );
+                    (scan.snapshot, Some(summary))
                 })
             } else {
                 discovery::walk(&request, &control, &events)
+                    .map(|snapshot| (snapshot, None))
                     .map_err(|error| error.message().to_string())
             };
             let (payload, outcome, progress) = match result {
-                Ok(snapshot) => {
+                Ok((snapshot, summary)) => {
                     let outcome = match snapshot.coverage {
                         Coverage::Complete => JobOutcome::Succeeded,
                         Coverage::Partial => JobOutcome::Partial,
@@ -924,7 +933,7 @@ impl CopyByFileTypeState {
                         bytes_total: None,
                         current: None,
                     };
-                    (Ok(snapshot), outcome, progress)
+                    (Ok((snapshot, summary)), outcome, progress)
                 }
                 Err(error) => {
                     let message = error.to_string();
@@ -1296,6 +1305,9 @@ impl CopyByFileTypeState {
         let Some(scanned) = &self.scanned else {
             return "Not scanned".to_string();
         };
+        if let Some(summary) = &scanned.summary {
+            return summary.clone();
+        }
         let mut text = format!(
             "{} matching file(s) · {} selected",
             self.rows.len(),
@@ -1407,7 +1419,9 @@ impl CopyByFileTypeState {
                 if self.rows.is_empty() {
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new(if self.scanned.is_some() {
+                        egui::RichText::new(if self.backup.is_some() && self.scanned.as_ref().is_some_and(|scan| scan.snapshot.coverage == Coverage::Complete) {
+                            "No backup copies are needed. Matching project files are up to date."
+                        } else if self.scanned.is_some() {
                             "No files of the selected types were found."
                         } else {
                             "Scan the source folder to list the matching files."
