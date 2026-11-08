@@ -2,6 +2,17 @@
 
 A native Rust/egui desktop for VFX projects: browse and launch Nuke and After Effects files, create shot structures, organize incoming media, copy selected file types, and back up projects with reviewed file-operation plans.
 
+<!-- moeffect-demo:start -->
+## Demo
+
+Watch the landscape demonstration below.
+
+https://github.com/user-attachments/assets/049eecc3-b8ff-4672-89fc-7e0351a19a99
+
+[Watch on the website and read more about the tool](https://moeffect.gr/index.php/tools/vfx-launcher/).
+
+<!-- moeffect-demo:end -->
+
 ## Downloads
 
 | Platform | Published version | Download | Installation |
