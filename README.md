@@ -17,14 +17,14 @@ https://github.com/user-attachments/assets/049eecc3-b8ff-4672-89fc-7e0351a19a99
 
 | Platform | Published version | Download | Installation |
 | --- | --- | --- | --- |
-| Linux x86_64 | **0.3.4** | [AppImage](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-x86_64.AppImage) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-x86_64.AppImage.sha256) | [Linux guide](docs/LINUX-APPIMAGE.md) |
-| Windows 10/11 x64 | **0.3.4** | [Portable ZIP](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-Windows-x86_64.zip) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.3.4/VFX-Launcher-0.3.4-Windows-x86_64.zip.sha256) | [Windows guide](docs/WINDOWS.md) |
+| Linux x86_64 | **0.4.0** | [AppImage](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.4.0/VFX-Launcher-0.4.0-x86_64.AppImage) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.4.0/VFX-Launcher-0.4.0-x86_64.AppImage.sha256) | [Linux guide](docs/LINUX-APPIMAGE.md) |
+| Windows 10/11 x64 | **0.4.0** | [Portable ZIP](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.4.0/VFX-Launcher-0.4.0-Windows-x86_64.zip) · [SHA-256](https://github.com/NickPittas/VFX-Launcher-v2/releases/download/v0.4.0/VFX-Launcher-0.4.0-Windows-x86_64.zip.sha256) | [Windows guide](docs/WINDOWS.md) |
 
-No Python or Rust installation is needed for these packages. Both platforms provide version 0.3.4. The Windows portable package is built natively on kamino-3.
+No Python or Rust installation is needed for these packages. Both platforms provide version 0.4.0. The Windows portable package is built natively on kamino-3.
 
 ## Screenshots
 
-Screenshots supplied by the user of the native desktop pages.
+Screenshots supplied by the user of the native desktop pages before the 0.4.0 visual refresh.
 
 ### Projects
 
@@ -48,7 +48,7 @@ Screenshots supplied by the user of the native desktop pages.
 
 ## Latest updates
 
-[0.3.4](docs/RELEASE-0.3.4.md) adds newer ARRI filename recognition, extension-based folder keywords such as `.cube`, resolution metadata during Incoming scans, corrected ffprobe parsing, and Pi model discovery with explicit submission. It also includes the 0.3.3 file-manager reveal and validation-error fixes.
+[0.4.0](docs/RELEASE-0.4.0.md) applies the approved Keyloom visual guide: neutral gray surfaces, consistent blue primary actions, compact spacing, underlined workspace tabs and embedded Noto Sans / IBM Plex Mono fonts. Existing workflows and file-operation rules are retained.
 
 Recent releases improved contained file-link copying, visible execution controls and refusal reasons, stable progress rows, Incoming media previews, external players, and sending media to a running Nuke socket session. See the [release history](CHANGELOG.md) for details and verification limits.
 

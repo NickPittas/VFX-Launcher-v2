@@ -1,5 +1,11 @@
 # Release history
 
+## 0.4.0 — 2026-11-09 · Linux and Windows
+
+Approved Keyloom visual styling across the native desktop: common colors,
+control states, compact spacing, workspace tabs and embedded fonts. Existing
+file-operation behavior is retained. [Release notes](docs/RELEASE-0.4.0.md).
+
 ## 0.3.4 — 2026-11-06 · Linux and Windows
 
 Newer ARRI filenames, extension keywords such as `.cube`, Incoming resolution reads, robust ffprobe JSON parsing and explicit Pi model discovery/submission. Includes the 0.3.3 fixes. Windows is built natively on kamino-3; the file-manager reveal fix is Linux-specific. [Full notes and verification limits](docs/RELEASE-0.3.4.md).

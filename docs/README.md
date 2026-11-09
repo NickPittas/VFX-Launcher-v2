@@ -1,6 +1,6 @@
 # Documentation
 
-Start with [downloads and screenshots](../README.md) and [getting started](guides/GETTING-STARTED.md). Guides describe the shared 0.3.4 desktop. Platform-specific dependencies and verification limits are in the installation guides.
+Start with [downloads and screenshots](../README.md) and [getting started](guides/GETTING-STARTED.md). Guides describe the shared 0.4.0 desktop. Platform-specific dependencies and verification limits are in the installation guides.
 
 | App page | User guide |
 | --- | --- |
