@@ -270,7 +270,7 @@ impl IncomingMedia {
             ui.label("Loading image…");
         }
         if let Some(e) = &self.error {
-            ui.colored_label(eframe::egui::Color32::LIGHT_RED, e);
+            ui.colored_label(crate::theme::ERROR, e);
         }
     }
 }

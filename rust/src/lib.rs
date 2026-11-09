@@ -44,6 +44,7 @@ pub mod storage;
 pub mod structure;
 pub mod structure_workspace;
 pub mod templates;
+pub(crate) mod theme;
 pub mod transfers;
 
 pub use app::{VfxLauncherApp, run_gui};

@@ -36,6 +36,7 @@ New-Item -ItemType Directory $staging | Out-Null
 Copy-Item $binary (Join-Path $staging "vfx-launcher.exe")
 Copy-Item (Join-Path $repo "docs/WINDOWS.md") (Join-Path $staging "README-Windows.md")
 Copy-Item (Join-Path $repo "docs/RELEASE-$version.md") (Join-Path $staging "RELEASE.md")
+Copy-Item (Join-Path $repo "rust/assets/fonts/OFL-*.txt") $staging
 $source = & git -C $repo rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw "Cannot record the source commit." }
 $dirty = @(& git -C $repo status --porcelain).Count -gt 0

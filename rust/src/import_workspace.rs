@@ -440,7 +440,7 @@ impl ImportWorkspace {
                 }
             });
             for issue in &prepared.report.issues {
-                ui.label(egui::RichText::new(issue).color(egui::Color32::from_rgb(224, 154, 106)));
+                ui.label(egui::RichText::new(issue).color(crate::theme::WARNING));
             }
             ui.collapsing("Record-by-record import report", |ui| {
                 egui::ScrollArea::vertical()
