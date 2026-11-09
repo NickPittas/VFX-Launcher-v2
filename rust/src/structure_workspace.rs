@@ -47,8 +47,7 @@ use crate::transfers::{
     RunState, TransferError, ValidatedPlan, ValidationReport,
 };
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
-const WARNING: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x6a);
+use crate::theme::WARNING;
 /// Frame rates the source widgets offered.
 const FPS_PRESETS: [f64; 9] = [23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 120.0];
 const NO_PROJECT: &str = "Select a project in Projects first.";
@@ -62,8 +61,7 @@ const NO_TEMPLATE: &str = "Create or import a folder template first.";
 // ---------------------------------------------------------------------------
 
 fn accent_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    let text = egui::RichText::new(label).color(egui::Color32::WHITE);
-    ui.add_enabled(enabled, egui::Button::new(text).fill(ACCENT))
+    crate::theme::primary_button(ui, label, enabled)
 }
 
 fn explain(response: &egui::Response, reason: &str) {
@@ -106,7 +104,7 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
         ui.add_space(10.0);
         ui.label(title);
         ui.add_space(2.0);
-        ui.label(egui::RichText::new(hint).color(egui::Color32::from_gray(180)));
+        ui.label(egui::RichText::new(hint).color(crate::theme::SECONDARY));
     });
 }
 

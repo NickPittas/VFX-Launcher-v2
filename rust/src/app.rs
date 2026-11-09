@@ -22,10 +22,6 @@ use crate::projects::{FileGroup, FileKind, ProjectFile, ProjectList};
 use crate::storage::{FileId, ProjectId};
 use crate::structure_workspace::StructureWorkspace;
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
-const PANEL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x24, 0x25, 0x28);
-const EDITOR_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x1a, 0x1b, 0x1d);
-const CONTROL_SURFACE: egui::Color32 = egui::Color32::from_rgb(0x2d, 0x2f, 0x33);
 const UNAVAILABLE: &str = "Not available in this build.";
 /// Missing metadata is displayed without fabricating a value.
 const UNKNOWN: &str = "—";
@@ -47,50 +43,6 @@ pub fn run_gui(data_dir: PathBuf) -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(VfxLauncherApp::new(cc, data_dir, workspace_dir)))),
     )
-}
-
-fn apply_desktop_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        style.visuals = egui::Visuals::dark();
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding = egui::vec2(7.0, 3.0);
-        style.spacing.interact_size.y = 20.0;
-        style.spacing.indent = 14.0;
-
-        style.visuals.panel_fill = PANEL_SURFACE;
-        style.visuals.window_fill = PANEL_SURFACE;
-        style.visuals.extreme_bg_color = EDITOR_SURFACE;
-        style.visuals.faint_bg_color = CONTROL_SURFACE;
-        style.visuals.selection.bg_fill = ACCENT;
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        style.visuals.widgets.inactive.weak_bg_fill = CONTROL_SURFACE;
-        style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0x3a, 0x3d, 0x42);
-        style.visuals.widgets.active.weak_bg_fill = ACCENT;
-
-        style.text_styles = [
-            (
-                egui::TextStyle::Heading,
-                egui::FontId::new(15.0, egui::FontFamily::Proportional),
-            ),
-            (
-                egui::TextStyle::Body,
-                egui::FontId::new(13.0, egui::FontFamily::Proportional),
-            ),
-            (
-                egui::TextStyle::Button,
-                egui::FontId::new(13.0, egui::FontFamily::Proportional),
-            ),
-            (
-                egui::TextStyle::Small,
-                egui::FontId::new(11.0, egui::FontFamily::Proportional),
-            ),
-            (
-                egui::TextStyle::Monospace,
-                egui::FontId::new(12.0, egui::FontFamily::Monospace),
-            ),
-        ]
-        .into();
-    });
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +128,7 @@ impl VfxLauncherApp {
         data_dir: PathBuf,
         workspace_dir: PathBuf,
     ) -> Self {
-        apply_desktop_style(&cc.egui_ctx);
+        crate::theme::apply(&cc.egui_ctx);
         Self {
             ctx: cc.egui_ctx.clone(),
             view: cc
@@ -361,10 +313,34 @@ impl VfxLauncherApp {
 
     fn navigation_button(&mut self, ui: &mut egui::Ui, view: View) {
         let selected = self.view == view;
-        if ui
-            .add(egui::Button::new(view.label()).selected(selected))
-            .clicked()
-        {
+        let response = ui
+            .scope(|ui| {
+                let visuals = ui.visuals_mut();
+                visuals.selection.bg_fill = crate::theme::PANEL;
+                visuals.widgets.inactive.weak_bg_fill = crate::theme::APP;
+                for widget in [
+                    &mut visuals.widgets.inactive,
+                    &mut visuals.widgets.hovered,
+                    &mut visuals.widgets.active,
+                    &mut visuals.widgets.open,
+                ] {
+                    widget.bg_stroke = egui::Stroke::NONE;
+                }
+                ui.add(
+                    egui::Button::new(view.label())
+                        .selected(selected)
+                        .min_size(egui::vec2(0.0, 28.0)),
+                )
+            })
+            .inner;
+        if selected {
+            ui.painter().hline(
+                response.rect.x_range(),
+                response.rect.bottom(),
+                egui::Stroke::new(2.0, crate::theme::ACCENT),
+            );
+        }
+        if response.clicked() {
             self.view = view;
         }
     }
@@ -383,6 +359,7 @@ impl VfxLauncherApp {
             if let Some(job) = &job {
                 ui.add(
                     egui::ProgressBar::new(job.progress.fraction())
+                        .fill(crate::theme::SECONDARY)
                         .text(progress_label(job))
                         .desired_height(13.0),
                 );
@@ -1669,8 +1646,7 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 fn primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    let text = egui::RichText::new(label).color(egui::Color32::WHITE);
-    ui.add_enabled(enabled, egui::Button::new(text).fill(ACCENT))
+    crate::theme::primary_button(ui, label, enabled)
 }
 
 /// Attaches the one explanation a disabled control gets.
@@ -1682,7 +1658,7 @@ fn notice_row(ui: &mut egui::Ui, title: &str, detail: Option<&str>, error: bool)
     ui.horizontal(|ui| {
         let text = egui::RichText::new(title).small();
         if error {
-            ui.label(text.color(egui::Color32::from_rgb(0xe0, 0x9a, 0x6a)));
+            ui.label(text.color(crate::theme::ERROR));
         } else {
             ui.label(text);
         }
@@ -1708,7 +1684,7 @@ fn notice_row(ui: &mut egui::Ui, title: &str, detail: Option<&str>, error: bool)
 /// Width shared by the editable Settings fields.
 const SETTINGS_FIELD_WIDTH: f32 = 360.0;
 /// Error copy colour used by the settings strip.
-const PROBLEM: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x6a);
+const PROBLEM: egui::Color32 = crate::theme::ERROR;
 
 fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
@@ -1748,7 +1724,7 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
         ui.add_space(14.0);
         ui.label(title);
         ui.add_space(2.0);
-        ui.label(egui::RichText::new(hint).color(egui::Color32::from_gray(180)));
+        ui.label(egui::RichText::new(hint).color(crate::theme::SECONDARY));
     });
 }
 

@@ -305,7 +305,7 @@ impl BackupWorkspace {
             });
             if let Some(error) = self.error.clone() {
                 ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(230, 155, 100), error);
+                    ui.colored_label(crate::theme::ERROR, error);
                     if ui.button("Retry").clicked() {
                         self.error = self.schedule.retry().err();
                         if !self.loaded {

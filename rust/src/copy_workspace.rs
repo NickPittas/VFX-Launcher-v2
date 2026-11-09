@@ -42,8 +42,7 @@ use crate::{
     },
 };
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
-const WARNING: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x6a);
+use crate::theme::WARNING;
 const DEFAULT_EXTENSIONS: [&str; 2] = [".autosave", ".nk"];
 const POLICIES: [ConflictPolicy; 4] = [
     ConflictPolicy::Skip,
@@ -1328,10 +1327,14 @@ impl CopyByFileTypeState {
             "Validating the current selection.".to_string()
         } else {
             match &self.review {
-                None => self.validation_error.as_ref()
+                None => self
+                    .validation_error
+                    .as_ref()
                     .filter(|(draft, _)| *draft == self.draft())
                     .map(|(_, reason)| format!("Validation failed: {reason}"))
-                    .unwrap_or_else(|| "Draft · validate the current file list before copying.".to_string()),
+                    .unwrap_or_else(|| {
+                        "Draft · validate the current file list before copying.".to_string()
+                    }),
                 Some(review) if review.draft != self.draft() => {
                     "The selection or settings changed; validate again.".to_string()
                 }
@@ -1839,8 +1842,7 @@ impl CopyByFileTypeState {
 // ---------------------------------------------------------------------------
 
 fn accent_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    let text = egui::RichText::new(label).color(egui::Color32::WHITE);
-    ui.add_enabled(enabled, egui::Button::new(text).fill(ACCENT))
+    crate::theme::primary_button(ui, label, enabled)
 }
 
 fn explain(response: &egui::Response, reason: &str) {
@@ -1867,12 +1869,14 @@ fn progress_block(
     if let Some(fraction) = fraction {
         ui.add(
             egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                .fill(crate::theme::SECONDARY)
                 .desired_height(8.0)
                 .show_percentage(),
         );
     } else {
         ui.add(
             egui::ProgressBar::new(0.0)
+                .fill(crate::theme::SECONDARY)
                 .text("Counting matching files…")
                 .desired_height(16.0),
         );

@@ -142,7 +142,7 @@ impl HistoryWindow {
                 }
             });
             if self.pending.is_some() { ui.spinner(); }
-            if let Some(error) = &self.error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+            if let Some(error) = &self.error { ui.colored_label(crate::theme::ERROR, error); }
             if catalog.is_none() { ui.label("The local catalog is not available."); }
             let needle = self.filter.to_lowercase();
             egui::ScrollArea::vertical().id_salt("history_scroll").show(ui, |ui| {
@@ -170,7 +170,7 @@ impl HistoryWindow {
                     ui.separator();
                     ui.label(format!("Run {} · {}", run.run_id, run.state.as_str()));
                     ui.label(run.actor.as_ref().map(|actor| format!("Requested by {}", actor.username)).unwrap_or_else(|| "No user identity was recorded for this run.".into()));
-                    if let Some(error) = &run.detail_error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+                    if let Some(error) = &run.detail_error { ui.colored_label(crate::theme::ERROR, error); }
                     if let Some(counts) = run.confirmed_counts() { ui.label(format!("{} copied · {} created · {} skipped · {} failed · {} unfinished", counts.copied, counts.created, counts.skipped, counts.failed, counts.unfinished())); }
                     ui.label("History is read-only. Retained paths are never deleted or replayed automatically.");
                     egui::ScrollArea::vertical().id_salt("operation_items").max_height(220.).show_rows(ui, 22., run.items.len(), |ui, range| {
@@ -180,7 +180,7 @@ impl HistoryWindow {
                         }
                     });
                     if let Some(item) = run.items.iter().find(|item| Some(item.ordinal) == self.selected_item) {
-                        if let Some(error) = &item.message_error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+                        if let Some(error) = &item.message_error { ui.colored_label(crate::theme::ERROR, error); }
                         for event in &item.events {
                             if let Some(message) = &event.message { ui.label(message); }
                             for path in event.recovery_paths() {

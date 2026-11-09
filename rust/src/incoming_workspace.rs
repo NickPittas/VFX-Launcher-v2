@@ -49,11 +49,10 @@ use crate::transfers::{
     ValidationReport,
 };
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x6b, 0xa8);
-const WARNING: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x9a, 0x6a);
-const DANGER: egui::Color32 = egui::Color32::from_rgb(0xd8, 0x5f, 0x55);
-const NEW_ENTRY: egui::Color32 = egui::Color32::from_rgb(0x7d, 0xb8, 0x7a);
-const MUTED: egui::Color32 = egui::Color32::from_gray(150);
+use crate::theme::WARNING;
+use crate::theme::ERROR as DANGER;
+use crate::theme::SUCCESS as NEW_ENTRY;
+use crate::theme::MUTED;
 const NO_CATALOG: &str = "The catalog is not ready yet.";
 const NO_USER: &str = "Choose who is using the app first.";
 const POLICIES: [ConflictPolicy; 4] = [
@@ -3872,7 +3871,7 @@ impl OrganizeIncomingState {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(phase).small().weak());
                 ui.add(
-                    egui::ProgressBar::new(fraction)
+                    egui::ProgressBar::new(fraction).fill(crate::theme::SECONDARY)
                         .desired_width(200.0)
                         .desired_height(9.0),
                 );
@@ -4535,12 +4534,11 @@ fn report_file_counts(report: &RunDone) -> (usize, usize, usize) {
 }
 
 fn accent_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    let text = egui::RichText::new(label).color(egui::Color32::WHITE);
-    ui.add_enabled(enabled, egui::Button::new(text).fill(ACCENT))
+    crate::theme::primary_button(ui, label, enabled)
 }
 
 fn accent_text_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(egui::Button::new(egui::RichText::new(label).color(egui::Color32::WHITE)).fill(ACCENT))
+    crate::theme::primary_button(ui, label, true)
 }
 
 fn explain(response: &egui::Response, reason: &str) {
@@ -5003,9 +5001,7 @@ impl OrganizeIncomingState {
                             .ai_prepared
                             .as_ref()
                             .is_some_and(|prepared| prepared.draft == self.draft());
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("Send to Pi").fill(ACCENT))
-                        .clicked()
+                    if crate::theme::primary_button(ui, "Send to Pi", enabled).clicked()
                     {
                         send = true;
                     }
